@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use hnsw_rs::prelude::*;
 
 const MAX_ELEMENTS: usize = 1_000_000;
@@ -32,8 +32,15 @@ impl Segment {
             .write(true)
             .truncate(true)
             .open(dir.join("vectors.seg"))?;
-        let hnsw = Hnsw::new(HNSW_M, MAX_ELEMENTS, 16, EF_CONSTRUCTION, DistL2::default());
-        Ok(Self { seg_id, dimension, num_vectors: 0, dir, hnsw, vector_file })
+        let hnsw = Hnsw::new(HNSW_M, MAX_ELEMENTS, 16, EF_CONSTRUCTION, DistL2 {});
+        Ok(Self {
+            seg_id,
+            dimension,
+            num_vectors: 0,
+            dir,
+            hnsw,
+            vector_file,
+        })
     }
 
     /// Open an existing segment and rebuild the HNSW index from vectors.
@@ -42,8 +49,15 @@ impl Segment {
             .read(true)
             .write(true)
             .open(dir.join("vectors.seg"))?;
-        let hnsw = Hnsw::new(HNSW_M, MAX_ELEMENTS, 16, EF_CONSTRUCTION, DistL2::default());
-        let mut seg = Self { seg_id, dimension, num_vectors, dir, hnsw, vector_file };
+        let hnsw = Hnsw::new(HNSW_M, MAX_ELEMENTS, 16, EF_CONSTRUCTION, DistL2 {});
+        let mut seg = Self {
+            seg_id,
+            dimension,
+            num_vectors,
+            dir,
+            hnsw,
+            vector_file,
+        };
         seg.rebuild_hnsw()?;
         Ok(seg)
     }
@@ -70,7 +84,11 @@ impl Segment {
         }
         for v in vectors {
             if v.len() != self.dimension {
-                bail!("dimension mismatch: expected {}, got {}", self.dimension, v.len());
+                bail!(
+                    "dimension mismatch: expected {}, got {}",
+                    self.dimension,
+                    v.len()
+                );
             }
         }
         let first_id = self.num_vectors;
@@ -81,11 +99,16 @@ impl Segment {
         }
         self.vector_file.flush()?;
 
-        let data: Vec<(&Vec<f32>, usize)> =
-            vectors.iter().enumerate().map(|(i, v)| (v, first_id + i)).collect();
+        let data: Vec<(&Vec<f32>, usize)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v, first_id + i))
+            .collect();
         self.hnsw.parallel_insert(&data);
 
-        let ids = (first_id..first_id + vectors.len()).map(|i| i as u32).collect();
+        let ids = (first_id..first_id + vectors.len())
+            .map(|i| i as u32)
+            .collect();
         self.num_vectors += vectors.len();
         Ok(ids)
     }
@@ -93,7 +116,11 @@ impl Segment {
     /// Append a vector to the segment and return its internal_id.
     pub fn insert(&mut self, vector: &[f32]) -> Result<u32> {
         if vector.len() != self.dimension {
-            bail!("dimension mismatch: expected {}, got {}", self.dimension, vector.len());
+            bail!(
+                "dimension mismatch: expected {}, got {}",
+                self.dimension,
+                vector.len()
+            );
         }
         let internal_id = self.num_vectors;
         let offset = (internal_id * self.dimension * 4) as u64;
@@ -108,11 +135,18 @@ impl Segment {
     /// HNSW nearest-neighbour search. Returns (internal_id, distance) pairs.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
         if query.len() != self.dimension {
-            bail!("dimension mismatch: expected {}, got {}", self.dimension, query.len());
+            bail!(
+                "dimension mismatch: expected {}, got {}",
+                self.dimension,
+                query.len()
+            );
         }
         let ef = EF_SEARCH.max(k);
         let neighbours = self.hnsw.search(query, k, ef);
-        Ok(neighbours.into_iter().map(|n| (n.d_id as u32, n.distance)).collect())
+        Ok(neighbours
+            .into_iter()
+            .map(|n| (n.d_id as u32, n.distance))
+            .collect())
     }
 
     /// Read a raw vector by internal_id.

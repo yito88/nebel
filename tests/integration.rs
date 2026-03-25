@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use nebel::{types::Metric, Nebel};
+use nebel::{Nebel, types::Metric};
 use tempfile::tempdir;
 
 // tempfile is only in dev-deps; pull it in below via Cargo.toml.
@@ -20,7 +20,9 @@ fn create_and_search() {
     db.upsert("col", "b", &[0.0, 1.0, 0.0], None).unwrap();
     db.upsert("col", "c", &[0.0, 0.0, 1.0], None).unwrap();
 
-    let hits = db.search("col", &[1.0, 0.01, 0.0], 1, false, false).unwrap();
+    let hits = db
+        .search("col", &[1.0, 0.01, 0.0], 1, false, false)
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].doc_id, "a");
 }
@@ -37,7 +39,10 @@ fn tombstone_after_delete() {
 
     // Search near "x" — should return "y", not "x".
     let hits = db.search("col", &[1.0, 0.0], 2, false, false).unwrap();
-    assert!(!hits.iter().any(|h| h.doc_id == "x"), "deleted doc should not appear");
+    assert!(
+        !hits.iter().any(|h| h.doc_id == "x"),
+        "deleted doc should not appear"
+    );
 }
 
 #[test]
@@ -60,7 +65,8 @@ fn metadata_roundtrip() {
     db.create_collection("col", 2, Metric::L2).unwrap();
 
     let meta = serde_json::json!({"label": "test", "value": 42});
-    db.upsert("col", "doc", &[1.0, 0.0], Some(meta.clone())).unwrap();
+    db.upsert("col", "doc", &[1.0, 0.0], Some(meta.clone()))
+        .unwrap();
 
     let hits = db.search("col", &[1.0, 0.0], 1, true, false).unwrap();
     assert_eq!(hits[0].metadata.as_ref().unwrap()["label"], "test");
@@ -72,7 +78,8 @@ fn update_metadata_only() {
     db.create_collection("col", 2, Metric::L2).unwrap();
 
     db.upsert("col", "doc", &[1.0, 0.0], None).unwrap();
-    db.update_metadata("col", "doc", serde_json::json!({"v": 99})).unwrap();
+    db.update_metadata("col", "doc", serde_json::json!({"v": 99}))
+        .unwrap();
 
     let hits = db.search("col", &[1.0, 0.0], 1, true, false).unwrap();
     assert_eq!(hits[0].metadata.as_ref().unwrap()["v"], 99);
@@ -101,7 +108,11 @@ fn ingest_binary_file() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("vecs.bin");
     let mut f = std::fs::File::create(&path).unwrap();
-    for vec in [[1.0f32, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]] {
+    for vec in [
+        [1.0f32, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ] {
         for v in vec {
             f.write_all(&v.to_le_bytes()).unwrap();
         }
@@ -111,6 +122,8 @@ fn ingest_binary_file() {
     let count = db.ingest_file("col", &path).unwrap();
     assert_eq!(count, 3);
 
-    let hits = db.search("col", &[1.0, 0.0, 0.0, 0.0], 1, false, false).unwrap();
+    let hits = db
+        .search("col", &[1.0, 0.0, 0.0, 0.0], 1, false, false)
+        .unwrap();
     assert_eq!(hits[0].doc_id, "doc_0");
 }

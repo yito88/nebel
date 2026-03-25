@@ -103,7 +103,12 @@ impl Storage {
     }
 
     /// Write the `doc_id -> (seg_id, internal_id)` mapping.
-    pub fn put_doc_location(&self, collection: &str, doc_id: &str, loc: &DocLocation) -> Result<()> {
+    pub fn put_doc_location(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        loc: &DocLocation,
+    ) -> Result<()> {
         let key = doc_key(collection, doc_id);
         let json = serde_json::to_string(loc)?;
         let wtxn = self.db.begin_write()?;

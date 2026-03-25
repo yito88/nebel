@@ -1,4 +1,4 @@
-use nebel::{types::Metric, Nebel};
+use nebel::{Nebel, types::Metric};
 
 fn main() -> anyhow::Result<()> {
     let mut db = Nebel::open("data")?;

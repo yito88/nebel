@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
 const INGEST_BATCH_SIZE: usize = 512;
@@ -32,11 +32,20 @@ impl Nebel {
         fs::create_dir_all(&base_dir)?;
         let db_path = base_dir.join("nebel.redb");
         let storage = Storage::open(&db_path)?;
-        Ok(Self { base_dir, storage, segments: HashMap::new() })
+        Ok(Self {
+            base_dir,
+            storage,
+            segments: HashMap::new(),
+        })
     }
 
     /// Create a new collection with the given `name`, vector `dimension`, and distance `metric`.
-    pub fn create_collection(&mut self, name: &str, dimension: usize, metric: Metric) -> Result<()> {
+    pub fn create_collection(
+        &mut self,
+        name: &str,
+        dimension: usize,
+        metric: Metric,
+    ) -> Result<()> {
         if self.storage.get_collection(name)?.is_some() {
             bail!("collection '{}' already exists", name);
         }
@@ -48,7 +57,10 @@ impl Nebel {
         };
         self.storage.put_collection(&schema)?;
         let seg = self.create_segment(name, 0, dimension)?;
-        let seg_meta = SegmentMeta { seg_id: 0, num_vectors: 0 };
+        let seg_meta = SegmentMeta {
+            seg_id: 0,
+            num_vectors: 0,
+        };
         self.storage.put_segment(name, &seg_meta)?;
         self.segments.insert(name.to_string(), seg);
         Ok(())
@@ -82,11 +94,16 @@ impl Nebel {
             }
             let vectors: Vec<Vec<f32>> = buf[..n_bytes]
                 .chunks_exact(record_size)
-                .map(|c| c.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+                .map(|c| {
+                    c.chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect()
+                })
                 .collect();
 
-            let doc_ids: Vec<String> =
-                (count..count + vectors.len()).map(|i| format!("doc_{}", i)).collect();
+            let doc_ids: Vec<String> = (count..count + vectors.len())
+                .map(|i| format!("doc_{}", i))
+                .collect();
             self.insert_vector_batch(collection, &schema, &doc_ids, &vectors)?;
             count += vectors.len();
         }
@@ -106,10 +123,15 @@ impl Nebel {
     ) -> Result<()> {
         let schema = self.get_schema(collection)?;
         if vector.len() != schema.dimension {
-            bail!("dimension mismatch: expected {}, got {}", schema.dimension, vector.len());
+            bail!(
+                "dimension mismatch: expected {}, got {}",
+                schema.dimension,
+                vector.len()
+            );
         }
         if let Some(loc) = self.storage.get_doc_location(collection, doc_id)? {
-            self.storage.set_tombstone(collection, loc.seg_id, loc.internal_id)?;
+            self.storage
+                .set_tombstone(collection, loc.seg_id, loc.internal_id)?;
         }
         self.insert_vector(collection, &schema, doc_id, vector, metadata)?;
         Ok(())
@@ -121,7 +143,8 @@ impl Nebel {
             .storage
             .get_doc_location(collection, doc_id)?
             .ok_or_else(|| anyhow!("document '{}' not found", doc_id))?;
-        self.storage.set_tombstone(collection, loc.seg_id, loc.internal_id)?;
+        self.storage
+            .set_tombstone(collection, loc.seg_id, loc.internal_id)?;
         self.storage.remove_doc_location(collection, doc_id)?;
         Ok(())
     }
@@ -137,7 +160,8 @@ impl Nebel {
             .storage
             .get_doc_location(collection, doc_id)?
             .ok_or_else(|| anyhow!("document '{}' not found", doc_id))?;
-        self.storage.put_metadata(collection, loc.seg_id, loc.internal_id, &metadata)?;
+        self.storage
+            .put_metadata(collection, loc.seg_id, loc.internal_id, &metadata)?;
         Ok(())
     }
 
@@ -155,7 +179,11 @@ impl Nebel {
     ) -> Result<Vec<SearchHit>> {
         let schema = self.get_schema(collection)?;
         if query.len() != schema.dimension {
-            bail!("dimension mismatch: expected {}, got {}", schema.dimension, query.len());
+            bail!(
+                "dimension mismatch: expected {}, got {}",
+                schema.dimension,
+                query.len()
+            );
         }
 
         let seg = self.load_segment(collection, schema.active_seg_id, schema.dimension)?;
@@ -167,12 +195,16 @@ impl Nebel {
 
         let mut hits = Vec::new();
         for (internal_id, distance) in raw {
-            if self.storage.is_tombstoned(collection, schema.active_seg_id, internal_id)? {
+            if self
+                .storage
+                .is_tombstoned(collection, schema.active_seg_id, internal_id)?
+            {
                 continue;
             }
             let doc_id = self.reverse_lookup(collection, schema.active_seg_id, internal_id)?;
             let metadata = if include_metadata {
-                self.storage.get_metadata(collection, schema.active_seg_id, internal_id)?
+                self.storage
+                    .get_metadata(collection, schema.active_seg_id, internal_id)?
             } else {
                 None
             };
@@ -182,7 +214,12 @@ impl Nebel {
             } else {
                 None
             };
-            hits.push(SearchHit { doc_id, score: distance, metadata, vector });
+            hits.push(SearchHit {
+                doc_id,
+                score: distance,
+                metadata,
+                vector,
+            });
         }
 
         Ok(hits)
@@ -202,7 +239,9 @@ impl Nebel {
     }
 
     fn seg_dir(&self, collection: &str, seg_id: u32) -> PathBuf {
-        self.base_dir.join(collection).join(format!("seg_{:03}", seg_id))
+        self.base_dir
+            .join(collection)
+            .join(format!("seg_{:03}", seg_id))
     }
 
     fn load_segment(
@@ -237,16 +276,27 @@ impl Nebel {
         let internal_id = seg.insert(vector)?;
         let num_vectors = seg.num_vectors;
 
-        self.storage.put_segment(collection, &SegmentMeta { seg_id, num_vectors })?;
+        self.storage.put_segment(
+            collection,
+            &SegmentMeta {
+                seg_id,
+                num_vectors,
+            },
+        )?;
         self.storage.put_doc_location(
             collection,
             doc_id,
-            &DocLocation { seg_id, internal_id },
+            &DocLocation {
+                seg_id,
+                internal_id,
+            },
         )?;
         if let Some(meta) = metadata {
-            self.storage.put_metadata(collection, seg_id, internal_id, &meta)?;
+            self.storage
+                .put_metadata(collection, seg_id, internal_id, &meta)?;
         }
-        self.storage.put_reverse_doc(collection, seg_id, internal_id, doc_id)?;
+        self.storage
+            .put_reverse_doc(collection, seg_id, internal_id, doc_id)?;
 
         Ok(())
     }
@@ -263,14 +313,24 @@ impl Nebel {
         let internal_ids = seg.insert_batch(vectors)?;
         let num_vectors = seg.num_vectors;
 
-        self.storage.put_segment(collection, &SegmentMeta { seg_id, num_vectors })?;
+        self.storage.put_segment(
+            collection,
+            &SegmentMeta {
+                seg_id,
+                num_vectors,
+            },
+        )?;
         for (doc_id, internal_id) in doc_ids.iter().zip(internal_ids.iter()) {
             self.storage.put_doc_location(
                 collection,
                 doc_id,
-                &DocLocation { seg_id, internal_id: *internal_id },
+                &DocLocation {
+                    seg_id,
+                    internal_id: *internal_id,
+                },
             )?;
-            self.storage.put_reverse_doc(collection, seg_id, *internal_id, doc_id)?;
+            self.storage
+                .put_reverse_doc(collection, seg_id, *internal_id, doc_id)?;
         }
         Ok(())
     }
@@ -278,7 +338,13 @@ impl Nebel {
     fn reverse_lookup(&self, collection: &str, seg_id: u32, internal_id: u32) -> Result<String> {
         self.storage
             .get_reverse_doc(collection, seg_id, internal_id)?
-            .ok_or_else(|| anyhow!("reverse mapping not found for ({}, {})", seg_id, internal_id))
+            .ok_or_else(|| {
+                anyhow!(
+                    "reverse mapping not found for ({}, {})",
+                    seg_id,
+                    internal_id
+                )
+            })
     }
 }
 
