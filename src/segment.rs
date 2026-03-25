@@ -60,6 +60,36 @@ impl Segment {
         Ok(())
     }
 
+    /// Append a batch of vectors, write them to the file in one pass, and
+    /// insert them into the HNSW index with `parallel_insert`.
+    ///
+    /// Returns the assigned internal_ids in the same order as `vectors`.
+    pub fn insert_batch(&mut self, vectors: &[Vec<f32>]) -> Result<Vec<u32>> {
+        if vectors.is_empty() {
+            return Ok(vec![]);
+        }
+        for v in vectors {
+            if v.len() != self.dimension {
+                bail!("dimension mismatch: expected {}, got {}", self.dimension, v.len());
+            }
+        }
+        let first_id = self.num_vectors;
+        let offset = (first_id * self.dimension * 4) as u64;
+        self.vector_file.seek(SeekFrom::Start(offset))?;
+        for v in vectors {
+            self.vector_file.write_all(&f32_to_bytes(v))?;
+        }
+        self.vector_file.flush()?;
+
+        let data: Vec<(&Vec<f32>, usize)> =
+            vectors.iter().enumerate().map(|(i, v)| (v, first_id + i)).collect();
+        self.hnsw.parallel_insert(&data);
+
+        let ids = (first_id..first_id + vectors.len()).map(|i| i as u32).collect();
+        self.num_vectors += vectors.len();
+        Ok(ids)
+    }
+
     /// Append a vector to the segment and return its internal_id.
     pub fn insert(&mut self, vector: &[f32]) -> Result<u32> {
         if vector.len() != self.dimension {

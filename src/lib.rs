@@ -12,6 +12,8 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 
+const INGEST_BATCH_SIZE: usize = 512;
+
 use segment::Segment;
 use storage::Storage;
 use types::{CollectionSchema, DocLocation, Metric, SearchHit, SegmentMeta};
@@ -58,28 +60,35 @@ impl Nebel {
     /// Each record is exactly `dimension * 4` bytes.
     /// Doc IDs are auto-assigned as `"doc_0"`, `"doc_1"`, …
     ///
+    /// Vectors are read in batches of [`INGEST_BATCH_SIZE`] and inserted into
+    /// the HNSW index with `parallel_insert`.
+    ///
     /// Returns the number of vectors ingested.
     pub fn ingest_file(&mut self, collection: &str, file_path: impl AsRef<Path>) -> Result<usize> {
         let schema = self.get_schema(collection)?;
         let record_size = schema.dimension * 4;
 
         let mut file = fs::File::open(file_path)?;
-        let mut buf = vec![0u8; record_size];
+        let mut buf = vec![0u8; record_size * INGEST_BATCH_SIZE];
         let mut count = 0;
 
         loop {
-            match read_exact_or_eof(&mut file, &mut buf)? {
-                0 => break,
-                n if n == record_size => {}
-                n => bail!("partial record: {} bytes (expected {})", n, record_size),
+            let n_bytes = read_up_to(&mut file, &mut buf)?;
+            if n_bytes == 0 {
+                break;
             }
-            let vector: Vec<f32> = buf
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            if n_bytes % record_size != 0 {
+                bail!("partial record: {} trailing bytes", n_bytes % record_size);
+            }
+            let vectors: Vec<Vec<f32>> = buf[..n_bytes]
+                .chunks_exact(record_size)
+                .map(|c| c.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
                 .collect();
-            let doc_id = format!("doc_{}", count);
-            self.insert_vector(collection, &schema, &doc_id, &vector, None)?;
-            count += 1;
+
+            let doc_ids: Vec<String> =
+                (count..count + vectors.len()).map(|i| format!("doc_{}", i)).collect();
+            self.insert_vector_batch(collection, &schema, &doc_ids, &vectors)?;
+            count += vectors.len();
         }
         Ok(count)
     }
@@ -242,6 +251,30 @@ impl Nebel {
         Ok(())
     }
 
+    fn insert_vector_batch(
+        &mut self,
+        collection: &str,
+        schema: &CollectionSchema,
+        doc_ids: &[String],
+        vectors: &[Vec<f32>],
+    ) -> Result<()> {
+        let seg_id = schema.active_seg_id;
+        let seg = self.load_segment(collection, seg_id, schema.dimension)?;
+        let internal_ids = seg.insert_batch(vectors)?;
+        let num_vectors = seg.num_vectors;
+
+        self.storage.put_segment(collection, &SegmentMeta { seg_id, num_vectors })?;
+        for (doc_id, internal_id) in doc_ids.iter().zip(internal_ids.iter()) {
+            self.storage.put_doc_location(
+                collection,
+                doc_id,
+                &DocLocation { seg_id, internal_id: *internal_id },
+            )?;
+            self.storage.put_reverse_doc(collection, seg_id, *internal_id, doc_id)?;
+        }
+        Ok(())
+    }
+
     fn reverse_lookup(&self, collection: &str, seg_id: u32, internal_id: u32) -> Result<String> {
         self.storage
             .get_reverse_doc(collection, seg_id, internal_id)?
@@ -249,7 +282,8 @@ impl Nebel {
     }
 }
 
-fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
+/// Read up to `buf.len()` bytes, stopping at EOF. Returns bytes read.
+fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
     let mut total = 0;
     while total < buf.len() {
         match r.read(&mut buf[total..])? {
