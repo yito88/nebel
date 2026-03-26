@@ -63,10 +63,17 @@ pub struct Manifest {
     pub next_seg_id: SegId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SegmentState {
+    Writable,
+    Sealed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentMeta {
     pub seg_id: SegId,
     pub num_vectors: usize,
+    pub state: SegmentState,
 }
 
 impl SegmentMeta {
@@ -74,6 +81,7 @@ impl SegmentMeta {
         Self {
             seg_id,
             num_vectors: 0,
+            state: SegmentState::Writable,
         }
     }
 }

@@ -17,10 +17,11 @@ const DB_NAME: &str = "nebel.redb";
 const INGEST_BATCH_SIZE: usize = 512;
 const SEGMENT_CAPACITY: usize = 100_000;
 
-use segment::Segment;
+use segment::{Segment, WritableSegment};
 use storage::Storage;
 use types::{
-    CollectionId, CollectionSchema, Manifest, Metric, SearchHit, SegId, SegmentMeta, VectorEntry,
+    CollectionId, CollectionSchema, Manifest, Metric, SearchHit, SegId, SegmentMeta, SegmentState,
+    VectorEntry,
 };
 
 pub struct Nebel {
@@ -47,8 +48,8 @@ impl Nebel {
         })
     }
 
-    /// Load an existing collection into memory, rebuilding the HNSW indices
-    /// from the persisted vectors for all active segments.
+    /// Load an existing collection into memory, loading indices for all active
+    /// segments.
     ///
     /// This must be called after [`Nebel::open`] to make a previously-created
     /// collection available for search and mutation.
@@ -87,32 +88,52 @@ impl Nebel {
         };
         self.storage
             .put_new_collection(&schema, &manifest, &SegmentMeta::new(SegId::FIRST))?;
-        let seg = self.create_segment(id, SegId::FIRST, dimension)?;
+        let seg = WritableSegment::create(SegId::FIRST, self.seg_dir(id, SegId::FIRST))?;
         self.segments
             .entry(id.clone())
             .or_default()
-            .insert(SegId::FIRST, seg);
+            .insert(SegId::FIRST, Segment::Writable(seg));
         self.manifests.insert(id.clone(), manifest);
         Ok(())
     }
 
-    /// Create a new writable segment for `collection`, updating the manifest.
-    ///
-    /// The previous writable segment remains in `active_segments` (for search)
-    /// but new writes will go to the returned segment.
+    /// Create a new writable segment for `collection`, sealing the previous
+    /// writable segment and updating the manifest.
     pub fn add_writable_segment(&mut self, id: &CollectionId) -> Result<SegId> {
         let schema = self.get_schema(id)?;
         let manifest = self.get_manifest(id)?;
+        let old_id = manifest.writable_segment;
         let new_id = manifest.next_seg_id;
 
+        // Compute dir before mutably borrowing the segment map.
+        let new_dir = self.seg_dir(id, new_id);
+
+        // Seal the old writable segment: remove from map, seal, re-insert as sealed.
+        self.load_segment(id, old_id, schema.dimension)?;
+        let col_segs = self.segments.get_mut(id).expect("collection present");
+        let old_seg = col_segs.remove(&old_id).expect("old segment present");
+        let (sealed, num_vectors) = match old_seg {
+            Segment::Writable(w) => {
+                let nv = w.num_vectors();
+                let sealed = w.seal()?;
+                (sealed, nv)
+            }
+            Segment::Sealed(_) => bail!("writable segment is already sealed"),
+        };
+        col_segs.insert(old_id, Segment::Sealed(sealed));
+
+        let old_meta = SegmentMeta {
+            seg_id: old_id,
+            num_vectors,
+            state: SegmentState::Sealed,
+        };
+        self.storage.put_segment(id, &old_meta)?;
+
+        // Create the new writable segment.
         self.storage
             .put_segment(id, &SegmentMeta::new(new_id))?;
-
-        let seg = self.create_segment(id, new_id, schema.dimension)?;
-        self.segments
-            .entry(id.clone())
-            .or_default()
-            .insert(new_id, seg);
+        let seg = WritableSegment::create(new_id, new_dir)?;
+        col_segs.insert(new_id, Segment::Writable(seg));
 
         let mut manifest = manifest;
         manifest.active_segments.push(new_id);
@@ -255,7 +276,7 @@ impl Nebel {
         let mut candidates: Vec<(SegId, u32, f32)> = Vec::new();
         for &seg_id in &manifest.active_segments {
             let seg = self.load_segment(id, seg_id, schema.dimension)?;
-            if seg.num_vectors == 0 {
+            if seg.num_vectors() == 0 {
                 continue;
             }
             let raw = seg.search(query, k)?;
@@ -283,7 +304,10 @@ impl Nebel {
             };
             let vector = if include_vector {
                 let seg = self.load_segment(id, seg_id, schema.dimension)?;
-                Some(seg.read_vector(internal_id)?)
+                match seg {
+                    Segment::Writable(w) => Some(w.read_vector(internal_id, schema.dimension)?),
+                    Segment::Sealed(_) => None,
+                }
             } else {
                 None
             };
@@ -320,21 +344,11 @@ impl Nebel {
     fn writable_manifest(&mut self, id: &CollectionId, dimension: usize) -> Result<Manifest> {
         let manifest = self.get_manifest(id)?;
         let seg = self.load_segment(id, manifest.writable_segment, dimension)?;
-        if seg.num_vectors >= SEGMENT_CAPACITY {
+        if seg.num_vectors() >= SEGMENT_CAPACITY {
             self.add_writable_segment(id)?;
             return self.get_manifest(id);
         }
         Ok(manifest)
-    }
-
-    fn create_segment(
-        &self,
-        id: &CollectionId,
-        seg_id: SegId,
-        dimension: usize,
-    ) -> Result<Segment> {
-        let dir = self.seg_dir(id, seg_id);
-        Segment::create(seg_id, dir, dimension)
     }
 
     fn seg_dir(&self, id: &CollectionId, seg_id: SegId) -> PathBuf {
@@ -349,7 +363,6 @@ impl Nebel {
         seg_id: SegId,
         dimension: usize,
     ) -> Result<&mut Segment> {
-        // Compute dir and load from storage before borrowing self.segments.
         let needs_load = !self
             .segments
             .get(id)
@@ -360,7 +373,14 @@ impl Nebel {
                 .get_segment(id, seg_id)?
                 .ok_or_else(|| anyhow!("segment {} not found for '{}'", seg_id, id))?;
             let dir = self.seg_dir(id, seg_id);
-            let seg = Segment::open(seg_id, dir, dimension, meta.num_vectors)?;
+            let seg = match meta.state {
+                SegmentState::Writable => {
+                    Segment::Writable(WritableSegment::open(seg_id, dir, dimension, meta.num_vectors)?)
+                }
+                SegmentState::Sealed => {
+                    Segment::Sealed(segment::SealedSegment::open(seg_id, dir, meta.num_vectors)?)
+                }
+            };
             self.segments
                 .entry(id.clone())
                 .or_default()
@@ -374,6 +394,19 @@ impl Nebel {
             .expect("segment present"))
     }
 
+    fn load_writable_segment(
+        &mut self,
+        id: &CollectionId,
+        seg_id: SegId,
+        dimension: usize,
+    ) -> Result<&mut WritableSegment> {
+        let seg = self.load_segment(id, seg_id, dimension)?;
+        match seg {
+            Segment::Writable(w) => Ok(w),
+            Segment::Sealed(_) => bail!("expected writable segment, got sealed"),
+        }
+    }
+
     fn insert_vector(
         &mut self,
         id: &CollectionId,
@@ -384,9 +417,9 @@ impl Nebel {
         metadata: Option<Value>,
     ) -> Result<()> {
         let seg_id = manifest.writable_segment;
-        let seg = self.load_segment(id, seg_id, schema.dimension)?;
-        let internal_id = seg.insert(vector)?;
-        let num_vectors = seg.num_vectors;
+        let seg = self.load_writable_segment(id, seg_id, schema.dimension)?;
+        let internal_id = seg.insert(vector, schema.dimension)?;
+        let num_vectors = seg.num_vectors();
 
         self.write_vector_entries(
             id,
@@ -409,9 +442,9 @@ impl Nebel {
         vectors: &[Vec<f32>],
     ) -> Result<()> {
         let seg_id = manifest.writable_segment;
-        let seg = self.load_segment(id, seg_id, schema.dimension)?;
-        let internal_ids = seg.insert_batch(vectors)?;
-        let num_vectors = seg.num_vectors;
+        let seg = self.load_writable_segment(id, seg_id, schema.dimension)?;
+        let internal_ids = seg.insert_batch(vectors, schema.dimension)?;
+        let num_vectors = seg.num_vectors();
 
         let entries: Vec<VectorEntry<'_>> = doc_ids
             .iter()
@@ -438,6 +471,7 @@ impl Nebel {
         let seg_meta = SegmentMeta {
             seg_id,
             num_vectors,
+            state: SegmentState::Writable,
         };
         self.storage
             .write_vector_entries(id, &seg_meta, entries)
