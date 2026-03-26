@@ -11,11 +11,34 @@ impl SegId {
     pub fn as_u32(self) -> u32 {
         self.0
     }
+
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
 }
 
 impl fmt::Display for SegId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CollectionId(String);
+
+impl CollectionId {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for CollectionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -28,10 +51,16 @@ pub enum Metric {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionSchema {
-    pub name: String,
+    pub name: CollectionId,
     pub dimension: usize,
     pub metric: Metric,
-    pub active_seg_id: SegId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Manifest {
+    pub active_segments: Vec<SegId>,
+    pub writable_segment: SegId,
+    pub next_seg_id: SegId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
