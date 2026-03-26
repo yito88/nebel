@@ -86,7 +86,7 @@ impl Segment {
 
             let vectors: Vec<Vec<f32>> = buf[..read_bytes]
                 .chunks_exact(record_size)
-                .map(|c| bytes_to_f32(c))
+                .map(bytes_to_f32)
                 .collect();
 
             let data: Vec<(&Vec<f32>, usize)> = vectors
