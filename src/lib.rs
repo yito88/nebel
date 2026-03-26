@@ -12,11 +12,12 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
+const DB_NAME: &str = "nebel.redb";
 const INGEST_BATCH_SIZE: usize = 512;
 
 use segment::Segment;
 use storage::Storage;
-use types::{CollectionSchema, DocLocation, Metric, SearchHit, SegmentMeta};
+use types::{CollectionSchema, Metric, SearchHit, SegId, SegmentMeta, VectorEntry};
 
 pub struct Nebel {
     base_dir: PathBuf,
@@ -30,7 +31,7 @@ impl Nebel {
     pub fn open(base_dir: impl AsRef<Path>) -> Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         fs::create_dir_all(&base_dir)?;
-        let db_path = base_dir.join("nebel.redb");
+        let db_path = base_dir.join(DB_NAME);
         let storage = Storage::open(&db_path)?;
         Ok(Self {
             base_dir,
@@ -53,15 +54,11 @@ impl Nebel {
             name: name.to_string(),
             dimension,
             metric,
-            active_seg_id: 0,
+            active_seg_id: SegId::FIRST,
         };
-        self.storage.put_collection(&schema)?;
-        let seg = self.create_segment(name, 0, dimension)?;
-        let seg_meta = SegmentMeta {
-            seg_id: 0,
-            num_vectors: 0,
-        };
-        self.storage.put_segment(name, &seg_meta)?;
+        self.storage
+            .put_new_collection(&schema, &SegmentMeta::new(SegId::FIRST))?;
+        let seg = self.create_segment(name, SegId::FIRST, dimension)?;
         self.segments.insert(name.to_string(), seg);
         Ok(())
     }
@@ -233,21 +230,21 @@ impl Nebel {
             .ok_or_else(|| anyhow!("collection '{}' not found", collection))
     }
 
-    fn create_segment(&self, collection: &str, seg_id: u32, dimension: usize) -> Result<Segment> {
+    fn create_segment(&self, collection: &str, seg_id: SegId, dimension: usize) -> Result<Segment> {
         let dir = self.seg_dir(collection, seg_id);
         Segment::create(seg_id, dir, dimension)
     }
 
-    fn seg_dir(&self, collection: &str, seg_id: u32) -> PathBuf {
+    fn seg_dir(&self, collection: &str, seg_id: SegId) -> PathBuf {
         self.base_dir
             .join(collection)
-            .join(format!("seg_{:03}", seg_id))
+            .join(format!("seg_{:03}", seg_id.as_u32()))
     }
 
     fn load_segment(
         &mut self,
         collection: &str,
-        seg_id: u32,
+        seg_id: SegId,
         dimension: usize,
     ) -> Result<&mut Segment> {
         if !self.segments.contains_key(collection) {
@@ -259,7 +256,10 @@ impl Nebel {
             let seg = Segment::open(seg_id, dir, dimension, meta.num_vectors)?;
             self.segments.insert(collection.to_string(), seg);
         }
-        Ok(self.segments.get_mut(collection).unwrap())
+        Ok(self
+            .segments
+            .get_mut(collection)
+            .expect("should be present"))
     }
 
     fn insert_vector(
@@ -271,34 +271,20 @@ impl Nebel {
         metadata: Option<Value>,
     ) -> Result<()> {
         let seg_id = schema.active_seg_id;
-
         let seg = self.load_segment(collection, seg_id, schema.dimension)?;
         let internal_id = seg.insert(vector)?;
         let num_vectors = seg.num_vectors;
 
-        self.storage.put_segment(
+        self.write_vector_entries(
             collection,
-            &SegmentMeta {
-                seg_id,
-                num_vectors,
-            },
-        )?;
-        self.storage.put_doc_location(
-            collection,
-            doc_id,
-            &DocLocation {
-                seg_id,
+            seg_id,
+            num_vectors,
+            &[VectorEntry {
+                doc_id,
                 internal_id,
-            },
-        )?;
-        if let Some(meta) = metadata {
-            self.storage
-                .put_metadata(collection, seg_id, internal_id, &meta)?;
-        }
-        self.storage
-            .put_reverse_doc(collection, seg_id, internal_id, doc_id)?;
-
-        Ok(())
+                metadata: metadata.as_ref(),
+            }],
+        )
     }
 
     fn insert_vector_batch(
@@ -313,29 +299,37 @@ impl Nebel {
         let internal_ids = seg.insert_batch(vectors)?;
         let num_vectors = seg.num_vectors;
 
-        self.storage.put_segment(
-            collection,
-            &SegmentMeta {
-                seg_id,
-                num_vectors,
-            },
-        )?;
-        for (doc_id, internal_id) in doc_ids.iter().zip(internal_ids.iter()) {
-            self.storage.put_doc_location(
-                collection,
-                doc_id,
-                &DocLocation {
-                    seg_id,
-                    internal_id: *internal_id,
-                },
-            )?;
-            self.storage
-                .put_reverse_doc(collection, seg_id, *internal_id, doc_id)?;
-        }
-        Ok(())
+        let entries: Vec<VectorEntry<'_>> = doc_ids
+            .iter()
+            .zip(internal_ids.iter())
+            .map(|(doc_id, &internal_id)| VectorEntry {
+                doc_id: doc_id.as_str(),
+                internal_id,
+                metadata: None,
+            })
+            .collect();
+
+        self.write_vector_entries(collection, seg_id, num_vectors, &entries)
     }
 
-    fn reverse_lookup(&self, collection: &str, seg_id: u32, internal_id: u32) -> Result<String> {
+    /// Write segment metadata, doc locations, reverse-doc mappings, and
+    /// optional per-vector metadata in a single redb transaction.
+    fn write_vector_entries(
+        &self,
+        collection: &str,
+        seg_id: SegId,
+        num_vectors: usize,
+        entries: &[VectorEntry<'_>],
+    ) -> Result<()> {
+        let seg_meta = SegmentMeta {
+            seg_id,
+            num_vectors,
+        };
+        self.storage
+            .write_vector_entries(collection, &seg_meta, entries)
+    }
+
+    fn reverse_lookup(&self, collection: &str, seg_id: SegId, internal_id: u32) -> Result<String> {
         self.storage
             .get_reverse_doc(collection, seg_id, internal_id)?
             .ok_or_else(|| {

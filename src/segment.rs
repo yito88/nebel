@@ -7,14 +7,19 @@ use std::{
 use anyhow::{Result, bail};
 use hnsw_rs::prelude::*;
 
+use crate::types::SegId;
+
 const MAX_ELEMENTS: usize = 1_000_000;
+const MAX_LAYER: usize = 16;
 const HNSW_M: usize = 16;
 const EF_CONSTRUCTION: usize = 200;
 const EF_SEARCH: usize = 50;
+/// 256 MB buffer for rebuilding the HNSW index in chunks.
+const REBUILD_BUF_BYTES: usize = 256 * 1024 * 1024;
 
 #[allow(dead_code)]
 pub struct Segment {
-    pub seg_id: u32,
+    pub seg_id: SegId,
     pub dimension: usize,
     pub num_vectors: usize,
     dir: PathBuf,
@@ -24,7 +29,7 @@ pub struct Segment {
 
 impl Segment {
     /// Create a new empty segment on disk.
-    pub fn create(seg_id: u32, dir: PathBuf, dimension: usize) -> Result<Self> {
+    pub fn create(seg_id: SegId, dir: PathBuf, dimension: usize) -> Result<Self> {
         fs::create_dir_all(&dir)?;
         let vector_file = fs::OpenOptions::new()
             .create(true)
@@ -32,7 +37,7 @@ impl Segment {
             .write(true)
             .truncate(true)
             .open(dir.join("vectors.seg"))?;
-        let hnsw = Hnsw::new(HNSW_M, MAX_ELEMENTS, 16, EF_CONSTRUCTION, DistL2 {});
+        let hnsw = Hnsw::new(HNSW_M, MAX_ELEMENTS, MAX_LAYER, EF_CONSTRUCTION, DistL2 {});
         Ok(Self {
             seg_id,
             dimension,
@@ -44,7 +49,7 @@ impl Segment {
     }
 
     /// Open an existing segment and rebuild the HNSW index from vectors.
-    pub fn open(seg_id: u32, dir: PathBuf, dimension: usize, num_vectors: usize) -> Result<Self> {
+    pub fn open(seg_id: SegId, dir: PathBuf, dimension: usize, num_vectors: usize) -> Result<Self> {
         let vector_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -63,13 +68,34 @@ impl Segment {
     }
 
     fn rebuild_hnsw(&mut self) -> Result<()> {
+        if self.num_vectors == 0 {
+            return Ok(());
+        }
         let record_size = self.dimension * 4;
-        let mut buf = vec![0u8; record_size];
+        let vectors_per_chunk = REBUILD_BUF_BYTES / record_size;
+        let chunk_bytes = vectors_per_chunk * record_size;
+        let mut buf = vec![0u8; chunk_bytes];
+        let mut offset = 0usize;
+
         self.vector_file.seek(SeekFrom::Start(0))?;
-        for internal_id in 0..self.num_vectors {
-            self.vector_file.read_exact(&mut buf)?;
-            let vec = bytes_to_f32(&buf);
-            self.hnsw.insert((&vec, internal_id));
+        while offset < self.num_vectors {
+            let remaining = self.num_vectors - offset;
+            let n = remaining.min(vectors_per_chunk);
+            let read_bytes = n * record_size;
+            self.vector_file.read_exact(&mut buf[..read_bytes])?;
+
+            let vectors: Vec<Vec<f32>> = buf[..read_bytes]
+                .chunks_exact(record_size)
+                .map(|c| bytes_to_f32(c))
+                .collect();
+
+            let data: Vec<(&Vec<f32>, usize)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (v, offset + i))
+                .collect();
+            self.hnsw.parallel_insert(&data);
+            offset += n;
         }
         Ok(())
     }

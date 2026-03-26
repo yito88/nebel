@@ -1,7 +1,7 @@
 use anyhow::Result;
 use redb::{Database, TableDefinition};
 
-use crate::types::{CollectionSchema, DocLocation, SegmentMeta};
+use crate::types::{CollectionSchema, DocLocation, SegId, SegmentMeta, VectorEntry};
 
 // table definitions
 
@@ -25,15 +25,15 @@ const REVERSE_DOC: TableDefinition<&str, &str> = TableDefinition::new("reverse_d
 
 // key helpers
 
-pub fn seg_key(collection: &str, seg_id: u32) -> String {
+fn seg_key(collection: &str, seg_id: SegId) -> String {
     format!("{}\0{}", collection, seg_id)
 }
 
-pub fn doc_key(collection: &str, doc_id: &str) -> String {
+fn doc_key(collection: &str, doc_id: &str) -> String {
     format!("{}\0{}", collection, doc_id)
 }
 
-pub fn meta_key(collection: &str, seg_id: u32, internal_id: u32) -> String {
+fn meta_key(collection: &str, seg_id: SegId, internal_id: u32) -> String {
     format!("{}\0{}\0{}", collection, seg_id, internal_id)
 }
 
@@ -56,13 +56,21 @@ impl Storage {
         Ok(Self { db })
     }
 
-    /// Persist a collection schema.
-    pub fn put_collection(&self, schema: &CollectionSchema) -> Result<()> {
-        let json = serde_json::to_string(schema)?;
+    /// Atomically persist a new collection schema and its initial segment metadata.
+    pub fn put_new_collection(
+        &self,
+        schema: &CollectionSchema,
+        seg_meta: &SegmentMeta,
+    ) -> Result<()> {
+        let schema_json = serde_json::to_string(schema)?;
+        let sk = seg_key(&schema.name, seg_meta.seg_id);
+        let seg_json = serde_json::to_string(seg_meta)?;
         let wtxn = self.db.begin_write()?;
         {
-            let mut table = wtxn.open_table(COLLECTIONS)?;
-            table.insert(schema.name.as_str(), json.as_str())?;
+            let mut col_table = wtxn.open_table(COLLECTIONS)?;
+            col_table.insert(schema.name.as_str(), schema_json.as_str())?;
+            let mut seg_table = wtxn.open_table(SEGMENTS)?;
+            seg_table.insert(sk.as_str(), seg_json.as_str())?;
         }
         wtxn.commit()?;
         Ok(())
@@ -78,21 +86,8 @@ impl Storage {
         }
     }
 
-    /// Persist segment metadata.
-    pub fn put_segment(&self, collection: &str, meta: &SegmentMeta) -> Result<()> {
-        let key = seg_key(collection, meta.seg_id);
-        let json = serde_json::to_string(meta)?;
-        let wtxn = self.db.begin_write()?;
-        {
-            let mut table = wtxn.open_table(SEGMENTS)?;
-            table.insert(key.as_str(), json.as_str())?;
-        }
-        wtxn.commit()?;
-        Ok(())
-    }
-
     /// Load segment metadata.
-    pub fn get_segment(&self, collection: &str, seg_id: u32) -> Result<Option<SegmentMeta>> {
+    pub fn get_segment(&self, collection: &str, seg_id: SegId) -> Result<Option<SegmentMeta>> {
         let key = seg_key(collection, seg_id);
         let rtxn = self.db.begin_read()?;
         let table = rtxn.open_table(SEGMENTS)?;
@@ -100,24 +95,6 @@ impl Storage {
             Some(v) => Ok(Some(serde_json::from_str(v.value())?)),
             None => Ok(None),
         }
-    }
-
-    /// Write the `doc_id -> (seg_id, internal_id)` mapping.
-    pub fn put_doc_location(
-        &self,
-        collection: &str,
-        doc_id: &str,
-        loc: &DocLocation,
-    ) -> Result<()> {
-        let key = doc_key(collection, doc_id);
-        let json = serde_json::to_string(loc)?;
-        let wtxn = self.db.begin_write()?;
-        {
-            let mut table = wtxn.open_table(DOC_MAP)?;
-            table.insert(key.as_str(), json.as_str())?;
-        }
-        wtxn.commit()?;
-        Ok(())
     }
 
     /// Look up the storage location for a document.
@@ -144,7 +121,7 @@ impl Storage {
     }
 
     /// Mark a vector slot as deleted.
-    pub fn set_tombstone(&self, collection: &str, seg_id: u32, internal_id: u32) -> Result<()> {
+    pub fn set_tombstone(&self, collection: &str, seg_id: SegId, internal_id: u32) -> Result<()> {
         let key = meta_key(collection, seg_id, internal_id);
         let wtxn = self.db.begin_write()?;
         {
@@ -156,7 +133,7 @@ impl Storage {
     }
 
     /// Return `true` if the slot is tombstoned.
-    pub fn is_tombstoned(&self, collection: &str, seg_id: u32, internal_id: u32) -> Result<bool> {
+    pub fn is_tombstoned(&self, collection: &str, seg_id: SegId, internal_id: u32) -> Result<bool> {
         let key = meta_key(collection, seg_id, internal_id);
         let rtxn = self.db.begin_read()?;
         let table = rtxn.open_table(TOMBSTONES)?;
@@ -167,7 +144,7 @@ impl Storage {
     pub fn put_metadata(
         &self,
         collection: &str,
-        seg_id: u32,
+        seg_id: SegId,
         internal_id: u32,
         meta: &serde_json::Value,
     ) -> Result<()> {
@@ -186,7 +163,7 @@ impl Storage {
     pub fn get_metadata(
         &self,
         collection: &str,
-        seg_id: u32,
+        seg_id: SegId,
         internal_id: u32,
     ) -> Result<Option<serde_json::Value>> {
         let key = meta_key(collection, seg_id, internal_id);
@@ -198,19 +175,52 @@ impl Storage {
         }
     }
 
-    /// Store the reverse mapping `(seg_id, internal_id) -> doc_id`.
-    pub fn put_reverse_doc(
+    /// Write segment metadata, doc locations, reverse-doc mappings, and
+    /// optional per-vector metadata in a single redb transaction.
+    pub fn write_vector_entries(
         &self,
         collection: &str,
-        seg_id: u32,
-        internal_id: u32,
-        doc_id: &str,
+        seg_meta: &SegmentMeta,
+        entries: &[VectorEntry<'_>],
     ) -> Result<()> {
-        let key = meta_key(collection, seg_id, internal_id);
+        let seg_key = seg_key(collection, seg_meta.seg_id);
+        let seg_json = serde_json::to_string(seg_meta)?;
+
+        // Pre-serialise doc locations so we don't do it inside the txn.
+        let prepared: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                let dk = doc_key(collection, e.doc_id);
+                let loc = DocLocation {
+                    seg_id: seg_meta.seg_id,
+                    internal_id: e.internal_id,
+                };
+                let loc_json = serde_json::to_string(&loc)?;
+                let mk = meta_key(collection, seg_meta.seg_id, e.internal_id);
+                let meta_json = match e.metadata {
+                    Some(m) => Some(serde_json::to_string(m)?),
+                    None => None,
+                };
+                Ok((dk, loc_json, mk, e.doc_id, meta_json))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let wtxn = self.db.begin_write()?;
         {
-            let mut table = wtxn.open_table(REVERSE_DOC)?;
-            table.insert(key.as_str(), doc_id)?;
+            let mut seg_table = wtxn.open_table(SEGMENTS)?;
+            seg_table.insert(seg_key.as_str(), seg_json.as_str())?;
+
+            let mut doc_table = wtxn.open_table(DOC_MAP)?;
+            let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
+            let mut meta_table = wtxn.open_table(METADATA)?;
+
+            for (dk, loc_json, mk, doc_id, meta_json) in &prepared {
+                doc_table.insert(dk.as_str(), loc_json.as_str())?;
+                rev_table.insert(mk.as_str(), *doc_id)?;
+                if let Some(mj) = meta_json {
+                    meta_table.insert(mk.as_str(), mj.as_str())?;
+                }
+            }
         }
         wtxn.commit()?;
         Ok(())
@@ -220,7 +230,7 @@ impl Storage {
     pub fn get_reverse_doc(
         &self,
         collection: &str,
-        seg_id: u32,
+        seg_id: SegId,
         internal_id: u32,
     ) -> Result<Option<String>> {
         let key = meta_key(collection, seg_id, internal_id);
