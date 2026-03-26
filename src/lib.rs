@@ -40,6 +40,19 @@ impl Nebel {
         })
     }
 
+    /// Load an existing collection into memory, rebuilding the HNSW index
+    /// from the persisted vectors.
+    ///
+    /// This must be called after [`Nebel::open`] to make a previously-created
+    /// collection available for search and mutation.
+    pub fn load_collection(&mut self, name: &str) -> Result<()> {
+        let schema = self.get_schema(name)?;
+        let seg_id = schema.active_seg_id;
+        let dimension = schema.dimension;
+        self.load_segment(name, seg_id, dimension)?;
+        Ok(())
+    }
+
     /// Create a new collection with the given `name`, vector `dimension`, and distance `metric`.
     pub fn create_collection(
         &mut self,

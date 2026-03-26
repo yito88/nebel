@@ -127,3 +127,41 @@ fn ingest_binary_file() {
         .unwrap();
     assert_eq!(hits[0].doc_id, "doc_0");
 }
+
+#[test]
+fn load_collection_restores_data() {
+    let dir = tempdir().unwrap();
+
+    // Create a collection and insert vectors in one Nebel instance.
+    {
+        let mut db = Nebel::open(dir.path()).unwrap();
+        db.create_collection("col", 3, Metric::L2).unwrap();
+
+        let meta = serde_json::json!({"tag": "hello"});
+        db.upsert("col", "a", &[1.0, 0.0, 0.0], Some(meta))
+            .unwrap();
+        db.upsert("col", "b", &[0.0, 1.0, 0.0], None).unwrap();
+        db.upsert("col", "c", &[0.0, 0.0, 1.0], None).unwrap();
+        // Delete one so we can verify tombstones survive reload.
+        db.delete("col", "c").unwrap();
+    }
+
+    // Re-open from disk and load the collection.
+    let mut db = Nebel::open(dir.path()).unwrap();
+    db.load_collection("col").unwrap();
+
+    // Search should return "a" nearest to the query, and "c" must stay deleted.
+    let hits = db
+        .search("col", &[1.0, 0.01, 0.0], 3, true, true)
+        .unwrap();
+
+    assert_eq!(hits[0].doc_id, "a");
+    assert!(!hits.iter().any(|h| h.doc_id == "c"), "deleted doc must not reappear");
+
+    // Metadata should survive the reload.
+    assert_eq!(hits[0].metadata.as_ref().unwrap()["tag"], "hello");
+
+    // Vector should survive the reload.
+    let vec = hits[0].vector.as_ref().unwrap();
+    assert!((vec[0] - 1.0).abs() < 1e-6);
+}
