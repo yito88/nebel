@@ -24,13 +24,16 @@ use types::{
     VectorEntry,
 };
 
+struct CollectionContext {
+    schema: CollectionSchema,
+    manifest: Manifest,
+    segments: HashMap<SegId, Segment>,
+}
+
 pub struct Nebel {
     base_dir: PathBuf,
     storage: Storage,
-    /// In-memory segments per collection, keyed by (collection, seg_id).
-    segments: HashMap<CollectionId, HashMap<SegId, Segment>>,
-    /// Cached manifests per collection.
-    manifests: HashMap<CollectionId, Manifest>,
+    collections: HashMap<CollectionId, CollectionContext>,
 }
 
 impl Nebel {
@@ -43,8 +46,7 @@ impl Nebel {
         Ok(Self {
             base_dir,
             storage,
-            segments: HashMap::new(),
-            manifests: HashMap::new(),
+            collections: HashMap::new(),
         })
     }
 
@@ -54,15 +56,46 @@ impl Nebel {
     /// This must be called after [`Nebel::open`] to make a previously-created
     /// collection available for search and mutation.
     pub fn load_collection(&mut self, id: &CollectionId) -> Result<()> {
-        let schema = self.get_schema(id)?;
+        let schema = self
+            .storage
+            .get_collection(id)?
+            .ok_or_else(|| anyhow!("collection '{}' not found", id))?;
         let manifest = self
             .storage
             .get_manifest(id)?
             .ok_or_else(|| anyhow!("manifest not found for '{}'", id))?;
+
+        let mut segments = HashMap::new();
         for &seg_id in &manifest.active_segments {
-            self.load_segment(id, seg_id, schema.dimension)?;
+            let meta = self
+                .storage
+                .get_segment(id, seg_id)?
+                .ok_or_else(|| anyhow!("segment {} not found for '{}'", seg_id, id))?;
+            let dir = self.seg_dir(id, seg_id);
+            let seg = match meta.state {
+                SegmentState::Writable => Segment::Writable(WritableSegment::open(
+                    seg_id,
+                    dir,
+                    schema.dimension,
+                    meta.num_vectors,
+                )?),
+                SegmentState::Sealed => Segment::Sealed(segment::SealedSegment::open(
+                    seg_id,
+                    dir,
+                    meta.num_vectors,
+                )?),
+            };
+            segments.insert(seg_id, seg);
         }
-        self.manifests.insert(id.clone(), manifest);
+
+        self.collections.insert(
+            id.clone(),
+            CollectionContext {
+                schema,
+                manifest,
+                segments,
+            },
+        );
         Ok(())
     }
 
@@ -89,29 +122,37 @@ impl Nebel {
         self.storage
             .put_new_collection(&schema, &manifest, &SegmentMeta::new(SegId::FIRST))?;
         let seg = WritableSegment::create(SegId::FIRST, self.seg_dir(id, SegId::FIRST))?;
-        self.segments
-            .entry(id.clone())
-            .or_default()
-            .insert(SegId::FIRST, Segment::Writable(seg));
-        self.manifests.insert(id.clone(), manifest);
+        let mut segments = HashMap::new();
+        segments.insert(SegId::FIRST, Segment::Writable(seg));
+        self.collections.insert(
+            id.clone(),
+            CollectionContext {
+                schema,
+                manifest,
+                segments,
+            },
+        );
         Ok(())
     }
 
     /// Create a new writable segment for `collection`, sealing the previous
     /// writable segment and updating the manifest.
     pub fn add_writable_segment(&mut self, id: &CollectionId) -> Result<SegId> {
-        let schema = self.get_schema(id)?;
-        let manifest = self.get_manifest(id)?;
-        let old_id = manifest.writable_segment;
-        let new_id = manifest.next_seg_id;
-
-        // Compute dir before mutably borrowing the segment map.
+        let ctx = self
+            .collections
+            .get(id)
+            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        let old_id = ctx.manifest.writable_segment;
+        let new_id = ctx.manifest.next_seg_id;
         let new_dir = self.seg_dir(id, new_id);
 
-        // Seal the old writable segment: remove from map, seal, re-insert as sealed.
-        self.load_segment(id, old_id, schema.dimension)?;
-        let col_segs = self.segments.get_mut(id).expect("collection present");
-        let old_seg = col_segs.remove(&old_id).expect("old segment present");
+        let ctx = self.collections.get_mut(id).expect("collection present");
+
+        // Seal the old writable segment.
+        let old_seg = ctx
+            .segments
+            .remove(&old_id)
+            .ok_or_else(|| anyhow!("old writable segment not found"))?;
         let (sealed, num_vectors) = match old_seg {
             Segment::Writable(w) => {
                 let nv = w.num_vectors();
@@ -120,7 +161,7 @@ impl Nebel {
             }
             Segment::Sealed(_) => bail!("writable segment is already sealed"),
         };
-        col_segs.insert(old_id, Segment::Sealed(sealed));
+        ctx.segments.insert(old_id, Segment::Sealed(sealed));
 
         let old_meta = SegmentMeta {
             seg_id: old_id,
@@ -133,14 +174,13 @@ impl Nebel {
         self.storage
             .put_segment(id, &SegmentMeta::new(new_id))?;
         let seg = WritableSegment::create(new_id, new_dir)?;
-        col_segs.insert(new_id, Segment::Writable(seg));
 
-        let mut manifest = manifest;
-        manifest.active_segments.push(new_id);
-        manifest.writable_segment = new_id;
-        manifest.next_seg_id = new_id.next();
-        self.storage.put_manifest(id, &manifest)?;
-        self.manifests.insert(id.clone(), manifest);
+        let ctx = self.collections.get_mut(id).expect("collection present");
+        ctx.segments.insert(new_id, Segment::Writable(seg));
+        ctx.manifest.active_segments.push(new_id);
+        ctx.manifest.writable_segment = new_id;
+        ctx.manifest.next_seg_id = new_id.next();
+        self.storage.put_manifest(id, &ctx.manifest)?;
 
         Ok(new_id)
     }
@@ -160,8 +200,8 @@ impl Nebel {
         id: &CollectionId,
         file_path: impl AsRef<Path>,
     ) -> Result<usize> {
-        let schema = self.get_schema(id)?;
-        let record_size = schema.dimension * 4;
+        let dimension = self.get_ctx(id)?.schema.dimension;
+        let record_size = dimension * 4;
 
         let mut file = fs::File::open(file_path)?;
         let mut buf = vec![0u8; record_size * INGEST_BATCH_SIZE];
@@ -187,8 +227,8 @@ impl Nebel {
             let doc_ids: Vec<String> = (count..count + vectors.len())
                 .map(|i| format!("doc_{}", i))
                 .collect();
-            let manifest = self.writable_manifest(id, schema.dimension)?;
-            self.insert_vector_batch(id, &schema, &manifest, &doc_ids, &vectors)?;
+            self.ensure_writable_capacity(id)?;
+            self.insert_vector_batch(id, &doc_ids, &vectors)?;
             count += vectors.len();
         }
         Ok(count)
@@ -205,11 +245,11 @@ impl Nebel {
         vector: &[f32],
         metadata: Option<Value>,
     ) -> Result<()> {
-        let schema = self.get_schema(id)?;
-        if vector.len() != schema.dimension {
+        let dimension = self.get_ctx(id)?.schema.dimension;
+        if vector.len() != dimension {
             bail!(
                 "dimension mismatch: expected {}, got {}",
-                schema.dimension,
+                dimension,
                 vector.len()
             );
         }
@@ -217,8 +257,8 @@ impl Nebel {
             self.storage
                 .set_tombstone(id, loc.seg_id, loc.internal_id)?;
         }
-        let manifest = self.writable_manifest(id, schema.dimension)?;
-        self.insert_vector(id, &schema, &manifest, doc_id, vector, metadata)?;
+        self.ensure_writable_capacity(id)?;
+        self.insert_vector(id, doc_id, vector, metadata)?;
         Ok(())
     }
 
@@ -262,20 +302,28 @@ impl Nebel {
         include_metadata: bool,
         include_vector: bool,
     ) -> Result<Vec<SearchHit>> {
-        let schema = self.get_schema(id)?;
-        let manifest = self.get_manifest(id)?;
-        if query.len() != schema.dimension {
+        let ctx = self
+            .collections
+            .get(id)
+            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        let dimension = ctx.schema.dimension;
+        if query.len() != dimension {
             bail!(
                 "dimension mismatch: expected {}, got {}",
-                schema.dimension,
+                dimension,
                 query.len()
             );
         }
 
         // Collect candidates from all active segments.
         let mut candidates: Vec<(SegId, u32, f32)> = Vec::new();
-        for &seg_id in &manifest.active_segments {
-            let seg = self.load_segment(id, seg_id, schema.dimension)?;
+        let active_segments = ctx.manifest.active_segments.clone();
+        for &seg_id in &active_segments {
+            let seg = self
+                .collections
+                .get(id)
+                .and_then(|c| c.segments.get(&seg_id))
+                .ok_or_else(|| anyhow!("segment {} not loaded", seg_id))?;
             if seg.num_vectors() == 0 {
                 continue;
             }
@@ -303,10 +351,12 @@ impl Nebel {
                 None
             };
             let vector = if include_vector {
-                let seg = self.load_segment(id, seg_id, schema.dimension)?;
-                match seg {
-                    Segment::Writable(w) => Some(w.read_vector(internal_id, schema.dimension)?),
-                    Segment::Sealed(_) => None,
+                let ctx = self.collections.get_mut(id).expect("collection present");
+                match ctx.segments.get_mut(&seg_id) {
+                    Some(Segment::Writable(w)) => {
+                        Some(w.read_vector(internal_id, dimension)?)
+                    }
+                    _ => None,
                 }
             } else {
                 None
@@ -324,31 +374,31 @@ impl Nebel {
 
     // --- internal helpers ---
 
-    fn get_schema(&self, id: &CollectionId) -> Result<CollectionSchema> {
-        self.storage
-            .get_collection(id)?
-            .ok_or_else(|| anyhow!("collection '{}' not found", id))
+    fn get_ctx(&self, id: &CollectionId) -> Result<&CollectionContext> {
+        self.collections
+            .get(id)
+            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))
     }
 
-    fn get_manifest(&self, id: &CollectionId) -> Result<Manifest> {
-        if let Some(m) = self.manifests.get(id) {
-            return Ok(m.clone());
-        }
-        self.storage
-            .get_manifest(id)?
-            .ok_or_else(|| anyhow!("manifest not found for '{}'", id))
+    fn get_ctx_mut(&mut self, id: &CollectionId) -> Result<&mut CollectionContext> {
+        self.collections
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))
     }
 
-    /// Return the current manifest, rotating to a new writable segment if
-    /// the current one has reached [`SEGMENT_CAPACITY`].
-    fn writable_manifest(&mut self, id: &CollectionId, dimension: usize) -> Result<Manifest> {
-        let manifest = self.get_manifest(id)?;
-        let seg = self.load_segment(id, manifest.writable_segment, dimension)?;
-        if seg.num_vectors() >= SEGMENT_CAPACITY {
+    /// Rotate to a new writable segment if the current one has reached
+    /// [`SEGMENT_CAPACITY`].
+    fn ensure_writable_capacity(&mut self, id: &CollectionId) -> Result<()> {
+        let ctx = self.get_ctx(id)?;
+        let writable_id = ctx.manifest.writable_segment;
+        let at_capacity = ctx
+            .segments
+            .get(&writable_id)
+            .is_some_and(|s| s.num_vectors() >= SEGMENT_CAPACITY);
+        if at_capacity {
             self.add_writable_segment(id)?;
-            return self.get_manifest(id);
         }
-        Ok(manifest)
+        Ok(())
     }
 
     fn seg_dir(&self, id: &CollectionId, seg_id: SegId) -> PathBuf {
@@ -357,68 +407,21 @@ impl Nebel {
             .join(format!("seg_{:03}", seg_id.as_u32()))
     }
 
-    fn load_segment(
-        &mut self,
-        id: &CollectionId,
-        seg_id: SegId,
-        dimension: usize,
-    ) -> Result<&mut Segment> {
-        let needs_load = !self
-            .segments
-            .get(id)
-            .is_some_and(|m| m.contains_key(&seg_id));
-        if needs_load {
-            let meta = self
-                .storage
-                .get_segment(id, seg_id)?
-                .ok_or_else(|| anyhow!("segment {} not found for '{}'", seg_id, id))?;
-            let dir = self.seg_dir(id, seg_id);
-            let seg = match meta.state {
-                SegmentState::Writable => {
-                    Segment::Writable(WritableSegment::open(seg_id, dir, dimension, meta.num_vectors)?)
-                }
-                SegmentState::Sealed => {
-                    Segment::Sealed(segment::SealedSegment::open(seg_id, dir, meta.num_vectors)?)
-                }
-            };
-            self.segments
-                .entry(id.clone())
-                .or_default()
-                .insert(seg_id, seg);
-        }
-        Ok(self
-            .segments
-            .get_mut(id)
-            .expect("collection present")
-            .get_mut(&seg_id)
-            .expect("segment present"))
-    }
-
-    fn load_writable_segment(
-        &mut self,
-        id: &CollectionId,
-        seg_id: SegId,
-        dimension: usize,
-    ) -> Result<&mut WritableSegment> {
-        let seg = self.load_segment(id, seg_id, dimension)?;
-        match seg {
-            Segment::Writable(w) => Ok(w),
-            Segment::Sealed(_) => bail!("expected writable segment, got sealed"),
-        }
-    }
-
     fn insert_vector(
         &mut self,
         id: &CollectionId,
-        schema: &CollectionSchema,
-        manifest: &Manifest,
         doc_id: &str,
         vector: &[f32],
         metadata: Option<Value>,
     ) -> Result<()> {
-        let seg_id = manifest.writable_segment;
-        let seg = self.load_writable_segment(id, seg_id, schema.dimension)?;
-        let internal_id = seg.insert(vector, schema.dimension)?;
+        let ctx = self.get_ctx_mut(id)?;
+        let seg_id = ctx.manifest.writable_segment;
+        let dimension = ctx.schema.dimension;
+        let seg = match ctx.segments.get_mut(&seg_id) {
+            Some(Segment::Writable(w)) => w,
+            _ => bail!("expected writable segment"),
+        };
+        let internal_id = seg.insert(vector, dimension)?;
         let num_vectors = seg.num_vectors();
 
         self.write_vector_entries(
@@ -436,14 +439,17 @@ impl Nebel {
     fn insert_vector_batch(
         &mut self,
         id: &CollectionId,
-        schema: &CollectionSchema,
-        manifest: &Manifest,
         doc_ids: &[String],
         vectors: &[Vec<f32>],
     ) -> Result<()> {
-        let seg_id = manifest.writable_segment;
-        let seg = self.load_writable_segment(id, seg_id, schema.dimension)?;
-        let internal_ids = seg.insert_batch(vectors, schema.dimension)?;
+        let ctx = self.get_ctx_mut(id)?;
+        let seg_id = ctx.manifest.writable_segment;
+        let dimension = ctx.schema.dimension;
+        let seg = match ctx.segments.get_mut(&seg_id) {
+            Some(Segment::Writable(w)) => w,
+            _ => bail!("expected writable segment"),
+        };
+        let internal_ids = seg.insert_batch(vectors, dimension)?;
         let num_vectors = seg.num_vectors();
 
         let entries: Vec<VectorEntry<'_>> = doc_ids
@@ -459,8 +465,6 @@ impl Nebel {
         self.write_vector_entries(id, seg_id, num_vectors, &entries)
     }
 
-    /// Write segment metadata, doc locations, reverse-doc mappings, and
-    /// optional per-vector metadata in a single redb transaction.
     fn write_vector_entries(
         &self,
         id: &CollectionId,
