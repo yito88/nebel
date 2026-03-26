@@ -1,6 +1,9 @@
 use std::io::Write;
 
-use nebel::{Nebel, types::{CollectionId, Metric}};
+use nebel::{
+    Nebel,
+    types::{CollectionId, Metric},
+};
 use tempfile::tempdir;
 
 // tempfile is only in dev-deps; pull it in below via Cargo.toml.
@@ -25,9 +28,7 @@ fn create_and_search() {
     db.upsert(&id, "b", &[0.0, 1.0, 0.0], None).unwrap();
     db.upsert(&id, "c", &[0.0, 0.0, 1.0], None).unwrap();
 
-    let hits = db
-        .search(&id, &[1.0, 0.01, 0.0], 1, false, false)
-        .unwrap();
+    let hits = db.search(&id, &[1.0, 0.01, 0.0], 1, false, false).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].doc_id, "a");
 }
@@ -150,8 +151,7 @@ fn load_collection_restores_data() {
         db.create_collection(&id, 3, Metric::L2).unwrap();
 
         let meta = serde_json::json!({"tag": "hello"});
-        db.upsert(&id, "a", &[1.0, 0.0, 0.0], Some(meta))
-            .unwrap();
+        db.upsert(&id, "a", &[1.0, 0.0, 0.0], Some(meta)).unwrap();
         db.upsert(&id, "b", &[0.0, 1.0, 0.0], None).unwrap();
         db.upsert(&id, "c", &[0.0, 0.0, 1.0], None).unwrap();
         // Delete one so we can verify tombstones survive reload.
@@ -163,12 +163,13 @@ fn load_collection_restores_data() {
     db.load_collection(&id).unwrap();
 
     // Search should return "a" nearest to the query, and "c" must stay deleted.
-    let hits = db
-        .search(&id, &[1.0, 0.01, 0.0], 3, true, true)
-        .unwrap();
+    let hits = db.search(&id, &[1.0, 0.01, 0.0], 3, true, true).unwrap();
 
     assert_eq!(hits[0].doc_id, "a");
-    assert!(!hits.iter().any(|h| h.doc_id == "c"), "deleted doc must not reappear");
+    assert!(
+        !hits.iter().any(|h| h.doc_id == "c"),
+        "deleted doc must not reappear"
+    );
 
     // Metadata should survive the reload.
     assert_eq!(hits[0].metadata.as_ref().unwrap()["tag"], "hello");
@@ -197,9 +198,7 @@ fn multi_segment_search() {
 
     // Search should merge results across both segments.
     // Query near [1,0,0]: closest should be "a" then "d".
-    let hits = db
-        .search(&id, &[1.0, 0.0, 0.0], 2, false, false)
-        .unwrap();
+    let hits = db.search(&id, &[1.0, 0.0, 0.0], 2, false, false).unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].doc_id, "a");
     assert_eq!(hits[1].doc_id, "d");
@@ -242,9 +241,7 @@ fn load_collection_multi_segment() {
     let mut db = Nebel::open(dir.path()).unwrap();
     db.load_collection(&id).unwrap();
 
-    let hits = db
-        .search(&id, &[1.0, 0.0, 0.0], 2, false, false)
-        .unwrap();
+    let hits = db.search(&id, &[1.0, 0.0, 0.0], 2, false, false).unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].doc_id, "a");
     assert_eq!(hits[1].doc_id, "b");

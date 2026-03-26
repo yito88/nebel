@@ -1,7 +1,9 @@
 use anyhow::Result;
 use redb::{Database, TableDefinition};
 
-use crate::types::{CollectionId, CollectionSchema, DocLocation, Manifest, SegId, SegmentMeta, VectorEntry};
+use crate::types::{
+    CollectionId, CollectionSchema, DocLocation, Manifest, SegId, SegmentMeta, VectorEntry,
+};
 
 // table definitions
 
@@ -142,11 +144,7 @@ impl Storage {
     }
 
     /// Look up the storage location for a document.
-    pub fn get_doc_location(
-        &self,
-        id: &CollectionId,
-        doc_id: &str,
-    ) -> Result<Option<DocLocation>> {
+    pub fn get_doc_location(&self, id: &CollectionId, doc_id: &str) -> Result<Option<DocLocation>> {
         let key = doc_key(id.as_str(), doc_id);
         let rtxn = self.db.begin_read()?;
         let table = rtxn.open_table(DOC_MAP)?;
@@ -169,12 +167,7 @@ impl Storage {
     }
 
     /// Mark a vector slot as deleted.
-    pub fn set_tombstone(
-        &self,
-        id: &CollectionId,
-        seg_id: SegId,
-        internal_id: u32,
-    ) -> Result<()> {
+    pub fn set_tombstone(&self, id: &CollectionId, seg_id: SegId, internal_id: u32) -> Result<()> {
         let key = meta_key(id.as_str(), seg_id, internal_id);
         let wtxn = self.db.begin_write()?;
         {

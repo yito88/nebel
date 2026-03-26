@@ -62,12 +62,7 @@ impl WritableSegment {
     }
 
     /// Open an existing writable segment and rebuild the index from vectors.
-    pub fn open(
-        seg_id: SegId,
-        dir: PathBuf,
-        dimension: usize,
-        num_vectors: usize,
-    ) -> Result<Self> {
+    pub fn open(seg_id: SegId, dir: PathBuf, dimension: usize, num_vectors: usize) -> Result<Self> {
         let vector_file = fs::OpenOptions::new()
             .read(true)
             .write(true)

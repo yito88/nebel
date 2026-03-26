@@ -1,4 +1,7 @@
-use nebel::{Nebel, types::{CollectionId, Metric}};
+use nebel::{
+    Nebel,
+    types::{CollectionId, Metric},
+};
 
 fn main() -> anyhow::Result<()> {
     let mut db = Nebel::open("data")?;

@@ -79,11 +79,9 @@ impl Nebel {
                     schema.dimension,
                     meta.num_vectors,
                 )?),
-                SegmentState::Sealed => Segment::Sealed(segment::SealedSegment::open(
-                    seg_id,
-                    dir,
-                    meta.num_vectors,
-                )?),
+                SegmentState::Sealed => {
+                    Segment::Sealed(segment::SealedSegment::open(seg_id, dir, meta.num_vectors)?)
+                }
             };
             segments.insert(seg_id, seg);
         }
@@ -171,8 +169,7 @@ impl Nebel {
         self.storage.put_segment(id, &old_meta)?;
 
         // Create the new writable segment.
-        self.storage
-            .put_segment(id, &SegmentMeta::new(new_id))?;
+        self.storage.put_segment(id, &SegmentMeta::new(new_id))?;
         let seg = WritableSegment::create(new_id, new_dir)?;
 
         let ctx = self.collections.get_mut(id).expect("collection present");
@@ -195,11 +192,7 @@ impl Nebel {
     /// the HNSW index with `parallel_insert`.
     ///
     /// Returns the number of vectors ingested.
-    pub fn ingest_file(
-        &mut self,
-        id: &CollectionId,
-        file_path: impl AsRef<Path>,
-    ) -> Result<usize> {
+    pub fn ingest_file(&mut self, id: &CollectionId, file_path: impl AsRef<Path>) -> Result<usize> {
         let dimension = self.get_ctx(id)?.schema.dimension;
         let record_size = dimension * 4;
 
@@ -353,9 +346,7 @@ impl Nebel {
             let vector = if include_vector {
                 let ctx = self.collections.get_mut(id).expect("collection present");
                 match ctx.segments.get_mut(&seg_id) {
-                    Some(Segment::Writable(w)) => {
-                        Some(w.read_vector(internal_id, dimension)?)
-                    }
+                    Some(Segment::Writable(w)) => Some(w.read_vector(internal_id, dimension)?),
                     _ => None,
                 }
             } else {
@@ -477,16 +468,10 @@ impl Nebel {
             num_vectors,
             state: SegmentState::Writable,
         };
-        self.storage
-            .write_vector_entries(id, &seg_meta, entries)
+        self.storage.write_vector_entries(id, &seg_meta, entries)
     }
 
-    fn reverse_lookup(
-        &self,
-        id: &CollectionId,
-        seg_id: SegId,
-        internal_id: u32,
-    ) -> Result<String> {
+    fn reverse_lookup(&self, id: &CollectionId, seg_id: SegId, internal_id: u32) -> Result<String> {
         self.storage
             .get_reverse_doc(id, seg_id, internal_id)?
             .ok_or_else(|| {
