@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
 
@@ -149,12 +150,11 @@ impl WritableSegment {
     }
 
     /// Read a raw vector by internal_id.
-    pub fn read_vector(&mut self, internal_id: u32, dimension: usize) -> Result<Vec<f32>> {
+    pub fn read_vector(&self, internal_id: u32, dimension: usize) -> Result<Vec<f32>> {
         let record_size = dimension * 4;
         let offset = internal_id as u64 * record_size as u64;
         let mut buf = vec![0u8; record_size];
-        self.vector_file.seek(SeekFrom::Start(offset))?;
-        self.vector_file.read_exact(&mut buf)?;
+        self.vector_file.read_exact_at(&mut buf, offset)?;
         Ok(bytes_to_f32(&buf))
     }
 
