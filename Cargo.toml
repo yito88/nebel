@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "verify"
+path = "src/bin/verify.rs"
+
 [dev-dependencies]
 tempfile = "3"
 

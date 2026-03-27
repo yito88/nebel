@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,22 @@ pub enum Metric {
     L2,
     Cosine,
     Dot,
+}
+
+impl FromStr for Metric {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "l2" => Ok(Metric::L2),
+            "cosine" => Ok(Metric::Cosine),
+            "dot" => Ok(Metric::Dot),
+            _ => Err(format!(
+                "unknown metric: '{}' (expected l2, cosine, or dot)",
+                s
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

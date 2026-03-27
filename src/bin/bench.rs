@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, path::Path, time::Instant};
+use std::{fs, path::Path, time::Instant};
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use nebel::{
     Nebel,
-    types::{CollectionId, CollectionSchema, Metric, SearchHit, SegmentParams},
+    dataset::{load_vectors, write_raw_f32},
+    eval::{hits_to_ids, percentile, recall_at_k},
+    types::{CollectionId, CollectionSchema, Metric, SegmentParams},
 };
 
 // ---------------------------------------------------------------------------
@@ -18,7 +20,7 @@ use nebel::{
 #[derive(Parser)]
 #[command(name = "bench", about = "Benchmark for nebel vector DB")]
 struct Cli {
-    /// Path to base vectors (SIFT .bvecs / .fvecs or raw f32 LE)
+    /// Path to base vectors (SIFT .bvecs / .fvecs)
     #[arg(long)]
     base_file: String,
 
@@ -44,7 +46,7 @@ struct Cli {
 
     /// Distance metric
     #[arg(long, default_value = "l2")]
-    metric: String,
+    metric: Metric,
 
     /// Random seed for deterministic query subset selection
     #[arg(long, default_value_t = 42)]
@@ -109,133 +111,11 @@ struct BenchmarkSummary {
 }
 
 // ---------------------------------------------------------------------------
-// SIFT .fvecs / .bvecs reader
-// ---------------------------------------------------------------------------
-
-/// Read vectors from .fvecs format (SIFT convention):
-/// each record = 4-byte i32 dimension + dimension * 4-byte f32 values.
-fn read_fvecs(path: &Path) -> Result<(usize, Vec<Vec<f32>>)> {
-    let data = fs::read(path)?;
-    if data.len() < 4 {
-        bail!("file too small");
-    }
-    let dim = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let record_size = 4 + dim * 4;
-    if data.len() % record_size != 0 {
-        bail!(
-            "file size {} not divisible by record size {} (dim={})",
-            data.len(),
-            record_size,
-            dim
-        );
-    }
-    let n = data.len() / record_size;
-    let mut vectors = Vec::with_capacity(n);
-    for i in 0..n {
-        let offset = i * record_size + 4; // skip the 4-byte dim header per record
-        let floats: Vec<f32> = data[offset..offset + dim * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        vectors.push(floats);
-    }
-    Ok((dim, vectors))
-}
-
-/// Read vectors from .bvecs format (SIFT convention):
-/// each record = 4-byte i32 dimension + dimension * 1-byte u8 values (cast to f32).
-fn read_bvecs(path: &Path) -> Result<(usize, Vec<Vec<f32>>)> {
-    let data = fs::read(path)?;
-    if data.len() < 4 {
-        bail!("file too small");
-    }
-    let dim = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let record_size = 4 + dim;
-    if data.len() % record_size != 0 {
-        bail!(
-            "file size {} not divisible by record size {} (dim={})",
-            data.len(),
-            record_size,
-            dim
-        );
-    }
-    let n = data.len() / record_size;
-    let mut vectors = Vec::with_capacity(n);
-    for i in 0..n {
-        let offset = i * record_size + 4;
-        let floats: Vec<f32> = data[offset..offset + dim]
-            .iter()
-            .map(|&b| b as f32)
-            .collect();
-        vectors.push(floats);
-    }
-    Ok((dim, vectors))
-}
-
-/// Auto-detect format by extension and read vectors.
-fn load_vectors(path: &str) -> Result<(usize, Vec<Vec<f32>>)> {
-    let p = Path::new(path);
-    match p.extension().and_then(|e| e.to_str()) {
-        Some("fvecs") => read_fvecs(p),
-        Some("bvecs") => read_bvecs(p),
-        _ => {
-            // Try fvecs first, fall back to error
-            read_fvecs(p)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn parse_metric(s: &str) -> Result<Metric> {
-    match s.to_lowercase().as_str() {
-        "l2" => Ok(Metric::L2),
-        "cosine" => Ok(Metric::Cosine),
-        "dot" => Ok(Metric::Dot),
-        _ => bail!("unknown metric: {}", s),
-    }
-}
-
-fn hits_to_ids(hits: &[SearchHit]) -> Vec<String> {
-    hits.iter().map(|h| h.doc_id.clone()).collect()
-}
-
-fn recall_at_k(exact_ids: &[String], ann_ids: &[String], k: usize) -> f64 {
-    let exact_set: HashSet<&str> = exact_ids.iter().take(k).map(|s| s.as_str()).collect();
-    let ann_set: HashSet<&str> = ann_ids.iter().take(k).map(|s| s.as_str()).collect();
-    let intersection = exact_set.intersection(&ann_set).count();
-    intersection as f64 / k as f64
-}
-
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = (p / 100.0 * (sorted.len() - 1) as f64).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
-}
-
-/// Write base vectors to a temporary raw f32 file for `ingest_file`.
-fn write_raw_f32(path: &Path, vectors: &[Vec<f32>]) -> Result<()> {
-    use std::io::Write;
-    let mut f = fs::File::create(path)?;
-    for v in vectors {
-        for &val in v {
-            f.write_all(&val.to_le_bytes())?;
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let metric = parse_metric(&cli.metric)?;
     let params = SegmentParams {
         m: cli.m,
         ef_construction: cli.ef_construction,
@@ -281,19 +161,19 @@ fn main() -> Result<()> {
 
     // 4. Create collection and ingest
     let db_dir = tempfile::tempdir()?;
+    println!("DB temp dir: {}", db_dir.path().display());
     let mut db = Nebel::open(db_dir.path())?;
     let col_id = CollectionId::new(&cli.dataset_name);
     let schema = CollectionSchema {
         name: col_id.clone(),
         dimension: dim,
-        metric: metric.clone(),
+        metric: cli.metric.clone(),
         segment_params: params.clone(),
     };
     db.create_collection(schema)?;
 
     println!("Ingesting base vectors...");
     let ingest_start = Instant::now();
-    // Write base vectors to temp file for ingest_file
     let tmp_base = db_dir.path().join("base_vectors.raw");
     write_raw_f32(&tmp_base, &base_vectors)?;
     let num_ingested = db.ingest_file(&col_id, &tmp_base)?;
@@ -332,7 +212,7 @@ fn main() -> Result<()> {
         println!(" done in {:.2}s", exact_start.elapsed().as_secs_f64());
         ExactResults {
             dataset_name: cli.dataset_name.clone(),
-            metric: metric.clone(),
+            metric: cli.metric.clone(),
             k: cli.k,
             query_results,
         }
@@ -341,6 +221,9 @@ fn main() -> Result<()> {
     // Save exact results if requested
     if let Some(ref path) = cli.save_exact_results {
         println!("Saving exact results to {}...", path);
+        if let Some(parent) = Path::new(path).parent() {
+            fs::create_dir_all(parent)?;
+        }
         let json = serde_json::to_string_pretty(&exact_results)?;
         fs::write(path, json)?;
     }
@@ -375,7 +258,7 @@ fn main() -> Result<()> {
 
     let summary = BenchmarkSummary {
         dataset_name: cli.dataset_name.clone(),
-        metric: metric.clone(),
+        metric: cli.metric.clone(),
         k: cli.k,
         num_base_vectors: num_ingested,
         num_queries: bench_queries.len(),
@@ -418,6 +301,9 @@ fn main() -> Result<()> {
     // 10. Save summary if requested
     if let Some(ref path) = cli.save_summary {
         println!("\nSaving summary to {}...", path);
+        if let Some(parent) = Path::new(path).parent() {
+            fs::create_dir_all(parent)?;
+        }
         let json = serde_json::to_string_pretty(&summary)?;
         fs::write(path, json)?;
     }

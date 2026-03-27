@@ -1,4 +1,6 @@
 mod context;
+pub mod dataset;
+pub mod eval;
 mod segment;
 mod storage;
 pub mod types;
@@ -14,7 +16,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
 const DB_NAME: &str = "nebel.redb";
-const INGEST_BATCH_SIZE: usize = 512;
+const INGEST_BATCH_SIZE: usize = 2048;
 
 use context::CollectionContext;
 use segment::{Segment, WritableSegment};
