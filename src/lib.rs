@@ -30,6 +30,201 @@ struct CollectionContext {
     segments: HashMap<SegId, Segment>,
 }
 
+impl CollectionContext {
+    fn search(
+        &self,
+        storage: &Storage,
+        query: &[f32],
+        k: usize,
+        include_metadata: bool,
+        include_vector: bool,
+    ) -> Result<Vec<SearchHit>> {
+        let dimension = self.schema.dimension;
+        if query.len() != dimension {
+            bail!(
+                "dimension mismatch: expected {}, got {}",
+                dimension,
+                query.len()
+            );
+        }
+
+        let mut candidates: Vec<(SegId, u32, f32)> = Vec::new();
+        for &seg_id in &self.manifest.active_segments {
+            let seg = self
+                .segments
+                .get(&seg_id)
+                .ok_or_else(|| anyhow!("segment {} not loaded", seg_id))?;
+            if seg.num_vectors() == 0 {
+                continue;
+            }
+            for (internal_id, distance) in seg.search(query, k)? {
+                candidates.push((seg_id, internal_id, distance));
+            }
+        }
+
+        candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
+
+        let id = &self.schema.name;
+        let mut hits = Vec::new();
+        for (seg_id, internal_id, distance) in candidates {
+            if hits.len() >= k {
+                break;
+            }
+            if storage.is_tombstoned(id, seg_id, internal_id)? {
+                continue;
+            }
+            let doc_id = storage
+                .get_reverse_doc(id, seg_id, internal_id)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "reverse mapping not found for ({}, {})",
+                        seg_id,
+                        internal_id
+                    )
+                })?;
+            let metadata = if include_metadata {
+                storage.get_metadata(id, seg_id, internal_id)?
+            } else {
+                None
+            };
+            let vector = if include_vector {
+                match self.segments.get(&seg_id) {
+                    Some(Segment::Writable(w)) => Some(w.read_vector(internal_id, dimension)?),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            hits.push(SearchHit {
+                doc_id,
+                score: distance,
+                metadata,
+                vector,
+            });
+        }
+
+        Ok(hits)
+    }
+
+    fn upsert(
+        &mut self,
+        storage: &mut Storage,
+        doc_id: &str,
+        vector: &[f32],
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let dimension = self.schema.dimension;
+        if vector.len() != dimension {
+            bail!(
+                "dimension mismatch: expected {}, got {}",
+                dimension,
+                vector.len()
+            );
+        }
+        let id = &self.schema.name;
+        if let Some(loc) = storage.get_doc_location(id, doc_id)? {
+            storage.set_tombstone(id, loc.seg_id, loc.internal_id)?;
+        }
+        self.insert_vector(storage, doc_id, vector, metadata)
+    }
+
+    fn delete(&mut self, storage: &mut Storage, doc_id: &str) -> Result<()> {
+        let id = &self.schema.name;
+        let loc = storage
+            .get_doc_location(id, doc_id)?
+            .ok_or_else(|| anyhow!("document '{}' not found", doc_id))?;
+        storage.set_tombstone(id, loc.seg_id, loc.internal_id)?;
+        storage.remove_doc_location(id, doc_id)
+    }
+
+    fn update_metadata(&self, storage: &mut Storage, doc_id: &str, metadata: Value) -> Result<()> {
+        let id = &self.schema.name;
+        let loc = storage
+            .get_doc_location(id, doc_id)?
+            .ok_or_else(|| anyhow!("document '{}' not found", doc_id))?;
+        storage.put_metadata(id, loc.seg_id, loc.internal_id, &metadata)
+    }
+
+    fn ensure_writable_capacity(&self) -> bool {
+        let writable_id = self.manifest.writable_segment;
+        self.segments
+            .get(&writable_id)
+            .is_some_and(|s| s.num_vectors() >= SEGMENT_CAPACITY)
+    }
+
+    fn insert_vector(
+        &mut self,
+        storage: &mut Storage,
+        doc_id: &str,
+        vector: &[f32],
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let id = self.schema.name.clone();
+        let seg_id = self.manifest.writable_segment;
+        let dimension = self.schema.dimension;
+        let seg = match self.segments.get_mut(&seg_id) {
+            Some(Segment::Writable(w)) => w,
+            _ => bail!("expected writable segment"),
+        };
+        let internal_id = seg.insert(vector, dimension)?;
+        let num_vectors = seg.num_vectors();
+        self.write_vector_entries(
+            storage,
+            &id,
+            seg_id,
+            num_vectors,
+            &[VectorEntry {
+                doc_id,
+                internal_id,
+                metadata: metadata.as_ref(),
+            }],
+        )
+    }
+
+    fn insert_vector_batch(
+        &mut self,
+        storage: &mut Storage,
+        doc_ids: &[String],
+        vectors: &[Vec<f32>],
+    ) -> Result<()> {
+        let id = self.schema.name.clone();
+        let seg_id = self.manifest.writable_segment;
+        let dimension = self.schema.dimension;
+        let seg = match self.segments.get_mut(&seg_id) {
+            Some(Segment::Writable(w)) => w,
+            _ => bail!("expected writable segment"),
+        };
+        let internal_ids = seg.insert_batch(vectors, dimension)?;
+        let num_vectors = seg.num_vectors();
+        let entries: Vec<VectorEntry<'_>> = doc_ids
+            .iter()
+            .zip(internal_ids.iter())
+            .map(|(doc_id, &internal_id)| VectorEntry {
+                doc_id: doc_id.as_str(),
+                internal_id,
+                metadata: None,
+            })
+            .collect();
+        self.write_vector_entries(storage, &id, seg_id, num_vectors, &entries)
+    }
+
+    fn write_vector_entries(
+        &self,
+        storage: &Storage,
+        id: &CollectionId,
+        seg_id: SegId,
+        num_vectors: usize,
+        entries: &[VectorEntry<'_>],
+    ) -> Result<()> {
+        let seg_meta = SegmentMeta {
+            seg_id,
+            num_vectors,
+            state: SegmentState::Writable,
+        };
+        storage.write_vector_entries(id, &seg_meta, entries)
+    }
+}
+
 pub struct Nebel {
     base_dir: PathBuf,
     storage: Storage,
@@ -220,8 +415,11 @@ impl Nebel {
             let doc_ids: Vec<String> = (count..count + vectors.len())
                 .map(|i| format!("doc_{}", i))
                 .collect();
-            self.ensure_writable_capacity(id)?;
-            self.insert_vector_batch(id, &doc_ids, &vectors)?;
+            if self.get_ctx(id)?.ensure_writable_capacity() {
+                self.add_writable_segment(id)?;
+            }
+            let ctx = self.collections.get_mut(id).expect("collection present");
+            ctx.insert_vector_batch(&mut self.storage, &doc_ids, &vectors)?;
             count += vectors.len();
         }
         Ok(count)
@@ -238,33 +436,17 @@ impl Nebel {
         vector: &[f32],
         metadata: Option<Value>,
     ) -> Result<()> {
-        let dimension = self.get_ctx(id)?.schema.dimension;
-        if vector.len() != dimension {
-            bail!(
-                "dimension mismatch: expected {}, got {}",
-                dimension,
-                vector.len()
-            );
+        if self.get_ctx(id)?.ensure_writable_capacity() {
+            self.add_writable_segment(id)?;
         }
-        if let Some(loc) = self.storage.get_doc_location(id, doc_id)? {
-            self.storage
-                .set_tombstone(id, loc.seg_id, loc.internal_id)?;
-        }
-        self.ensure_writable_capacity(id)?;
-        self.insert_vector(id, doc_id, vector, metadata)?;
-        Ok(())
+        let ctx = self.collections.get_mut(id).expect("collection present");
+        ctx.upsert(&mut self.storage, doc_id, vector, metadata)
     }
 
     /// Mark a document as deleted (tombstone). Returns an error if not found.
     pub fn delete(&mut self, id: &CollectionId, doc_id: &str) -> Result<()> {
-        let loc = self
-            .storage
-            .get_doc_location(id, doc_id)?
-            .ok_or_else(|| anyhow!("document '{}' not found", doc_id))?;
-        self.storage
-            .set_tombstone(id, loc.seg_id, loc.internal_id)?;
-        self.storage.remove_doc_location(id, doc_id)?;
-        Ok(())
+        let ctx = self.collections.get_mut(id).ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        ctx.delete(&mut self.storage, doc_id)
     }
 
     /// Overwrite the stored metadata for `doc_id` without touching its vector.
@@ -274,13 +456,8 @@ impl Nebel {
         doc_id: &str,
         metadata: Value,
     ) -> Result<()> {
-        let loc = self
-            .storage
-            .get_doc_location(id, doc_id)?
-            .ok_or_else(|| anyhow!("document '{}' not found", doc_id))?;
-        self.storage
-            .put_metadata(id, loc.seg_id, loc.internal_id, &metadata)?;
-        Ok(())
+        let ctx = self.collections.get(id).ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        ctx.update_metadata(&mut self.storage, doc_id, metadata)
     }
 
     /// Return the `k` nearest neighbours to `query` across all active segments,
@@ -288,79 +465,15 @@ impl Nebel {
     ///
     /// Scores are raw L2 distances (lower = closer).
     pub fn search(
-        &mut self,
+        &self,
         id: &CollectionId,
         query: &[f32],
         k: usize,
         include_metadata: bool,
         include_vector: bool,
     ) -> Result<Vec<SearchHit>> {
-        let ctx = self
-            .collections
-            .get(id)
-            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
-        let dimension = ctx.schema.dimension;
-        if query.len() != dimension {
-            bail!(
-                "dimension mismatch: expected {}, got {}",
-                dimension,
-                query.len()
-            );
-        }
-
-        // Collect candidates from all active segments.
-        let mut candidates: Vec<(SegId, u32, f32)> = Vec::new();
-        let active_segments = ctx.manifest.active_segments.clone();
-        for &seg_id in &active_segments {
-            let seg = self
-                .collections
-                .get(id)
-                .and_then(|c| c.segments.get(&seg_id))
-                .ok_or_else(|| anyhow!("segment {} not loaded", seg_id))?;
-            if seg.num_vectors() == 0 {
-                continue;
-            }
-            let raw = seg.search(query, k)?;
-            for (internal_id, distance) in raw {
-                candidates.push((seg_id, internal_id, distance));
-            }
-        }
-
-        // Sort by distance ascending, take top k after filtering tombstones.
-        candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
-
-        let mut hits = Vec::new();
-        for (seg_id, internal_id, distance) in candidates {
-            if hits.len() >= k {
-                break;
-            }
-            if self.storage.is_tombstoned(id, seg_id, internal_id)? {
-                continue;
-            }
-            let doc_id = self.reverse_lookup(id, seg_id, internal_id)?;
-            let metadata = if include_metadata {
-                self.storage.get_metadata(id, seg_id, internal_id)?
-            } else {
-                None
-            };
-            let vector = if include_vector {
-                let ctx = self.collections.get_mut(id).expect("collection present");
-                match ctx.segments.get_mut(&seg_id) {
-                    Some(Segment::Writable(w)) => Some(w.read_vector(internal_id, dimension)?),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            hits.push(SearchHit {
-                doc_id,
-                score: distance,
-                metadata,
-                vector,
-            });
-        }
-
-        Ok(hits)
+        let ctx = self.collections.get(id).ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        ctx.search(&self.storage, query, k, include_metadata, include_vector)
     }
 
     // --- internal helpers ---
@@ -371,116 +484,10 @@ impl Nebel {
             .ok_or_else(|| anyhow!("collection '{}' not loaded", id))
     }
 
-    fn get_ctx_mut(&mut self, id: &CollectionId) -> Result<&mut CollectionContext> {
-        self.collections
-            .get_mut(id)
-            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))
-    }
-
-    /// Rotate to a new writable segment if the current one has reached
-    /// [`SEGMENT_CAPACITY`].
-    fn ensure_writable_capacity(&mut self, id: &CollectionId) -> Result<()> {
-        let ctx = self.get_ctx(id)?;
-        let writable_id = ctx.manifest.writable_segment;
-        let at_capacity = ctx
-            .segments
-            .get(&writable_id)
-            .is_some_and(|s| s.num_vectors() >= SEGMENT_CAPACITY);
-        if at_capacity {
-            self.add_writable_segment(id)?;
-        }
-        Ok(())
-    }
-
     fn seg_dir(&self, id: &CollectionId, seg_id: SegId) -> PathBuf {
         self.base_dir
             .join(id.as_str())
             .join(format!("seg_{:03}", seg_id.as_u32()))
-    }
-
-    fn insert_vector(
-        &mut self,
-        id: &CollectionId,
-        doc_id: &str,
-        vector: &[f32],
-        metadata: Option<Value>,
-    ) -> Result<()> {
-        let ctx = self.get_ctx_mut(id)?;
-        let seg_id = ctx.manifest.writable_segment;
-        let dimension = ctx.schema.dimension;
-        let seg = match ctx.segments.get_mut(&seg_id) {
-            Some(Segment::Writable(w)) => w,
-            _ => bail!("expected writable segment"),
-        };
-        let internal_id = seg.insert(vector, dimension)?;
-        let num_vectors = seg.num_vectors();
-
-        self.write_vector_entries(
-            id,
-            seg_id,
-            num_vectors,
-            &[VectorEntry {
-                doc_id,
-                internal_id,
-                metadata: metadata.as_ref(),
-            }],
-        )
-    }
-
-    fn insert_vector_batch(
-        &mut self,
-        id: &CollectionId,
-        doc_ids: &[String],
-        vectors: &[Vec<f32>],
-    ) -> Result<()> {
-        let ctx = self.get_ctx_mut(id)?;
-        let seg_id = ctx.manifest.writable_segment;
-        let dimension = ctx.schema.dimension;
-        let seg = match ctx.segments.get_mut(&seg_id) {
-            Some(Segment::Writable(w)) => w,
-            _ => bail!("expected writable segment"),
-        };
-        let internal_ids = seg.insert_batch(vectors, dimension)?;
-        let num_vectors = seg.num_vectors();
-
-        let entries: Vec<VectorEntry<'_>> = doc_ids
-            .iter()
-            .zip(internal_ids.iter())
-            .map(|(doc_id, &internal_id)| VectorEntry {
-                doc_id: doc_id.as_str(),
-                internal_id,
-                metadata: None,
-            })
-            .collect();
-
-        self.write_vector_entries(id, seg_id, num_vectors, &entries)
-    }
-
-    fn write_vector_entries(
-        &self,
-        id: &CollectionId,
-        seg_id: SegId,
-        num_vectors: usize,
-        entries: &[VectorEntry<'_>],
-    ) -> Result<()> {
-        let seg_meta = SegmentMeta {
-            seg_id,
-            num_vectors,
-            state: SegmentState::Writable,
-        };
-        self.storage.write_vector_entries(id, &seg_meta, entries)
-    }
-
-    fn reverse_lookup(&self, id: &CollectionId, seg_id: SegId, internal_id: u32) -> Result<String> {
-        self.storage
-            .get_reverse_doc(id, seg_id, internal_id)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "reverse mapping not found for ({}, {})",
-                    seg_id,
-                    internal_id
-                )
-            })
     }
 }
 
