@@ -1,13 +1,13 @@
 use nebel::{
     Nebel,
-    types::{CollectionId, Metric},
+    types::{CollectionId, CollectionSchema, Metric},
 };
 
 fn main() -> anyhow::Result<()> {
     let mut db = Nebel::open("data")?;
 
     let col = CollectionId::new("demo");
-    db.create_collection(&col, 4, Metric::L2)?;
+    db.create_collection(CollectionSchema::new(col.clone(), 4, Metric::L2))?;
 
     db.upsert(&col, "a", &[1.0, 0.0, 0.0, 0.0], None)?;
     db.upsert(&col, "b", &[0.0, 1.0, 0.0, 0.0], None)?;

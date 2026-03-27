@@ -50,10 +50,49 @@ pub enum Metric {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentParams {
+    /// Number of bi-directional links per node in the HNSW graph.
+    /// Higher = better recall, more memory. Typical range: 8–48.
+    pub m: usize,
+    /// Size of the candidate list during index construction.
+    /// Higher = better index quality, slower inserts.
+    pub ef_construction: usize,
+    /// Size of the candidate list during search.
+    /// Higher = better recall, slower queries.
+    pub ef_search: usize,
+    /// Number of vectors a writable segment holds before it is sealed.
+    pub segment_capacity: usize,
+}
+
+impl Default for SegmentParams {
+    fn default() -> Self {
+        Self {
+            m: 16,
+            ef_construction: 200,
+            ef_search: 50,
+            segment_capacity: 100_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionSchema {
     pub name: CollectionId,
     pub dimension: usize,
     pub metric: Metric,
+    pub segment_params: SegmentParams,
+}
+
+impl CollectionSchema {
+    /// Create a schema with the given identity fields and default [`SegmentParams`].
+    pub fn new(name: CollectionId, dimension: usize, metric: Metric) -> Self {
+        Self {
+            name,
+            dimension,
+            metric,
+            segment_params: SegmentParams::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

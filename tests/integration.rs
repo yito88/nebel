@@ -2,7 +2,7 @@ use std::io::Write;
 
 use nebel::{
     Nebel,
-    types::{CollectionId, Metric},
+    types::{CollectionId, CollectionSchema, Metric},
 };
 use tempfile::tempdir;
 
@@ -22,7 +22,8 @@ fn col(name: &str) -> CollectionId {
 fn create_and_search() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 3, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
+        .unwrap();
 
     db.upsert(&id, "a", &[1.0, 0.0, 0.0], None).unwrap();
     db.upsert(&id, "b", &[0.0, 1.0, 0.0], None).unwrap();
@@ -37,7 +38,8 @@ fn create_and_search() {
 fn tombstone_after_delete() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 2, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 2, Metric::L2))
+        .unwrap();
 
     db.upsert(&id, "x", &[1.0, 0.0], None).unwrap();
     db.upsert(&id, "y", &[0.0, 1.0], None).unwrap();
@@ -56,7 +58,8 @@ fn tombstone_after_delete() {
 fn upsert_replaces_vector() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 2, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 2, Metric::L2))
+        .unwrap();
 
     db.upsert(&id, "a", &[1.0, 0.0], None).unwrap();
     // Replace "a" with a new vector close to (0,1).
@@ -71,7 +74,8 @@ fn upsert_replaces_vector() {
 fn metadata_roundtrip() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 2, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 2, Metric::L2))
+        .unwrap();
 
     let meta = serde_json::json!({"label": "test", "value": 42});
     db.upsert(&id, "doc", &[1.0, 0.0], Some(meta.clone()))
@@ -85,7 +89,8 @@ fn metadata_roundtrip() {
 fn update_metadata_only() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 2, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 2, Metric::L2))
+        .unwrap();
 
     db.upsert(&id, "doc", &[1.0, 0.0], None).unwrap();
     db.update_metadata(&id, "doc", serde_json::json!({"v": 99}))
@@ -99,7 +104,8 @@ fn update_metadata_only() {
 fn include_vector_in_search() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 3, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
+        .unwrap();
 
     db.upsert(&id, "v", &[1.0, 2.0, 3.0], None).unwrap();
 
@@ -114,7 +120,8 @@ fn include_vector_in_search() {
 fn ingest_binary_file() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 4, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 4, Metric::L2))
+        .unwrap();
 
     // Write 3 vectors as raw f32 LE.
     let tmp = tempdir().unwrap();
@@ -148,7 +155,8 @@ fn load_collection_restores_data() {
     // Create a collection and insert vectors in one Nebel instance.
     {
         let mut db = Nebel::open(dir.path()).unwrap();
-        db.create_collection(&id, 3, Metric::L2).unwrap();
+        db.create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
+            .unwrap();
 
         let meta = serde_json::json!({"tag": "hello"});
         db.upsert(&id, "a", &[1.0, 0.0, 0.0], Some(meta)).unwrap();
@@ -183,7 +191,8 @@ fn load_collection_restores_data() {
 fn multi_segment_search() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 3, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
+        .unwrap();
 
     // Insert into segment 0.
     db.upsert(&id, "a", &[1.0, 0.0, 0.0], None).unwrap();
@@ -208,7 +217,8 @@ fn multi_segment_search() {
 fn multi_segment_tombstone() {
     let (mut db, _dir) = make_db();
     let id = col("col");
-    db.create_collection(&id, 2, Metric::L2).unwrap();
+    db.create_collection(CollectionSchema::new(id.clone(), 2, Metric::L2))
+        .unwrap();
 
     db.upsert(&id, "x", &[1.0, 0.0], None).unwrap();
 
@@ -230,7 +240,8 @@ fn load_collection_multi_segment() {
 
     {
         let mut db = Nebel::open(dir.path()).unwrap();
-        db.create_collection(&id, 3, Metric::L2).unwrap();
+        db.create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
+            .unwrap();
         db.upsert(&id, "a", &[1.0, 0.0, 0.0], None).unwrap();
 
         db.add_writable_segment(&id).unwrap();

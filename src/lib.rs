@@ -20,7 +20,7 @@ use context::CollectionContext;
 use segment::{Segment, WritableSegment};
 use storage::Storage;
 use types::{
-    CollectionId, CollectionSchema, Manifest, Metric, SearchHit, SegId, SegmentMeta, SegmentState,
+    CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta, SegmentState,
 };
 
 pub struct Nebel {
@@ -71,10 +71,16 @@ impl Nebel {
                     dir,
                     schema.dimension,
                     meta.num_vectors,
+                    &schema.metric,
+                    &schema.segment_params,
                 )?),
-                SegmentState::Sealed => {
-                    Segment::Sealed(segment::SealedSegment::open(seg_id, dir, meta.num_vectors)?)
-                }
+                SegmentState::Sealed => Segment::Sealed(segment::SealedSegment::open(
+                    seg_id,
+                    dir,
+                    meta.num_vectors,
+                    &schema.metric,
+                    schema.segment_params.ef_search,
+                )?),
             };
             segments.insert(seg_id, seg);
         }
@@ -90,21 +96,15 @@ impl Nebel {
         Ok(())
     }
 
-    /// Create a new collection with the given `name`, vector `dimension`, and distance `metric`.
-    pub fn create_collection(
-        &mut self,
-        id: &CollectionId,
-        dimension: usize,
-        metric: Metric,
-    ) -> Result<()> {
-        if self.storage.get_collection(id)?.is_some() {
+    /// Create a new collection from a [`CollectionSchema`].
+    ///
+    /// The collection id is taken from `schema.name`. Use [`CollectionSchema::new`]
+    /// to build a schema with default [`SegmentParams`].
+    pub fn create_collection(&mut self, schema: CollectionSchema) -> Result<()> {
+        let id = schema.name.clone();
+        if self.storage.get_collection(&id)?.is_some() {
             bail!("collection '{}' already exists", id);
         }
-        let schema = CollectionSchema {
-            name: id.clone(),
-            dimension,
-            metric,
-        };
         let manifest = Manifest {
             active_segments: vec![SegId::FIRST],
             writable_segment: SegId::FIRST,
@@ -112,11 +112,16 @@ impl Nebel {
         };
         self.storage
             .put_new_collection(&schema, &manifest, &SegmentMeta::new(SegId::FIRST))?;
-        let seg = WritableSegment::create(SegId::FIRST, self.seg_dir(id, SegId::FIRST))?;
+        let seg = WritableSegment::create(
+            SegId::FIRST,
+            self.seg_dir(&id, SegId::FIRST),
+            &schema.metric,
+            &schema.segment_params,
+        )?;
         let mut segments = HashMap::new();
         segments.insert(SegId::FIRST, Segment::Writable(seg));
         self.collections.insert(
-            id.clone(),
+            id,
             CollectionContext {
                 schema,
                 manifest,
@@ -163,7 +168,9 @@ impl Nebel {
 
         // Create the new writable segment.
         self.storage.put_segment(id, &SegmentMeta::new(new_id))?;
-        let seg = WritableSegment::create(new_id, new_dir)?;
+        let metric = self.collections[id].schema.metric.clone();
+        let params = self.collections[id].schema.segment_params.clone();
+        let seg = WritableSegment::create(new_id, new_dir, &metric, &params)?;
 
         let ctx = self.collections.get_mut(id).expect("collection present");
         ctx.segments.insert(new_id, Segment::Writable(seg));
