@@ -5,19 +5,103 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use hnsw_rs::prelude::*;
 
-use crate::types::SegId;
+use crate::types::{Metric, SegId, SegmentParams};
 
 const MAX_ELEMENTS: usize = 1_000_000;
 const MAX_LAYER: usize = 16;
-const HNSW_M: usize = 16;
-const EF_CONSTRUCTION: usize = 200;
-const EF_SEARCH: usize = 50;
 /// 256 MB buffer for rebuilding the HNSW index in chunks.
 const REBUILD_BUF_BYTES: usize = 256 * 1024 * 1024;
 const INDEX_BASENAME: &str = "index";
+
+// ---------------------------------------------------------------------------
+// HnswIndex — metric-polymorphic wrapper around hnsw_rs
+// ---------------------------------------------------------------------------
+
+enum HnswIndex {
+    L2(Hnsw<'static, f32, DistL2>),
+    Cosine(Hnsw<'static, f32, DistCosine>),
+    Dot(Hnsw<'static, f32, DistDot>),
+}
+
+impl HnswIndex {
+    fn new(metric: &Metric, m: usize, ef_construction: usize) -> Self {
+        match metric {
+            Metric::L2 => HnswIndex::L2(Hnsw::new(
+                m,
+                MAX_ELEMENTS,
+                MAX_LAYER,
+                ef_construction,
+                DistL2 {},
+            )),
+            Metric::Cosine => HnswIndex::Cosine(Hnsw::new(
+                m,
+                MAX_ELEMENTS,
+                MAX_LAYER,
+                ef_construction,
+                DistCosine {},
+            )),
+            Metric::Dot => HnswIndex::Dot(Hnsw::new(
+                m,
+                MAX_ELEMENTS,
+                MAX_LAYER,
+                ef_construction,
+                DistDot {},
+            )),
+        }
+    }
+
+    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Neighbour> {
+        match self {
+            HnswIndex::L2(idx) => idx.search(query, k, ef),
+            HnswIndex::Cosine(idx) => idx.search(query, k, ef),
+            HnswIndex::Dot(idx) => idx.search(query, k, ef),
+        }
+    }
+
+    fn insert(&self, data: (&[f32], usize)) {
+        match self {
+            HnswIndex::L2(idx) => idx.insert(data),
+            HnswIndex::Cosine(idx) => idx.insert(data),
+            HnswIndex::Dot(idx) => idx.insert(data),
+        }
+    }
+
+    fn parallel_insert(&self, data: &[(&Vec<f32>, usize)]) {
+        match self {
+            HnswIndex::L2(idx) => idx.parallel_insert(data),
+            HnswIndex::Cosine(idx) => idx.parallel_insert(data),
+            HnswIndex::Dot(idx) => idx.parallel_insert(data),
+        }
+    }
+
+    fn file_dump(&self, dir: &Path, basename: &str) -> Result<()> {
+        match self {
+            HnswIndex::L2(idx) => idx
+                .file_dump(dir, basename)
+                .map(|_| ())
+                .map_err(|e| anyhow!(e)),
+            HnswIndex::Cosine(idx) => idx
+                .file_dump(dir, basename)
+                .map(|_| ())
+                .map_err(|e| anyhow!(e)),
+            HnswIndex::Dot(idx) => idx
+                .file_dump(dir, basename)
+                .map(|_| ())
+                .map_err(|e| anyhow!(e)),
+        }
+    }
+
+    fn metric(&self) -> Metric {
+        match self {
+            HnswIndex::L2(_) => Metric::L2,
+            HnswIndex::Cosine(_) => Metric::Cosine,
+            HnswIndex::Dot(_) => Metric::Dot,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared in-memory metadata
@@ -36,13 +120,19 @@ struct SegMeta {
 
 pub struct WritableSegment {
     meta: SegMeta,
-    index: Hnsw<'static, f32, DistL2>,
+    index: HnswIndex,
+    ef_search: usize,
     vector_file: fs::File,
 }
 
 impl WritableSegment {
     /// Create a new empty writable segment on disk.
-    pub fn create(seg_id: SegId, dir: PathBuf) -> Result<Self> {
+    pub fn create(
+        seg_id: SegId,
+        dir: PathBuf,
+        metric: &Metric,
+        params: &SegmentParams,
+    ) -> Result<Self> {
         fs::create_dir_all(&dir)?;
         let vector_file = fs::OpenOptions::new()
             .create(true)
@@ -50,7 +140,7 @@ impl WritableSegment {
             .write(true)
             .truncate(true)
             .open(dir.join("vectors.seg"))?;
-        let index = Hnsw::new(HNSW_M, MAX_ELEMENTS, MAX_LAYER, EF_CONSTRUCTION, DistL2 {});
+        let index = HnswIndex::new(metric, params.m, params.ef_construction);
         Ok(Self {
             meta: SegMeta {
                 seg_id,
@@ -58,17 +148,25 @@ impl WritableSegment {
                 dir,
             },
             index,
+            ef_search: params.ef_search,
             vector_file,
         })
     }
 
     /// Open an existing writable segment and rebuild the index from vectors.
-    pub fn open(seg_id: SegId, dir: PathBuf, dimension: usize, num_vectors: usize) -> Result<Self> {
+    pub fn open(
+        seg_id: SegId,
+        dir: PathBuf,
+        dimension: usize,
+        num_vectors: usize,
+        metric: &Metric,
+        params: &SegmentParams,
+    ) -> Result<Self> {
         let vector_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(dir.join("vectors.seg"))?;
-        let index = Hnsw::new(HNSW_M, MAX_ELEMENTS, MAX_LAYER, EF_CONSTRUCTION, DistL2 {});
+        let index = HnswIndex::new(metric, params.m, params.ef_construction);
         let mut seg = Self {
             meta: SegMeta {
                 seg_id,
@@ -76,6 +174,7 @@ impl WritableSegment {
                 dir,
             },
             index,
+            ef_search: params.ef_search,
             vector_file,
         };
         seg.rebuild_index(dimension)?;
@@ -88,11 +187,13 @@ impl WritableSegment {
 
     /// Seal this segment: persist the index to disk and return a `SealedSegment`.
     pub fn seal(self) -> Result<SealedSegment> {
+        let metric = self.index.metric();
         self.index.file_dump(&self.meta.dir, INDEX_BASENAME)?;
-        let (index, index_io) = load_index(&self.meta.dir)?;
+        let (index, index_io) = load_index(&self.meta.dir, &metric)?;
         Ok(SealedSegment {
             meta: self.meta,
             index,
+            ef_search: self.ef_search,
             index_io,
         })
     }
@@ -141,7 +242,7 @@ impl WritableSegment {
 
     /// Nearest-neighbour search. Returns (internal_id, distance) pairs.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
-        let ef = EF_SEARCH.max(k);
+        let ef = self.ef_search.max(k);
         let neighbours = self.index.search(query, k, ef);
         Ok(neighbours
             .into_iter()
@@ -198,15 +299,22 @@ impl WritableSegment {
 
 pub struct SealedSegment {
     meta: SegMeta,
-    index: Hnsw<'static, f32, DistL2>,
+    index: HnswIndex,
+    ef_search: usize,
     #[allow(dead_code)]
     index_io: Box<HnswIo>,
 }
 
 impl SealedSegment {
     /// Open an existing sealed segment by loading the persisted index.
-    pub fn open(seg_id: SegId, dir: PathBuf, num_vectors: usize) -> Result<Self> {
-        let (index, index_io) = load_index(&dir)?;
+    pub fn open(
+        seg_id: SegId,
+        dir: PathBuf,
+        num_vectors: usize,
+        metric: &Metric,
+        ef_search: usize,
+    ) -> Result<Self> {
+        let (index, index_io) = load_index(&dir, metric)?;
         Ok(Self {
             meta: SegMeta {
                 seg_id,
@@ -214,13 +322,14 @@ impl SealedSegment {
                 dir,
             },
             index,
+            ef_search,
             index_io,
         })
     }
 
     /// Nearest-neighbour search. Returns (internal_id, distance) pairs.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
-        let ef = EF_SEARCH.max(k);
+        let ef = self.ef_search.max(k);
         let neighbours = self.index.search(query, k, ef);
         Ok(neighbours
             .into_iter()
@@ -270,12 +379,25 @@ impl Segment {
 ///
 /// Returns the index and the `HnswIo` that owns the memory-mapped backing data.
 /// The caller must keep the `Box<HnswIo>` alive for as long as the `Hnsw` is used.
-fn load_index(dir: &Path) -> Result<(Hnsw<'static, f32, DistL2>, Box<HnswIo>)> {
+fn load_index(dir: &Path, metric: &Metric) -> Result<(HnswIndex, Box<HnswIo>)> {
     let mut reloader = Box::new(HnswIo::new(dir, INDEX_BASENAME));
     // SAFETY: The Box<HnswIo> is stored alongside the Hnsw in SealedSegment,
     // ensuring the mmap backing lives as long as the index.
     let reloader_ref: &'static mut HnswIo = unsafe { &mut *(&mut *reloader as *mut HnswIo) };
-    let index: Hnsw<f32, DistL2> = reloader_ref.load_hnsw()?;
+    let index = match metric {
+        Metric::L2 => {
+            let idx: Hnsw<f32, DistL2> = reloader_ref.load_hnsw()?;
+            HnswIndex::L2(idx)
+        }
+        Metric::Cosine => {
+            let idx: Hnsw<f32, DistCosine> = reloader_ref.load_hnsw()?;
+            HnswIndex::Cosine(idx)
+        }
+        Metric::Dot => {
+            let idx: Hnsw<f32, DistDot> = reloader_ref.load_hnsw()?;
+            HnswIndex::Dot(idx)
+        }
+    };
     Ok((index, reloader))
 }
 

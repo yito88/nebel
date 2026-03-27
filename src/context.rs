@@ -10,8 +10,6 @@ use crate::types::{
     VectorEntry,
 };
 
-const SEGMENT_CAPACITY: usize = 100_000;
-
 pub(crate) struct CollectionContext {
     pub(crate) schema: CollectionSchema,
     pub(crate) manifest: Manifest,
@@ -142,7 +140,7 @@ impl CollectionContext {
         let writable_id = self.manifest.writable_segment;
         self.segments
             .get(&writable_id)
-            .is_some_and(|s| s.num_vectors() >= SEGMENT_CAPACITY)
+            .is_some_and(|s| s.num_vectors() >= self.schema.segment_params.segment_capacity)
     }
 
     pub(crate) fn insert_vector(
