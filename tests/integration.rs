@@ -254,7 +254,12 @@ fn search_exact_matches_brute_force() {
     assert_eq!(approx.len(), 3);
     for (e, a) in exact.iter().zip(approx.iter()) {
         assert_eq!(e.doc_id, a.doc_id);
-        assert!((e.score - a.score).abs() < 1e-3, "score mismatch: exact={} approx={}", e.score, a.score);
+        assert!(
+            (e.score - a.score).abs() < 1e-3,
+            "score mismatch: exact={} approx={}",
+            e.score,
+            a.score
+        );
     }
 }
 

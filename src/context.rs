@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, collections::{BinaryHeap, HashMap}};
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap},
+};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
@@ -95,6 +98,7 @@ impl CollectionContext {
     /// Brute-force exact search over all vectors.
     /// Computes the distance for every non-tombstoned vector and returns the
     /// top-k results sorted by distance (ascending).
+    #[allow(clippy::collapsible_if)]
     pub(crate) fn search_exact(
         &self,
         storage: &Storage,
@@ -131,11 +135,19 @@ impl CollectionContext {
                 let vector = seg.read_vector(internal_id, dimension)?;
                 let distance = compute_distance(metric, query, &vector);
                 if heap.len() < k {
-                    heap.push(HeapEntry { distance, seg_id, internal_id });
+                    heap.push(HeapEntry {
+                        distance,
+                        seg_id,
+                        internal_id,
+                    });
                 } else if let Some(worst) = heap.peek() {
                     if distance < worst.distance {
                         heap.pop();
-                        heap.push(HeapEntry { distance, seg_id, internal_id });
+                        heap.push(HeapEntry {
+                            distance,
+                            seg_id,
+                            internal_id,
+                        });
                     }
                 }
             }
@@ -143,7 +155,11 @@ impl CollectionContext {
 
         // Drain the heap and sort ascending by distance.
         let mut top_k: Vec<HeapEntry> = heap.into_vec();
-        top_k.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        top_k.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
 
         let mut hits = Vec::with_capacity(top_k.len());
         for entry in top_k {
