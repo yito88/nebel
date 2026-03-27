@@ -243,7 +243,10 @@ impl Nebel {
 
     /// Mark a document as deleted (tombstone). Returns an error if not found.
     pub fn delete(&mut self, id: &CollectionId, doc_id: &str) -> Result<()> {
-        let ctx = self.collections.get_mut(id).ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        let ctx = self
+            .collections
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
         ctx.delete(&mut self.storage, doc_id)
     }
 
@@ -254,7 +257,10 @@ impl Nebel {
         doc_id: &str,
         metadata: Value,
     ) -> Result<()> {
-        let ctx = self.collections.get(id).ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        let ctx = self
+            .collections
+            .get(id)
+            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
         ctx.update_metadata(&mut self.storage, doc_id, metadata)
     }
 
@@ -270,7 +276,10 @@ impl Nebel {
         include_metadata: bool,
         include_vector: bool,
     ) -> Result<Vec<SearchHit>> {
-        let ctx = self.collections.get(id).ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        let ctx = self
+            .collections
+            .get(id)
+            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
         ctx.search(&self.storage, query, k, include_metadata, include_vector)
     }
 
