@@ -1,9 +1,9 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, collections::{BinaryHeap, HashMap}};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::segment::Segment;
+use crate::segment::{Segment, compute_distance};
 use crate::storage::Storage;
 use crate::types::{
     CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta, SegmentState,
@@ -86,6 +86,81 @@ impl CollectionContext {
                 score: distance,
                 metadata,
                 vector,
+            });
+        }
+
+        Ok(hits)
+    }
+
+    /// Brute-force exact search over all vectors.
+    /// Computes the distance for every non-tombstoned vector and returns the
+    /// top-k results sorted by distance (ascending).
+    pub(crate) fn search_exact(
+        &self,
+        storage: &Storage,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let dimension = self.schema.dimension;
+        if query.len() != dimension {
+            bail!(
+                "dimension mismatch: expected {}, got {}",
+                dimension,
+                query.len()
+            );
+        }
+
+        let metric = &self.schema.metric;
+        let id = &self.schema.name;
+
+        // Max-heap of size k: stores (distance, seg_id, internal_id).
+        // The worst (largest distance) candidate sits at the top, so we can
+        // cheaply evict it when a closer vector is found.
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(k);
+
+        for &seg_id in &self.manifest.active_segments {
+            let seg = self
+                .segments
+                .get(&seg_id)
+                .ok_or_else(|| anyhow!("segment {} not loaded", seg_id))?;
+            let n = seg.num_vectors();
+            for internal_id in 0..n as u32 {
+                if storage.is_tombstoned(id, seg_id, internal_id)? {
+                    continue;
+                }
+                let vector = seg.read_vector(internal_id, dimension)?;
+                let distance = compute_distance(metric, query, &vector);
+                if heap.len() < k {
+                    heap.push(HeapEntry { distance, seg_id, internal_id });
+                } else if let Some(worst) = heap.peek() {
+                    if distance < worst.distance {
+                        heap.pop();
+                        heap.push(HeapEntry { distance, seg_id, internal_id });
+                    }
+                }
+            }
+        }
+
+        // Drain the heap and sort ascending by distance.
+        let mut top_k: Vec<HeapEntry> = heap.into_vec();
+        top_k.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+
+        let mut hits = Vec::with_capacity(top_k.len());
+        for entry in top_k {
+            let doc_id = storage
+                .get_reverse_doc(id, entry.seg_id, entry.internal_id)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "reverse mapping not found for ({}, {})",
+                        entry.seg_id,
+                        entry.internal_id
+                    )
+                })?;
+            hits.push(SearchHit {
+                doc_id,
+                score: entry.distance,
+                metadata: None,
+                vector: None,
             });
         }
 
@@ -213,5 +288,34 @@ impl CollectionContext {
             state: SegmentState::Writable,
         };
         storage.write_vector_entries(id, &seg_meta, entries)
+    }
+}
+
+/// Entry for the bounded max-heap used by `search_exact`.
+struct HeapEntry {
+    distance: f32,
+    seg_id: SegId,
+    internal_id: u32,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .partial_cmp(&other.distance)
+            .unwrap_or(Ordering::Equal)
     }
 }

@@ -336,6 +336,17 @@ impl SealedSegment {
             .map(|n| (n.d_id as u32, n.distance))
             .collect())
     }
+
+    /// Read a raw vector by internal_id from the on-disk vectors.seg file.
+    pub fn read_vector(&self, internal_id: u32, dimension: usize) -> Result<Vec<f32>> {
+        let record_size = dimension * 4;
+        let offset = internal_id as u64 * record_size as u64;
+        let mut buf = vec![0u8; record_size];
+        let path = self.meta.dir.join("vectors.seg");
+        let file = fs::File::open(&path)?;
+        file.read_exact_at(&mut buf, offset)?;
+        Ok(bytes_to_f32(&buf))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +380,13 @@ impl Segment {
             Segment::Sealed(s) => s.search(query, k),
         }
     }
+
+    pub fn read_vector(&self, internal_id: u32, dimension: usize) -> Result<Vec<f32>> {
+        match self {
+            Segment::Writable(s) => s.read_vector(internal_id, dimension),
+            Segment::Sealed(s) => s.read_vector(internal_id, dimension),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +417,28 @@ fn load_index(dir: &Path, metric: &Metric) -> Result<(HnswIndex, Box<HnswIo>)> {
         }
     };
     Ok((index, reloader))
+}
+
+/// Compute the raw distance between two vectors for the given metric.
+/// The result is consistent with hnsw_rs conventions (lower = closer).
+pub fn compute_distance(metric: &Metric, a: &[f32], b: &[f32]) -> f32 {
+    match metric {
+        Metric::L2 => {
+            let sq: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            sq.sqrt()
+        }
+        Metric::Cosine => {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let denom = norm_a * norm_b;
+            if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
+        }
+        Metric::Dot => {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            -dot
+        }
+    }
 }
 
 fn f32_to_bytes(v: &[f32]) -> Vec<u8> {

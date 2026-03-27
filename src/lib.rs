@@ -290,6 +290,21 @@ impl Nebel {
         ctx.search(&self.storage, query, k, include_metadata, include_vector)
     }
 
+    /// Brute-force exact search (for testing recall of the HNSW index).
+    #[doc(hidden)]
+    pub fn search_exact(
+        &self,
+        id: &CollectionId,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let ctx = self
+            .collections
+            .get(id)
+            .ok_or_else(|| anyhow!("collection '{}' not loaded", id))?;
+        ctx.search_exact(&self.storage, query, k)
+    }
+
     // --- internal helpers ---
 
     fn get_ctx(&self, id: &CollectionId) -> Result<&CollectionContext> {

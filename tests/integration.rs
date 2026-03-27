@@ -234,6 +234,68 @@ fn multi_segment_tombstone() {
 }
 
 #[test]
+fn search_exact_matches_brute_force() {
+    let (mut db, _dir) = make_db();
+    let id = col("col");
+    db.create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
+        .unwrap();
+
+    db.upsert(&id, "a", &[1.0, 0.0, 0.0], None).unwrap();
+    db.upsert(&id, "b", &[0.0, 1.0, 0.0], None).unwrap();
+    db.upsert(&id, "c", &[0.0, 0.0, 1.0], None).unwrap();
+    db.upsert(&id, "d", &[0.9, 0.1, 0.0], None).unwrap();
+
+    let query = [1.0, 0.05, 0.0];
+    let exact = db.search_exact(&id, &query, 3).unwrap();
+    let approx = db.search(&id, &query, 3, false, false).unwrap();
+
+    // Exact search should return the same top-k ordering as HNSW on this small dataset.
+    assert_eq!(exact.len(), 3);
+    assert_eq!(approx.len(), 3);
+    for (e, a) in exact.iter().zip(approx.iter()) {
+        assert_eq!(e.doc_id, a.doc_id);
+        assert!((e.score - a.score).abs() < 1e-3, "score mismatch: exact={} approx={}", e.score, a.score);
+    }
+}
+
+#[test]
+fn search_exact_respects_tombstones() {
+    let (mut db, _dir) = make_db();
+    let id = col("col");
+    db.create_collection(CollectionSchema::new(id.clone(), 2, Metric::L2))
+        .unwrap();
+
+    db.upsert(&id, "x", &[1.0, 0.0], None).unwrap();
+    db.upsert(&id, "y", &[0.0, 1.0], None).unwrap();
+    db.delete(&id, "x").unwrap();
+
+    let hits = db.search_exact(&id, &[1.0, 0.0], 2).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].doc_id, "y");
+}
+
+#[test]
+fn search_exact_multi_segment() {
+    let (mut db, _dir) = make_db();
+    let id = col("col");
+    db.create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
+        .unwrap();
+
+    db.upsert(&id, "a", &[1.0, 0.0, 0.0], None).unwrap();
+    db.upsert(&id, "b", &[0.0, 1.0, 0.0], None).unwrap();
+
+    db.add_writable_segment(&id).unwrap();
+
+    db.upsert(&id, "c", &[0.0, 0.0, 1.0], None).unwrap();
+    db.upsert(&id, "d", &[0.9, 0.1, 0.0], None).unwrap();
+
+    let hits = db.search_exact(&id, &[1.0, 0.0, 0.0], 2).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].doc_id, "a");
+    assert_eq!(hits[1].doc_id, "d");
+}
+
+#[test]
 fn load_collection_multi_segment() {
     let dir = tempdir().unwrap();
     let id = col("col");
