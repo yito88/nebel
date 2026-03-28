@@ -1,4 +1,8 @@
-use std::{fs, path::{Path, PathBuf}, time::Instant};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -208,7 +212,11 @@ fn main() -> Result<()> {
         let tmp_base = db_dir.path().join("base_vectors.raw");
         write_raw_f32(&tmp_base, &base_vectors)?;
         let n = db.ingest_file(&col_id, &tmp_base)?;
-        println!("  Ingested {} vectors in {:.2}s", n, ingest_start.elapsed().as_secs_f64());
+        println!(
+            "  Ingested {} vectors in {:.2}s",
+            n,
+            ingest_start.elapsed().as_secs_f64()
+        );
     }
 
     // 5. Warmup
@@ -219,9 +227,20 @@ fn main() -> Result<()> {
 
     // 6. Exact results: load or compute
     // When --data-dir is set, default exact results to {data_dir}/exact_results.json.
-    let auto_exact = cli.data_dir.as_ref().map(|d| PathBuf::from(d).join("exact_results.json"));
-    let load_exact = cli.load_exact_results.as_deref().map(PathBuf::from).or(auto_exact.clone());
-    let save_exact = cli.save_exact_results.as_deref().map(PathBuf::from).or(auto_exact);
+    let auto_exact = cli
+        .data_dir
+        .as_ref()
+        .map(|d| PathBuf::from(d).join("exact_results.json"));
+    let load_exact = cli
+        .load_exact_results
+        .as_deref()
+        .map(PathBuf::from)
+        .or(auto_exact.clone());
+    let save_exact = cli
+        .save_exact_results
+        .as_deref()
+        .map(PathBuf::from)
+        .or(auto_exact);
 
     let exact_results: ExactResults = if let Some(ref path) = load_exact.filter(|p| p.exists()) {
         println!("Loading exact results from {}...", path.display());
