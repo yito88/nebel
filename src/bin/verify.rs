@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{path::{Path, PathBuf}, time::Instant};
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -62,6 +62,11 @@ struct Cli {
 
     #[arg(long, default_value_t = 100_000)]
     segment_capacity: usize,
+
+    /// Persist ingested DB to this directory and reuse it on subsequent runs.
+    /// If omitted, a temporary directory is used and discarded after the run.
+    #[arg(long)]
+    data_dir: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,29 +120,56 @@ fn main() -> Result<()> {
     let num_queries = indices.len();
     println!("  Using {} queries for verification", num_queries);
 
-    // 5. Create collection and ingest
-    let db_dir = tempfile::tempdir()?;
-    println!("DB temp dir: {}", db_dir.path().display());
-    let mut db = Nebel::open(db_dir.path())?;
+    // 5. Open or create DB, ingest if needed
     let col_id = CollectionId::new("verify");
-    let schema = CollectionSchema {
-        name: col_id.clone(),
-        dimension: dim,
-        metric: cli.metric.clone(),
-        segment_params: params.clone(),
-    };
-    db.create_collection(schema)?;
 
-    println!("Ingesting base vectors...");
-    let ingest_start = Instant::now();
-    let tmp_base = db_dir.path().join("base_vectors.raw");
-    write_raw_f32(&tmp_base, &base_vectors)?;
-    let num_ingested = db.ingest_file(&col_id, &tmp_base)?;
-    println!(
-        "  Ingested {} vectors in {:.2}s",
-        num_ingested,
-        ingest_start.elapsed().as_secs_f64()
-    );
+    enum DbDir {
+        Temp(tempfile::TempDir),
+        Persistent(PathBuf),
+    }
+    impl DbDir {
+        fn path(&self) -> &Path {
+            match self {
+                DbDir::Temp(t) => t.path(),
+                DbDir::Persistent(p) => p.as_path(),
+            }
+        }
+    }
+
+    let (db_dir, mut db, reused) = if let Some(ref dir) = cli.data_dir {
+        let path = PathBuf::from(dir);
+        let mut db = Nebel::open(&path)?;
+        let reused = db.load_collection(&col_id).is_ok();
+        (DbDir::Persistent(path), db, reused)
+    } else {
+        let tmp = tempfile::tempdir()?;
+        println!("DB temp dir: {}", tmp.path().display());
+        let db = Nebel::open(tmp.path())?;
+        (DbDir::Temp(tmp), db, false)
+    };
+
+    if reused {
+        println!("Reusing existing DB at {}", db_dir.path().display());
+    } else {
+        let schema = CollectionSchema {
+            name: col_id.clone(),
+            dimension: dim,
+            metric: cli.metric.clone(),
+            segment_params: params.clone(),
+        };
+        db.create_collection(schema)?;
+
+        println!("Ingesting base vectors...");
+        let ingest_start = Instant::now();
+        let tmp_base = db_dir.path().join("base_vectors.raw");
+        write_raw_f32(&tmp_base, &base_vectors)?;
+        let num_ingested = db.ingest_file(&col_id, &tmp_base)?;
+        println!(
+            "  Ingested {} vectors in {:.2}s",
+            num_ingested,
+            ingest_start.elapsed().as_secs_f64()
+        );
+    }
 
     // 6. Run search_exact and search(ANN) for each query
     println!(
