@@ -9,7 +9,9 @@ use std::{
     collections::HashMap,
     fs,
     io::Read,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    thread,
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -17,12 +19,14 @@ use serde_json::Value;
 
 const DB_NAME: &str = "nebel.redb";
 const INGEST_BATCH_SIZE: usize = 2048;
+const MAX_INGEST_THREADS: usize = 4;
 
 use context::CollectionContext;
 use segment::{Segment, WritableSegment};
 use storage::Storage;
 use types::{
     CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta, SegmentState,
+    VectorEntry,
 };
 
 pub struct Nebel {
@@ -230,6 +234,193 @@ impl Nebel {
             count += vectors.len();
         }
         Ok(count)
+    }
+
+    /// Ingest vectors from a binary file using parallel segment building.
+    ///
+    /// Same file format as [`ingest_file`](Self::ingest_file). Pre-splits the
+    /// data into segment-sized chunks and builds each segment's HNSW index on
+    /// a separate thread (up to [`MAX_INGEST_THREADS`] concurrently). Each
+    /// thread uses sequential index inserts to avoid contention with the rayon
+    /// pool used by `parallel_insert`.
+    ///
+    /// Returns the number of vectors ingested.
+    pub fn ingest_file_parallel(
+        &mut self,
+        id: &CollectionId,
+        file_path: impl AsRef<Path>,
+    ) -> Result<usize> {
+        let ctx = self.get_ctx(id)?;
+        let dimension = ctx.schema.dimension;
+        let metric = ctx.schema.metric.clone();
+        let params = ctx.schema.segment_params.clone();
+        let segment_capacity = params.segment_capacity;
+        let record_size = dimension * 4;
+
+        let file_len = fs::metadata(&file_path)?.len() as usize;
+        if !file_len.is_multiple_of(record_size) {
+            bail!(
+                "file size {} not divisible by record size {}",
+                file_len,
+                record_size
+            );
+        }
+        let total_vectors = file_len / record_size;
+        if total_vectors == 0 {
+            return Ok(0);
+        }
+
+        // Plan segments: each gets up to `segment_capacity` vectors.
+        let num_segments = total_vectors.div_ceil(segment_capacity);
+
+        struct SegPlan {
+            seg_id: SegId,
+            dir: PathBuf,
+            doc_offset: usize, // global doc index offset
+            num_vectors: usize,
+            file_byte_offset: u64,
+        }
+
+        let mut current_seg_id = ctx.manifest.next_seg_id;
+        let mut plans = Vec::with_capacity(num_segments);
+        for i in 0..num_segments {
+            let doc_offset = i * segment_capacity;
+            let num = segment_capacity.min(total_vectors - doc_offset);
+            plans.push(SegPlan {
+                seg_id: current_seg_id,
+                dir: self.seg_dir(id, current_seg_id),
+                doc_offset,
+                num_vectors: num,
+                file_byte_offset: (doc_offset * record_size) as u64,
+            });
+            current_seg_id = current_seg_id.next();
+        }
+
+        // Phase 2: Build segments in parallel, MAX_INGEST_THREADS at a time.
+        // Each thread returns (WritableSegment, Vec<(doc_id, internal_id)>).
+        let file = fs::File::open(&file_path)?;
+
+        struct BuiltSegment {
+            seg_id: SegId,
+            segment: WritableSegment,
+            entries: Vec<(String, u32)>, // (doc_id, internal_id)
+        }
+
+        let mut built: Vec<BuiltSegment> = Vec::with_capacity(num_segments);
+
+        for chunk in plans.chunks(MAX_INGEST_THREADS) {
+            let results: Vec<Result<BuiltSegment>> = thread::scope(|s| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|plan| {
+                        let file = &file;
+                        let metric = &metric;
+                        let params = &params;
+                        s.spawn(move || {
+                            // Read this segment's portion of the file.
+                            let byte_len = plan.num_vectors * record_size;
+                            let mut buf = vec![0u8; byte_len];
+                            file.read_exact_at(&mut buf, plan.file_byte_offset)?;
+
+                            let vectors: Vec<Vec<f32>> = buf
+                                .chunks_exact(record_size)
+                                .map(|c| {
+                                    c.chunks_exact(4)
+                                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                        .collect()
+                                })
+                                .collect();
+
+                            // Create segment and build index sequentially.
+                            let mut seg = WritableSegment::create(
+                                plan.seg_id,
+                                plan.dir.clone(),
+                                metric,
+                                params,
+                            )?;
+
+                            // Insert in sub-batches to limit memory.
+                            let mut entries = Vec::with_capacity(vectors.len());
+                            for batch in vectors.chunks(INGEST_BATCH_SIZE) {
+                                let ids = seg.insert_batch_sequential(batch, dimension)?;
+                                for (i, internal_id) in ids.into_iter().enumerate() {
+                                    let global_idx = plan.doc_offset + entries.len() + i;
+                                    entries.push((format!("doc_{}", global_idx), internal_id));
+                                }
+                            }
+
+                            Ok(BuiltSegment {
+                                seg_id: plan.seg_id,
+                                segment: seg,
+                                entries,
+                            })
+                        })
+                    })
+                    .collect();
+
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            for r in results {
+                built.push(r?);
+            }
+        }
+
+        // Phase 3: Commit metadata to storage (single-threaded).
+        // Seal all segments except the last (which stays writable).
+        let col_id = id.clone();
+
+        for (i, b) in built.iter().enumerate() {
+            let is_last = i == built.len() - 1;
+            let state = if is_last {
+                SegmentState::Writable
+            } else {
+                SegmentState::Sealed
+            };
+            let seg_meta = SegmentMeta {
+                seg_id: b.seg_id,
+                num_vectors: b.entries.len(),
+                state,
+            };
+
+            let ve: Vec<VectorEntry<'_>> = b
+                .entries
+                .iter()
+                .map(|(doc_id, internal_id)| VectorEntry {
+                    doc_id: doc_id.as_str(),
+                    internal_id: *internal_id,
+                    metadata: None,
+                })
+                .collect();
+            self.storage.write_vector_entries(&col_id, &seg_meta, &ve)?;
+        }
+
+        // Seal non-last segments, register all in the collection context.
+        let mut segments = HashMap::new();
+        for (i, b) in built.into_iter().enumerate() {
+            let is_last = i == num_segments - 1;
+            let seg = if is_last {
+                Segment::Writable(b.segment)
+            } else {
+                Segment::Sealed(b.segment.seal()?)
+            };
+            segments.insert(b.seg_id, seg);
+        }
+
+        // Update manifest.
+        let last_seg_id = plans.last().unwrap().seg_id;
+        let manifest = Manifest {
+            active_segments: plans.iter().map(|p| p.seg_id).collect(),
+            writable_segment: last_seg_id,
+            next_seg_id: current_seg_id,
+        };
+        self.storage.put_manifest(&col_id, &manifest)?;
+
+        let ctx = self.collections.get_mut(id).expect("collection present");
+        ctx.manifest = manifest;
+        ctx.segments = segments;
+
+        Ok(total_vectors)
     }
 
     /// Insert or replace a document.

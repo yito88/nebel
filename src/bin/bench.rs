@@ -86,6 +86,10 @@ struct Cli {
     /// If omitted, a temporary directory is used and discarded after the run.
     #[arg(long)]
     data_dir: Option<String>,
+
+    /// Use parallel ingestion (builds segments concurrently).
+    #[arg(long, default_value_t = false)]
+    parallel_ingest: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,11 +211,20 @@ fn main() -> Result<()> {
         };
         db.create_collection(schema)?;
 
-        println!("Ingesting base vectors...");
+        let mode = if cli.parallel_ingest {
+            "parallel"
+        } else {
+            "sequential"
+        };
+        println!("Ingesting base vectors ({})...", mode);
         let ingest_start = Instant::now();
         let tmp_base = db_dir.path().join("base_vectors.raw");
         write_raw_f32(&tmp_base, &base_vectors)?;
-        let n = db.ingest_file(&col_id, &tmp_base)?;
+        let n = if cli.parallel_ingest {
+            db.ingest_file_parallel(&col_id, &tmp_base)?
+        } else {
+            db.ingest_file(&col_id, &tmp_base)?
+        };
         println!(
             "  Ingested {} vectors in {:.2}s",
             n,

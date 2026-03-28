@@ -240,6 +240,37 @@ impl WritableSegment {
         Ok(ids)
     }
 
+    /// Append a batch of vectors using sequential `insert` calls on the index.
+    /// Suitable for use in multi-threaded ingestion where each thread builds
+    /// its own segment and inter-segment parallelism replaces intra-segment
+    /// `parallel_insert`.
+    pub fn insert_batch_sequential(
+        &mut self,
+        vectors: &[Vec<f32>],
+        dimension: usize,
+    ) -> Result<Vec<u32>> {
+        if vectors.is_empty() {
+            return Ok(vec![]);
+        }
+        let first_id = self.meta.num_vectors;
+        let offset = (first_id * dimension * 4) as u64;
+        self.vector_file.seek(SeekFrom::Start(offset))?;
+        for v in vectors {
+            self.vector_file.write_all(&f32_to_bytes(v))?;
+        }
+        self.vector_file.flush()?;
+
+        for (i, v) in vectors.iter().enumerate() {
+            self.index.insert((v.as_slice(), first_id + i));
+        }
+
+        let ids = (first_id..first_id + vectors.len())
+            .map(|i| i as u32)
+            .collect();
+        self.meta.num_vectors += vectors.len();
+        Ok(ids)
+    }
+
     /// Nearest-neighbour search. Returns (internal_id, distance) pairs.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
         let ef = self.ef_search.max(k);

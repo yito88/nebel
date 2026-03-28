@@ -2,7 +2,7 @@ use std::io::Write;
 
 use nebel::{
     Nebel,
-    types::{CollectionId, CollectionSchema, Metric},
+    types::{CollectionId, CollectionSchema, Metric, SegmentParams},
 };
 use tempfile::tempdir;
 
@@ -323,4 +323,60 @@ fn load_collection_multi_segment() {
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].doc_id, "a");
     assert_eq!(hits[1].doc_id, "b");
+}
+
+#[test]
+fn ingest_file_parallel_basic() {
+    let dir = tempdir().unwrap();
+    let mut db = Nebel::open(dir.path()).unwrap();
+    let id = col("col");
+
+    // Use a small segment capacity to force multiple segments.
+    let schema = CollectionSchema {
+        name: id.clone(),
+        dimension: 4,
+        metric: Metric::L2,
+        segment_params: SegmentParams {
+            segment_capacity: 3,
+            ..SegmentParams::default()
+        },
+    };
+    db.create_collection(schema).unwrap();
+
+    // Write 7 vectors → should create 3 segments (3 + 3 + 1).
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("vecs.bin");
+    let mut f = std::fs::File::create(&path).unwrap();
+    let vectors: Vec<[f32; 4]> = vec![
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.5, 0.5, 0.0, 0.0],
+        [0.0, 0.5, 0.5, 0.0],
+        [0.9, 0.1, 0.0, 0.0],
+    ];
+    for vec in &vectors {
+        for &v in vec {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+    }
+    drop(f);
+
+    let count = db.ingest_file_parallel(&id, &path).unwrap();
+    assert_eq!(count, 7);
+
+    // Verify search works across segments.
+    let hits = db
+        .search(&id, &[1.0, 0.0, 0.0, 0.0], 2, false, false)
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].doc_id, "doc_0");
+    assert_eq!(hits[1].doc_id, "doc_6"); // [0.9, 0.1, 0.0, 0.0]
+
+    // Verify exact search also works.
+    let exact = db.search_exact(&id, &[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+    assert_eq!(exact.len(), 2);
+    assert_eq!(exact[0].doc_id, "doc_0");
+    assert_eq!(exact[1].doc_id, "doc_6");
 }
