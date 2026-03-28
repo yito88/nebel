@@ -1,4 +1,8 @@
-use std::{fs, path::Path, time::Instant};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -77,6 +81,11 @@ struct Cli {
     /// Save benchmark summary to this path (JSON)
     #[arg(long)]
     save_summary: Option<String>,
+
+    /// Persist ingested DB to this directory and reuse it on subsequent runs.
+    /// If omitted, a temporary directory is used and discarded after the run.
+    #[arg(long)]
+    data_dir: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,30 +168,56 @@ fn main() -> Result<()> {
         bench_queries.len()
     );
 
-    // 4. Create collection and ingest
-    let db_dir = tempfile::tempdir()?;
-    println!("DB temp dir: {}", db_dir.path().display());
-    let mut db = Nebel::open(db_dir.path())?;
+    // 4. Open or create DB, ingest if needed
     let col_id = CollectionId::new(&cli.dataset_name);
-    let schema = CollectionSchema {
-        name: col_id.clone(),
-        dimension: dim,
-        metric: cli.metric.clone(),
-        segment_params: params.clone(),
-    };
-    db.create_collection(schema)?;
 
-    println!("Ingesting base vectors...");
-    let ingest_start = Instant::now();
-    let tmp_base = db_dir.path().join("base_vectors.raw");
-    write_raw_f32(&tmp_base, &base_vectors)?;
-    let num_ingested = db.ingest_file(&col_id, &tmp_base)?;
-    let ingest_elapsed = ingest_start.elapsed();
-    println!(
-        "  Ingested {} vectors in {:.2}s",
-        num_ingested,
-        ingest_elapsed.as_secs_f64()
-    );
+    enum DbDir {
+        Temp(tempfile::TempDir),
+        Persistent(PathBuf),
+    }
+    impl DbDir {
+        fn path(&self) -> &Path {
+            match self {
+                DbDir::Temp(t) => t.path(),
+                DbDir::Persistent(p) => p.as_path(),
+            }
+        }
+    }
+
+    let (db_dir, mut db, reused) = if let Some(ref dir) = cli.data_dir {
+        let path = PathBuf::from(dir);
+        let mut db = Nebel::open(&path)?;
+        let reused = db.load_collection(&col_id).is_ok();
+        (DbDir::Persistent(path), db, reused)
+    } else {
+        let tmp = tempfile::tempdir()?;
+        println!("DB temp dir: {}", tmp.path().display());
+        let db = Nebel::open(tmp.path())?;
+        (DbDir::Temp(tmp), db, false)
+    };
+
+    if reused {
+        println!("Reusing existing DB at {}", db_dir.path().display());
+    } else {
+        let schema = CollectionSchema {
+            name: col_id.clone(),
+            dimension: dim,
+            metric: cli.metric.clone(),
+            segment_params: params.clone(),
+        };
+        db.create_collection(schema)?;
+
+        println!("Ingesting base vectors...");
+        let ingest_start = Instant::now();
+        let tmp_base = db_dir.path().join("base_vectors.raw");
+        write_raw_f32(&tmp_base, &base_vectors)?;
+        let n = db.ingest_file(&col_id, &tmp_base)?;
+        println!(
+            "  Ingested {} vectors in {:.2}s",
+            n,
+            ingest_start.elapsed().as_secs_f64()
+        );
+    }
 
     // 5. Warmup
     println!("Running {} warmup queries...", warmup_queries.len());
@@ -191,8 +226,24 @@ fn main() -> Result<()> {
     }
 
     // 6. Exact results: load or compute
-    let exact_results: ExactResults = if let Some(ref path) = cli.load_exact_results {
-        println!("Loading exact results from {}...", path);
+    // When --data-dir is set, default exact results to {data_dir}/exact_results.json.
+    let auto_exact = cli
+        .data_dir
+        .as_ref()
+        .map(|d| PathBuf::from(d).join("exact_results.json"));
+    let load_exact = cli
+        .load_exact_results
+        .as_deref()
+        .map(PathBuf::from)
+        .or(auto_exact.clone());
+    let save_exact = cli
+        .save_exact_results
+        .as_deref()
+        .map(PathBuf::from)
+        .or(auto_exact);
+
+    let exact_results: ExactResults = if let Some(ref path) = load_exact.filter(|p| p.exists()) {
+        println!("Loading exact results from {}...", path.display());
         let data = fs::read_to_string(path)?;
         serde_json::from_str(&data)?
     } else {
@@ -210,23 +261,21 @@ fn main() -> Result<()> {
             }
         }
         println!(" done in {:.2}s", exact_start.elapsed().as_secs_f64());
-        ExactResults {
+        let results = ExactResults {
             dataset_name: cli.dataset_name.clone(),
             metric: cli.metric.clone(),
             k: cli.k,
             query_results,
+        };
+        if let Some(ref path) = save_exact {
+            println!("Saving exact results to {}...", path.display());
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, serde_json::to_string_pretty(&results)?)?;
         }
+        results
     };
-
-    // Save exact results if requested
-    if let Some(ref path) = cli.save_exact_results {
-        println!("Saving exact results to {}...", path);
-        if let Some(parent) = Path::new(path).parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(&exact_results)?;
-        fs::write(path, json)?;
-    }
 
     // 7. ANN benchmark
     println!(
@@ -260,7 +309,7 @@ fn main() -> Result<()> {
         dataset_name: cli.dataset_name.clone(),
         metric: cli.metric.clone(),
         k: cli.k,
-        num_base_vectors: num_ingested,
+        num_base_vectors: base_vectors.len(),
         num_queries: bench_queries.len(),
         warmup_queries: warmup_queries.len(),
         avg_latency_ms: avg_latency,
