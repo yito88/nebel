@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{SeedableRng, seq::SliceRandom};
+use rayon::prelude::*;
 
 use nebel::{
     Db,
@@ -70,6 +71,10 @@ struct Cli {
     /// If omitted, a temporary directory is used and discarded after the run.
     #[arg(long)]
     data_dir: Option<String>,
+
+    /// Number of concurrent query threads.
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,39 +191,70 @@ fn main() -> Result<()> {
 
     // 6. Run search_exact and search(ANN) for each query
     println!(
-        "Running verification ({} queries, k={})...",
-        num_queries, cli.k
+        "Running verification ({} queries, k={}, concurrency={})...",
+        num_queries, cli.k, cli.concurrency,
     );
 
-    let mut exact_recalls = Vec::with_capacity(num_queries);
-    let mut ann_recalls = Vec::with_capacity(num_queries);
-    let mut exact_low_recall: Vec<(usize, f64)> = Vec::new();
-
-    for (qi, &query_idx) in indices.iter().enumerate() {
-        let query = &all_queries[query_idx];
-        let gt = &all_groundtruth[query_idx];
-
-        // search_exact
-        let exact_hits = col.search_exact(query, cli.k)?;
-        let exact_ids = hits_to_ids(&exact_hits);
-        let exact_r = recall_at_k(gt, &exact_ids, cli.k);
-        exact_recalls.push(exact_r);
-
-        if exact_r < 1.0 {
-            exact_low_recall.push((query_idx, exact_r));
-        }
-
-        // search (ANN)
-        let ann_hits = col.search(query, cli.k, false, false)?;
-        let ann_ids = hits_to_ids(&ann_hits);
-        let ann_r = recall_at_k(gt, &ann_ids, cli.k);
-        ann_recalls.push(ann_r);
-
-        if (qi + 1) % 10 == 0 || qi + 1 == num_queries {
-            print!("\r  {}/{}", qi + 1, num_queries);
-        }
+    struct QueryResult {
+        query_idx: usize,
+        exact_recall: f64,
+        ann_recall: f64,
     }
+
+    let results: Vec<QueryResult> = if cli.concurrency <= 1 {
+        let mut out = Vec::with_capacity(num_queries);
+        for (qi, &query_idx) in indices.iter().enumerate() {
+            let query = &all_queries[query_idx];
+            let gt = &all_groundtruth[query_idx];
+            let exact_r = recall_at_k(gt, &hits_to_ids(&col.search_exact(query, cli.k)?), cli.k);
+            let ann_r = recall_at_k(
+                gt,
+                &hits_to_ids(&col.search(query, cli.k, false, false)?),
+                cli.k,
+            );
+            out.push(QueryResult { query_idx, exact_recall: exact_r, ann_recall: ann_r });
+            if (qi + 1) % 10 == 0 || qi + 1 == num_queries {
+                print!("\r  {}/{}", qi + 1, num_queries);
+            }
+        }
+        out
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(cli.concurrency)
+            .build()?;
+        let mut out: Vec<QueryResult> = pool.install(|| {
+            indices
+                .par_iter()
+                .map(|&query_idx| {
+                    let query = &all_queries[query_idx];
+                    let gt = &all_groundtruth[query_idx];
+                    let exact_r = recall_at_k(
+                        gt,
+                        &hits_to_ids(&col.search_exact(query, cli.k).unwrap()),
+                        cli.k,
+                    );
+                    let ann_r = recall_at_k(
+                        gt,
+                        &hits_to_ids(&col.search(query, cli.k, false, false).unwrap()),
+                        cli.k,
+                    );
+                    QueryResult { query_idx, exact_recall: exact_r, ann_recall: ann_r }
+                })
+                .collect()
+        });
+        out.sort_by_key(|r| r.query_idx);
+        out
+    };
     println!();
+
+    let exact_recalls: Vec<f64> = results.iter().map(|r| r.exact_recall).collect();
+    let ann_recalls: Vec<f64> = results.iter().map(|r| r.ann_recall).collect();
+    let exact_low_recall: Vec<(usize, f64)> = results
+        .iter()
+        .filter(|r| r.exact_recall < 1.0)
+        .map(|r| (r.query_idx, r.exact_recall))
+        .collect();
+    drop(results);
 
     // 7. Compute and print results
     let avg_exact_recall = exact_recalls.iter().sum::<f64>() / num_queries as f64;

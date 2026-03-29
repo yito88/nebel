@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::BinaryHeap,
+
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -622,41 +622,27 @@ fn search_exact_snapshot(
         seg_id: SegId,
         internal_id: u32,
     }
-    impl PartialEq for HeapEntry {
-        fn eq(&self, other: &Self) -> bool {
-            self.distance == other.distance
-        }
-    }
-    impl Eq for HeapEntry {}
-    impl PartialOrd for HeapEntry {
-        fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl Ord for HeapEntry {
-        fn cmp(&self, other: &Self) -> CmpOrdering {
-            self.distance.partial_cmp(&other.distance).unwrap_or(CmpOrdering::Equal)
-        }
-    }
 
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(k);
+    // Scan sealed segments in parallel, collecting (distance, seg_id, internal_id) tuples.
+    let mut candidates: Vec<HeapEntry> = snap
+        .sealed_segs
+        .par_iter()
+        .flat_map(|seg| {
+            let sid = seg.seg_id();
+            (0..seg.num_vectors() as u32)
+                .filter_map(|internal_id| {
+                    if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
+                        return None;
+                    }
+                    let vector = seg.read_vector(internal_id, dimension).ok()?;
+                    let distance = compute_distance(metric, query, &vector);
+                    Some(HeapEntry { distance, seg_id: sid, internal_id })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
-    for seg in &snap.sealed_segs {
-        let sid = seg.seg_id();
-        for internal_id in 0..seg.num_vectors() as u32 {
-            if storage.is_tombstoned(id, sid, internal_id)? {
-                continue;
-            }
-            let vector = seg.read_vector(internal_id, dimension)?;
-            let distance = compute_distance(metric, query, &vector);
-            if heap.len() < k {
-                heap.push(HeapEntry { distance, seg_id: sid, internal_id });
-            } else if distance < heap.peek().unwrap().distance {
-                heap.pop();
-                heap.push(HeapEntry { distance, seg_id: sid, internal_id });
-            }
-        }
-    }
+    // Scan the writable segment sequentially (holds read lock, no nested parallelism).
     {
         let ws = snap.writable_seg.read().unwrap();
         let sid = ws.seg_id();
@@ -666,17 +652,12 @@ fn search_exact_snapshot(
             }
             let vector = ws.read_vector(internal_id, dimension)?;
             let distance = compute_distance(metric, query, &vector);
-            if heap.len() < k {
-                heap.push(HeapEntry { distance, seg_id: sid, internal_id });
-            } else if distance < heap.peek().unwrap().distance {
-                heap.pop();
-                heap.push(HeapEntry { distance, seg_id: sid, internal_id });
-            }
+            candidates.push(HeapEntry { distance, seg_id: sid, internal_id });
         }
     }
 
-    let mut top_k: Vec<HeapEntry> = heap.into_vec();
-    top_k.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(CmpOrdering::Equal));
+    candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(CmpOrdering::Equal));
+    let top_k: Vec<HeapEntry> = candidates.into_iter().take(k).collect();
 
     let mut hits = Vec::with_capacity(top_k.len());
     for entry in top_k {

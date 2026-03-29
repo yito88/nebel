@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{SeedableRng, seq::SliceRandom};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use nebel::{
@@ -86,6 +87,10 @@ struct Cli {
     /// If omitted, a temporary directory is used and discarded after the run.
     #[arg(long)]
     data_dir: Option<String>,
+
+    /// Number of concurrent query threads during the ANN benchmark phase.
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +120,9 @@ struct BenchmarkSummary {
     p99_latency_ms: f64,
 
     avg_recall_at_k: f64,
+
+    concurrency: usize,
+    throughput_qps: f64,
 
     params: SegmentParams,
 }
@@ -288,23 +296,46 @@ fn main() -> Result<()> {
 
     // 7. ANN benchmark
     println!(
-        "Running ANN benchmark ({} queries, k={})...",
+        "Running ANN benchmark ({} queries, k={}, concurrency={})...",
         bench_queries.len(),
-        cli.k
+        cli.k,
+        cli.concurrency,
     );
-    let mut latencies_ms = Vec::with_capacity(bench_queries.len());
-    let mut recalls = Vec::with_capacity(bench_queries.len());
 
-    for (i, q) in bench_queries.iter().enumerate() {
-        let start = Instant::now();
-        let hits = col.search(q, cli.k, false, false)?;
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        latencies_ms.push(elapsed);
-
-        let ann_ids = hits_to_ids(&hits);
-        let r = recall_at_k(&exact_results.query_results[i], &ann_ids, cli.k);
-        recalls.push(r);
-    }
+    let bench_start = Instant::now();
+    let (mut latencies_ms, recalls): (Vec<f64>, Vec<f64>) = if cli.concurrency <= 1 {
+        let mut latencies = Vec::with_capacity(bench_queries.len());
+        let mut recalls = Vec::with_capacity(bench_queries.len());
+        for (i, q) in bench_queries.iter().enumerate() {
+            let start = Instant::now();
+            let hits = col.search(q, cli.k, false, false)?;
+            latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+            recalls.push(recall_at_k(&exact_results.query_results[i], &hits_to_ids(&hits), cli.k));
+        }
+        (latencies, recalls)
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(cli.concurrency)
+            .build()?;
+        pool.install(|| {
+            (0..bench_queries.len())
+                .into_par_iter()
+                .map(|i| {
+                    let start = Instant::now();
+                    let hits = col.search(&bench_queries[i], cli.k, false, false).unwrap();
+                    let latency = start.elapsed().as_secs_f64() * 1000.0;
+                    let recall = recall_at_k(
+                        &exact_results.query_results[i],
+                        &hits_to_ids(&hits),
+                        cli.k,
+                    );
+                    (latency, recall)
+                })
+                .unzip()
+        })
+    };
+    let wall_secs = bench_start.elapsed().as_secs_f64();
+    let throughput_qps = bench_queries.len() as f64 / wall_secs;
 
     // 8. Compute stats
     latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -326,6 +357,8 @@ fn main() -> Result<()> {
         p95_latency_ms: p95,
         p99_latency_ms: p99,
         avg_recall_at_k: avg_recall,
+        concurrency: cli.concurrency,
+        throughput_qps,
         params,
     };
 
@@ -337,7 +370,9 @@ fn main() -> Result<()> {
     println!("Base vectors:     {}", summary.num_base_vectors);
     println!("Queries:          {}", summary.num_queries);
     println!("Warmup queries:   {}", summary.warmup_queries);
+    println!("Concurrency:      {}", summary.concurrency);
     println!("---");
+    println!("Throughput:       {:.1} QPS", summary.throughput_qps);
     println!("Avg latency:      {:.3} ms", summary.avg_latency_ms);
     println!("P50 latency:      {:.3} ms", summary.p50_latency_ms);
     println!("P95 latency:      {:.3} ms", summary.p95_latency_ms);
