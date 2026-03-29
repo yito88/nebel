@@ -156,6 +156,11 @@ pub struct VectorEntry<'a> {
     pub metadata: Option<&'a serde_json::Value>,
 }
 
+/// Monotonic sequence token returned by every write operation.
+/// Pass to `wait_visible` to block until the write is search-visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WriteToken(pub u64);
+
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub doc_id: String,

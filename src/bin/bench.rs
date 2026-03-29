@@ -11,7 +11,7 @@ use rand::{SeedableRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 
 use nebel::{
-    Nebel,
+    Db,
     dataset::{load_vectors, write_raw_f32},
     eval::{hits_to_ids, percentile, recall_at_k},
     types::{CollectionId, CollectionSchema, Metric, SegmentParams},
@@ -184,34 +184,44 @@ fn main() -> Result<()> {
         }
     }
 
-    let (db_dir, mut db, reused) = if let Some(ref dir) = cli.data_dir {
+    let (db_dir, col, reused) = if let Some(ref dir) = cli.data_dir {
         let path = PathBuf::from(dir);
-        let mut db = Nebel::open(&path)?;
-        let reused = db.load_collection(&col_id).is_ok();
-        (DbDir::Persistent(path), db, reused)
+        let db = Db::open(&path)?;
+        let (col, reused) = match db.collection(col_id.as_str()) {
+            Ok(h) => (h, true),
+            Err(_) => {
+                let schema = CollectionSchema {
+                    name: col_id.clone(),
+                    dimension: dim,
+                    metric: cli.metric.clone(),
+                    segment_params: params.clone(),
+                };
+                (db.create_collection(schema)?, false)
+            }
+        };
+        (DbDir::Persistent(path), col, reused)
     } else {
         let tmp = tempfile::tempdir()?;
         println!("DB temp dir: {}", tmp.path().display());
-        let db = Nebel::open(tmp.path())?;
-        (DbDir::Temp(tmp), db, false)
-    };
-
-    if reused {
-        println!("Reusing existing DB at {}", db_dir.path().display());
-    } else {
+        let db = Db::open(tmp.path())?;
         let schema = CollectionSchema {
             name: col_id.clone(),
             dimension: dim,
             metric: cli.metric.clone(),
             segment_params: params.clone(),
         };
-        db.create_collection(schema)?;
+        let col = db.create_collection(schema)?;
+        (DbDir::Temp(tmp), col, false)
+    };
 
+    if reused {
+        println!("Reusing existing DB at {}", db_dir.path().display());
+    } else {
         println!("Ingesting base vectors...");
         let ingest_start = Instant::now();
         let tmp_base = db_dir.path().join("base_vectors.raw");
         write_raw_f32(&tmp_base, &base_vectors)?;
-        let n = db.ingest_file(&col_id, &tmp_base)?;
+        let n = col.ingest_file(&tmp_base)?;
         println!(
             "  Ingested {} vectors in {:.2}s",
             n,
@@ -222,11 +232,10 @@ fn main() -> Result<()> {
     // 5. Warmup
     println!("Running {} warmup queries...", warmup_queries.len());
     for q in warmup_queries {
-        let _ = db.search(&col_id, q, cli.k, false, false)?;
+        let _ = col.search(q, cli.k, false, false)?;
     }
 
     // 6. Exact results: load or compute
-    // When --data-dir is set, default exact results to {data_dir}/exact_results.json.
     let auto_exact = cli
         .data_dir
         .as_ref()
@@ -254,7 +263,7 @@ fn main() -> Result<()> {
         let exact_start = Instant::now();
         let mut query_results = Vec::with_capacity(bench_queries.len());
         for (i, q) in bench_queries.iter().enumerate() {
-            let hits = db.search_exact(&col_id, q, cli.k)?;
+            let hits = col.search_exact(q, cli.k)?;
             query_results.push(hits_to_ids(&hits));
             if (i + 1) % 10 == 0 || i + 1 == bench_queries.len() {
                 print!("\r  {}/{}", i + 1, bench_queries.len());
@@ -288,7 +297,7 @@ fn main() -> Result<()> {
 
     for (i, q) in bench_queries.iter().enumerate() {
         let start = Instant::now();
-        let hits = db.search(&col_id, q, cli.k, false, false)?;
+        let hits = col.search(q, cli.k, false, false)?;
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         latencies_ms.push(elapsed);
 

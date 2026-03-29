@@ -181,8 +181,30 @@ impl WritableSegment {
         Ok(seg)
     }
 
+    pub fn seg_id(&self) -> SegId {
+        self.meta.seg_id
+    }
+
     pub fn num_vectors(&self) -> usize {
         self.meta.num_vectors
+    }
+
+    /// Non-consuming seal: persist the index to disk and return a new `SealedSegment`
+    /// while keeping this `WritableSegment` intact for ongoing searches.
+    pub(crate) fn persist_as_sealed(&self) -> Result<SealedSegment> {
+        let metric = self.index.metric();
+        self.index.file_dump(&self.meta.dir, INDEX_BASENAME)?;
+        let (index, index_io) = load_index(&self.meta.dir, &metric)?;
+        Ok(SealedSegment {
+            meta: SegMeta {
+                seg_id: self.meta.seg_id,
+                num_vectors: self.meta.num_vectors,
+                dir: self.meta.dir.clone(),
+            },
+            index,
+            ef_search: self.ef_search,
+            index_io,
+        })
     }
 
     /// Seal this segment: persist the index to disk and return a `SealedSegment`.
@@ -306,6 +328,14 @@ pub struct SealedSegment {
 }
 
 impl SealedSegment {
+    pub fn seg_id(&self) -> SegId {
+        self.meta.seg_id
+    }
+
+    pub fn num_vectors(&self) -> usize {
+        self.meta.num_vectors
+    }
+
     /// Open an existing sealed segment by loading the persisted index.
     pub fn open(
         seg_id: SegId,

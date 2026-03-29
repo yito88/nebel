@@ -1,26 +1,26 @@
 use nebel::{
-    Nebel,
+    Db,
     types::{CollectionId, CollectionSchema, Metric},
 };
 
 fn main() -> anyhow::Result<()> {
-    let mut db = Nebel::open("data")?;
+    let db = Db::open("data")?;
 
-    let col = CollectionId::new("demo");
-    db.create_collection(CollectionSchema::new(col.clone(), 4, Metric::L2))?;
+    let col_id = CollectionId::new("demo");
+    let col = db.create_collection(CollectionSchema::new(col_id, 4, Metric::L2))?;
 
-    db.upsert(&col, "a", &[1.0, 0.0, 0.0, 0.0], None)?;
-    db.upsert(&col, "b", &[0.0, 1.0, 0.0, 0.0], None)?;
-    db.upsert(&col, "c", &[0.0, 0.0, 1.0, 0.0], None)?;
+    col.upsert("a", &[1.0, 0.0, 0.0, 0.0], None)?;
+    col.upsert("b", &[0.0, 1.0, 0.0, 0.0], None)?;
+    col.upsert("c", &[0.0, 0.0, 1.0, 0.0], None)?;
 
-    let hits = db.search(&col, &[1.0, 0.1, 0.0, 0.0], 2, false, false)?;
+    let hits = col.search(&[1.0, 0.1, 0.0, 0.0], 2, false, false)?;
     for h in &hits {
         println!("doc_id={} score={:.4}", h.doc_id, h.score);
     }
 
-    db.delete(&col, "a")?;
+    col.delete("a")?;
     println!("\nafter delete 'a':");
-    let hits = db.search(&col, &[1.0, 0.1, 0.0, 0.0], 2, false, false)?;
+    let hits = col.search(&[1.0, 0.1, 0.0, 0.0], 2, false, false)?;
     for h in &hits {
         println!("doc_id={} score={:.4}", h.doc_id, h.score);
     }

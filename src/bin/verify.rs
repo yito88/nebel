@@ -9,7 +9,7 @@ use rand::rngs::StdRng;
 use rand::{SeedableRng, seq::SliceRandom};
 
 use nebel::{
-    Nebel,
+    Db,
     dataset::{load_groundtruth, load_vectors, write_raw_f32},
     eval::{hits_to_ids, recall_at_k},
     types::{CollectionId, CollectionSchema, Metric, SegmentParams},
@@ -139,34 +139,44 @@ fn main() -> Result<()> {
         }
     }
 
-    let (db_dir, mut db, reused) = if let Some(ref dir) = cli.data_dir {
+    let (db_dir, col, reused) = if let Some(ref dir) = cli.data_dir {
         let path = PathBuf::from(dir);
-        let mut db = Nebel::open(&path)?;
-        let reused = db.load_collection(&col_id).is_ok();
-        (DbDir::Persistent(path), db, reused)
+        let db = Db::open(&path)?;
+        let (col, reused) = match db.collection(col_id.as_str()) {
+            Ok(h) => (h, true),
+            Err(_) => {
+                let schema = CollectionSchema {
+                    name: col_id.clone(),
+                    dimension: dim,
+                    metric: cli.metric.clone(),
+                    segment_params: params.clone(),
+                };
+                (db.create_collection(schema)?, false)
+            }
+        };
+        (DbDir::Persistent(path), col, reused)
     } else {
         let tmp = tempfile::tempdir()?;
         println!("DB temp dir: {}", tmp.path().display());
-        let db = Nebel::open(tmp.path())?;
-        (DbDir::Temp(tmp), db, false)
-    };
-
-    if reused {
-        println!("Reusing existing DB at {}", db_dir.path().display());
-    } else {
+        let db = Db::open(tmp.path())?;
         let schema = CollectionSchema {
             name: col_id.clone(),
             dimension: dim,
             metric: cli.metric.clone(),
             segment_params: params.clone(),
         };
-        db.create_collection(schema)?;
+        let col = db.create_collection(schema)?;
+        (DbDir::Temp(tmp), col, false)
+    };
 
+    if reused {
+        println!("Reusing existing DB at {}", db_dir.path().display());
+    } else {
         println!("Ingesting base vectors...");
         let ingest_start = Instant::now();
         let tmp_base = db_dir.path().join("base_vectors.raw");
         write_raw_f32(&tmp_base, &base_vectors)?;
-        let num_ingested = db.ingest_file(&col_id, &tmp_base)?;
+        let num_ingested = col.ingest_file(&tmp_base)?;
         println!(
             "  Ingested {} vectors in {:.2}s",
             num_ingested,
@@ -189,7 +199,7 @@ fn main() -> Result<()> {
         let gt = &all_groundtruth[query_idx];
 
         // search_exact
-        let exact_hits = db.search_exact(&col_id, query, cli.k)?;
+        let exact_hits = col.search_exact(query, cli.k)?;
         let exact_ids = hits_to_ids(&exact_hits);
         let exact_r = recall_at_k(gt, &exact_ids, cli.k);
         exact_recalls.push(exact_r);
@@ -199,7 +209,7 @@ fn main() -> Result<()> {
         }
 
         // search (ANN)
-        let ann_hits = db.search(&col_id, query, cli.k, false, false)?;
+        let ann_hits = col.search(query, cli.k, false, false)?;
         let ann_ids = hits_to_ids(&ann_hits);
         let ann_r = recall_at_k(gt, &ann_ids, cli.k);
         ann_recalls.push(ann_r);
