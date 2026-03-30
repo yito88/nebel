@@ -315,3 +315,51 @@ fn load_collection_multi_segment() {
     assert_eq!(hits[0].doc_id, "a");
     assert_eq!(hits[1].doc_id, "b");
 }
+
+#[test]
+fn recovery_from_wal_after_crash() {
+    let dir = tempdir().unwrap();
+    let schema = CollectionSchema::new(col("test"), 3, Metric::Cosine);
+
+    // Write records then drop without wait_visible — simulates crash mid-apply.
+    {
+        let db = Db::open(dir.path()).unwrap();
+        let col = db.create_collection(schema).unwrap();
+        col.upsert("a", &[1.0, 0.0, 0.0], None).unwrap();
+        col.upsert("b", &[0.0, 1.0, 0.0], None).unwrap();
+        col.upsert("c", &[0.0, 0.0, 1.0], None).unwrap();
+        // drop without wait_visible
+    }
+
+    // Reopen — recovery applies WAL records synchronously in load_collection_inner.
+    let db2 = Db::open(dir.path()).unwrap();
+    let col2 = db2.collection("test").unwrap();
+    let hits = col2.search_exact(&[1.0, 0.0, 0.0], 3).unwrap();
+    assert_eq!(hits.len(), 3);
+    let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(ids.contains(&"a") && ids.contains(&"b") && ids.contains(&"c"));
+}
+
+#[test]
+fn wal_segment_rotation() {
+    let (db, _dir) = make_db();
+    let col = db
+        .create_collection(CollectionSchema::new(col("test"), 3, Metric::Cosine))
+        .unwrap();
+
+    // Set a tiny rotation threshold so a handful of records triggers it.
+    col.set_wal_rotation_bytes(512);
+    assert_eq!(col.wal_segment_count(), 1);
+
+    // Write enough records to exceed the threshold several times.
+    let mut last = col.upsert("a", &[1.0, 0.0, 0.0], None).unwrap();
+    for i in 0..20u32 {
+        last = col
+            .upsert(&format!("doc{i}"), &[i as f32, 0.0, 0.0], None)
+            .unwrap();
+    }
+    col.wait_visible(last).unwrap();
+
+    // Multiple segments should now exist.
+    assert!(col.wal_segment_count() > 1);
+}

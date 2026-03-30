@@ -408,6 +408,14 @@ impl CollectionHandle {
         Ok(state.manifest.writable_segment)
     }
 
+    pub fn set_wal_rotation_bytes(&self, n: u64) {
+        self.inner.wal.lock().unwrap().rotation_bytes = n;
+    }
+
+    pub fn wal_segment_count(&self) -> usize {
+        self.inner.wal.lock().unwrap().segments.len()
+    }
+
     /// Apply all pending WAL records synchronously. Used by add_writable_segment.
     fn drain_wal(&self) -> Result<()> {
         let inner = &self.inner;

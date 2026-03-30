@@ -96,6 +96,7 @@ pub(crate) struct Wal {
     /// All segments sorted by wal_id ascending. Last entry is always Active.
     pub(crate) segments: Vec<WalSegmentMeta>,
     writer: BufWriter<fs::File>,
+    pub(crate) rotation_bytes: u64,
 }
 
 impl Wal {
@@ -137,6 +138,7 @@ impl Wal {
                     state: WalSegmentState::Active,
                 }],
                 writer: BufWriter::new(file),
+                rotation_bytes: WAL_ROTATION_BYTES,
             });
         }
 
@@ -175,6 +177,7 @@ impl Wal {
             wal_dir: wal_dir.to_path_buf(),
             segments,
             writer: BufWriter::new(new_file),
+            rotation_bytes: WAL_ROTATION_BYTES,
         })
     }
 
@@ -217,7 +220,7 @@ impl Wal {
         active.record_count += 1;
         active.byte_size += record_byte_size;
 
-        if active.byte_size >= WAL_ROTATION_BYTES {
+        if active.byte_size >= self.rotation_bytes {
             self.rotate()?;
         }
         Ok(())
