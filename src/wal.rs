@@ -101,11 +101,6 @@ pub(crate) struct Wal {
 impl Wal {
     /// Open (or create) a segmented WAL directory.
     ///
-    /// - If the directory is empty, creates `000001.log` as the first active segment.
-    /// - If segments already exist, reconstructs metadata by scanning them, marks all
-    ///   but the last as Closed, and opens the last in append mode.
-    /// Open (or create) a segmented WAL directory.
-    ///
     /// - **Empty / absent directory**: creates `WalId::first()` as the sole Active segment.
     /// - **Existing segments**: marks every existing segment Closed (they are recovery
     ///   candidates), then creates a new Active segment at `max_id.next()`.  The caller

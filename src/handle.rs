@@ -490,7 +490,11 @@ fn apply_worker_loop(
         }
 
         // Snapshot segment paths briefly under lock; read files without holding it.
-        let segments = inner.wal.lock().unwrap().segment_paths_from(cursor.current_wal_id);
+        let segments = inner
+            .wal
+            .lock()
+            .unwrap()
+            .segment_paths_from(cursor.current_wal_id);
 
         let (pending, new_cursor) =
             match read_records_from_cursor(&segments, cursor, durable, APPLY_BATCH_SIZE) {
@@ -561,7 +565,10 @@ fn read_records_from_cursor(
         last_applied_seq: cursor.last_applied_seq,
     };
 
-    'outer: for (wal_id, path) in segments.iter().filter(|(id, _)| *id >= cursor.current_wal_id) {
+    'outer: for (wal_id, path) in segments
+        .iter()
+        .filter(|(id, _)| *id >= cursor.current_wal_id)
+    {
         if !path.exists() {
             continue;
         }
@@ -578,12 +585,8 @@ fn read_records_from_cursor(
 
         let mut pos = start_offset;
         while pos + 4 <= data.len() {
-            let len = u32::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-            ]) as usize;
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             pos += 4;
             if pos + len > data.len() {
                 break;
