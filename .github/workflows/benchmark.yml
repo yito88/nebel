@@ -1,0 +1,186 @@
+name: Benchmark
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cache SIFT dataset
+        id: cache-sift
+        uses: actions/cache@v4
+        with:
+          path: data/raw/sift
+          key: sift-v1
+
+      - name: Download SIFT dataset
+        if: steps.cache-sift.outputs.cache-hit != 'true'
+        run: bash scripts/download_sift.sh
+
+      - name: Build bench binary
+        run: cargo build --release --bin bench
+
+      - name: Benchmark concurrency=1 (ingest + query)
+        run: |
+          mkdir -p results
+          BENCH_DATA_DIR=$(mktemp -d /tmp/bench-db-XXXXXX)
+          echo "BENCH_DATA_DIR=$BENCH_DATA_DIR" >> "$GITHUB_ENV"
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir "$BENCH_DATA_DIR" \
+            --concurrency 1 \
+            --save-summary results/bench_c1.json
+
+      - name: Benchmark concurrency=2
+        run: |
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir "$BENCH_DATA_DIR" \
+            --concurrency 2 \
+            --no-recall \
+            --save-summary results/bench_c2.json
+
+      - name: Benchmark concurrency=4
+        run: |
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir "$BENCH_DATA_DIR" \
+            --concurrency 4 \
+            --no-recall \
+            --save-summary results/bench_c4.json
+
+      - name: Benchmark concurrency=8
+        run: |
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir "$BENCH_DATA_DIR" \
+            --concurrency 8 \
+            --no-recall \
+            --save-summary results/bench_c8.json
+
+      - name: Benchmark concurrency=16
+        run: |
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir "$BENCH_DATA_DIR" \
+            --concurrency 16 \
+            --no-recall \
+            --save-summary results/bench_c16.json
+
+      - name: Print summary
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "## Benchmark Results"
+            echo ""
+            echo "| Date | Commit | Run |"
+            echo "|---|---|---|"
+            echo "| $(date -u '+%Y-%m-%d %H:%M UTC') | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) | [#$GITHUB_RUN_NUMBER]($RUN_URL) |"
+            echo ""
+            echo "| concurrency | QPS | avg_ms | p50_ms | p95_ms | p99_ms | recall |"
+            echo "|---|---|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in results/bench_c*.json; do
+            python3 - "$f" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          recall = f"{d['avg_recall_at_k']:.4f}" if d.get('avg_recall_at_k') is not None else "-"
+          print(f"| {d['concurrency']} | {d['throughput_qps']:.1f} | {d['avg_latency_ms']:.2f} | {d['p50_latency_ms']:.2f} | {d['p95_latency_ms']:.2f} | {d['p99_latency_ms']:.2f} | {recall} |")
+          EOF
+          done
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: results/
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Update benchmark history
+        run: |
+          mkdir -p gh-pages/data
+          python3 - <<'EOF'
+          import json, os, glob
+
+          history_path = "gh-pages/data/benchmark.json"
+          history = []
+          if os.path.exists(history_path):
+              with open(history_path) as f:
+                  history = json.load(f)
+
+          run_entry = {
+              "date": os.environ["GITHUB_RUN_STARTED_AT"] if "GITHUB_RUN_STARTED_AT" in os.environ else __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "commit": os.environ["GITHUB_SHA"][:7],
+              "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
+              "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "results": [],
+          }
+
+          for path in sorted(glob.glob("results/bench_c*.json")):
+              d = json.load(open(path))
+              run_entry["results"].append({
+                  "concurrency": d["concurrency"],
+                  "throughput_qps": d["throughput_qps"],
+                  "avg_latency_ms": d["avg_latency_ms"],
+                  "p50_latency_ms": d["p50_latency_ms"],
+                  "p95_latency_ms": d["p95_latency_ms"],
+                  "p99_latency_ms": d["p99_latency_ms"],
+                  "avg_recall_at_k": d.get("avg_recall_at_k"),
+              })
+
+          history.append(run_entry)
+          history = history[-100:]  # keep last 100 runs
+
+          with open(history_path, "w") as f:
+              json.dump(history, f, indent=2)
+          print(f"History now has {len(history)} entries.")
+          EOF
+
+      - name: Push to gh-pages
+        run: |
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/benchmark.json
+          git diff --cached --quiet || git commit -m "benchmark: run #$GITHUB_RUN_NUMBER (${GITHUB_SHA::7})"
+          git push
