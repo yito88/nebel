@@ -1,9 +1,9 @@
 pub mod dataset;
-pub mod eval;
 pub mod db;
+pub mod eval;
 pub mod handle;
-mod snapshot;
 mod segment;
+mod snapshot;
 mod storage;
 pub mod types;
 mod wal;

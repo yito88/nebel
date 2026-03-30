@@ -1,6 +1,5 @@
 use std::{
     cmp::Ordering as CmpOrdering,
-
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -21,8 +20,8 @@ use crate::{
     snapshot::{CollectionSnapshot, SegmentSnapshot},
     storage::Storage,
     types::{
-        CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta,
-        SegmentState, VectorEntry, WriteToken,
+        CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta, SegmentState,
+        VectorEntry, WriteToken,
     },
     wal::{Wal, WalOp, WalRecord},
 };
@@ -91,9 +90,12 @@ impl CollectionInner {
         fs::create_dir_all(&wal_dir)?;
         let wal = Wal::open(&wal_dir.join("wal.log"))?;
 
-        let initial_segs = sealed_segs.iter()
+        let initial_segs = sealed_segs
+            .iter()
             .map(|s| SegmentSnapshot::Sealed(Arc::clone(s)))
-            .chain(std::iter::once(SegmentSnapshot::Writable(Arc::clone(&writable_seg))))
+            .chain(std::iter::once(SegmentSnapshot::Writable(Arc::clone(
+                &writable_seg,
+            ))))
             .collect();
         let initial_snap = Arc::new(CollectionSnapshot {
             schema: Arc::clone(&schema),
@@ -123,11 +125,18 @@ impl CollectionInner {
     }
 
     pub(crate) fn publish_snapshot(&self, state: &ApplyState) {
-        let segs = state.sealed_segs.iter()
+        let segs = state
+            .sealed_segs
+            .iter()
             .map(|s| SegmentSnapshot::Sealed(Arc::clone(s)))
-            .chain(std::iter::once(SegmentSnapshot::Writable(Arc::clone(&state.writable_seg))))
+            .chain(std::iter::once(SegmentSnapshot::Writable(Arc::clone(
+                &state.writable_seg,
+            ))))
             .collect();
-        let snap = Arc::new(CollectionSnapshot { schema: Arc::clone(&self.schema), segs });
+        let snap = Arc::new(CollectionSnapshot {
+            schema: Arc::clone(&self.schema),
+            segs,
+        });
         *self.snapshot.write().unwrap() = snap;
     }
 
@@ -198,7 +207,9 @@ impl CollectionHandle {
         let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
         inner.wal.lock().unwrap().append(&WalRecord {
             seq,
-            op: WalOp::Delete { doc_id: doc_id.to_string() },
+            op: WalOp::Delete {
+                doc_id: doc_id.to_string(),
+            },
         })?;
         notify_worker(&inner.notify);
         Ok(WriteToken(seq + 1))
@@ -209,7 +220,10 @@ impl CollectionHandle {
         let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
         inner.wal.lock().unwrap().append(&WalRecord {
             seq,
-            op: WalOp::UpdateMetadata { doc_id: doc_id.to_string(), metadata },
+            op: WalOp::UpdateMetadata {
+                doc_id: doc_id.to_string(),
+                metadata,
+            },
         })?;
         notify_worker(&inner.notify);
         Ok(WriteToken(seq + 1))
@@ -227,7 +241,14 @@ impl CollectionHandle {
         include_vector: bool,
     ) -> Result<Vec<SearchHit>> {
         let snap = { Arc::clone(&*self.inner.snapshot.read().unwrap()) };
-        search_snapshot(&self.inner, &snap, query, k, include_metadata, include_vector)
+        search_snapshot(
+            &self.inner,
+            &snap,
+            query,
+            k,
+            include_metadata,
+            include_vector,
+        )
     }
 
     pub fn search_exact(&self, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
@@ -265,8 +286,9 @@ impl CollectionHandle {
                         .collect()
                 })
                 .collect();
-            let doc_ids: Vec<String> =
-                (count..count + vectors.len()).map(|i| format!("doc_{}", i)).collect();
+            let doc_ids: Vec<String> = (count..count + vectors.len())
+                .map(|i| format!("doc_{}", i))
+                .collect();
 
             let mut state = inner.apply_state.lock().unwrap();
             if state.writable_seg.read().unwrap().num_vectors()
@@ -291,7 +313,11 @@ impl CollectionHandle {
                 .collect();
             storage.write_vector_entries(
                 &inner.id,
-                &SegmentMeta { seg_id, num_vectors, state: SegmentState::Writable },
+                &SegmentMeta {
+                    seg_id,
+                    num_vectors,
+                    state: SegmentState::Writable,
+                },
                 &entries,
             )?;
             count += vectors.len();
@@ -351,7 +377,9 @@ impl CollectionHandle {
             apply_entry(inner, &mut state, record)?;
         }
         if !pending.is_empty() {
-            inner.storage.put_applied_seq(&inner.id, state.applied_seq)?;
+            inner
+                .storage
+                .put_applied_seq(&inner.id, state.applied_seq)?;
             let visible = state.applied_seq + 1;
             inner.publish_snapshot(&state);
             drop(state);
@@ -377,7 +405,9 @@ fn apply_worker_loop(weak: Weak<CollectionInner>, notify: PendingNotify) {
         // This allows Storage/Database to be freed when all handles drop.
         {
             let guard = notify.0.lock().unwrap();
-            let _ = notify.1.wait_timeout_while(guard, APPLY_INTERVAL, |hw| !*hw);
+            let _ = notify
+                .1
+                .wait_timeout_while(guard, APPLY_INTERVAL, |hw| !*hw);
         }
 
         // Upgrade to do work. If the last strong Arc was dropped, we exit.
@@ -451,7 +481,11 @@ pub(crate) fn apply_entry(
     let id = &inner.id;
 
     match &record.op {
-        WalOp::Upsert { doc_id, vector, metadata } => {
+        WalOp::Upsert {
+            doc_id,
+            vector,
+            metadata,
+        } => {
             if let Some(loc) = storage.get_doc_location(id, doc_id)? {
                 storage.set_tombstone(id, loc.seg_id, loc.internal_id)?;
             }
@@ -468,8 +502,16 @@ pub(crate) fn apply_entry(
             let num_vectors = state.writable_seg.read().unwrap().num_vectors();
             storage.write_vector_entries(
                 id,
-                &SegmentMeta { seg_id, num_vectors, state: SegmentState::Writable },
-                &[VectorEntry { doc_id: doc_id.as_str(), internal_id, metadata: metadata.as_ref() }],
+                &SegmentMeta {
+                    seg_id,
+                    num_vectors,
+                    state: SegmentState::Writable,
+                },
+                &[VectorEntry {
+                    doc_id: doc_id.as_str(),
+                    internal_id,
+                    metadata: metadata.as_ref(),
+                }],
             )?;
         }
         WalOp::Delete { doc_id } => {
@@ -494,10 +536,7 @@ pub(crate) fn apply_entry(
 // ---------------------------------------------------------------------------
 
 /// Seal the current writable segment and create a fresh one, updating `state` and storage.
-pub(crate) fn seal_and_new_segment(
-    inner: &CollectionInner,
-    state: &mut ApplyState,
-) -> Result<()> {
+pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplyState) -> Result<()> {
     let storage = &*inner.storage;
     let old_id = state.manifest.writable_segment;
     let new_id = state.manifest.next_seg_id;
@@ -509,7 +548,11 @@ pub(crate) fn seal_and_new_segment(
 
     storage.put_segment(
         &inner.id,
-        &SegmentMeta { seg_id: old_id, num_vectors, state: SegmentState::Sealed },
+        &SegmentMeta {
+            seg_id: old_id,
+            num_vectors,
+            state: SegmentState::Sealed,
+        },
     )?;
     storage.put_segment(&inner.id, &SegmentMeta::new(new_id))?;
 
@@ -544,19 +587,32 @@ fn search_snapshot(
 ) -> Result<Vec<SearchHit>> {
     let dimension = snap.schema.dimension;
     if query.len() != dimension {
-        bail!("dimension mismatch: expected {}, got {}", dimension, query.len());
+        bail!(
+            "dimension mismatch: expected {}, got {}",
+            dimension,
+            query.len()
+        );
     }
     let storage = &*inner.storage;
     let id = &inner.id;
 
-    let sealed: Vec<&Arc<SealedSegment>> = snap.segs.iter()
-        .filter_map(|s| match s { SegmentSnapshot::Sealed(ss) => Some(ss), _ => None })
+    let sealed: Vec<&Arc<SealedSegment>> = snap
+        .segs
+        .iter()
+        .filter_map(|s| match s {
+            SegmentSnapshot::Sealed(ss) => Some(ss),
+            _ => None,
+        })
         .collect();
-    let writable = snap.segs.iter()
-        .find_map(|s| match s { SegmentSnapshot::Writable(w) => Some(w), _ => None });
+    let writable = snap.segs.iter().find_map(|s| match s {
+        SegmentSnapshot::Writable(w) => Some(w),
+        _ => None,
+    });
 
     let (sealed_cands, ws_cands) = rayon::join(
-            || sealed.par_iter()
+        || {
+            sealed
+                .par_iter()
                 .filter(|s| s.num_vectors() > 0)
                 .flat_map(|seg| {
                     let sid = seg.seg_id();
@@ -566,19 +622,26 @@ fn search_snapshot(
                         .map(move |(id, dist)| (sid, id, dist))
                         .collect::<Vec<_>>()
                 })
-                .collect(),
-            || writable.map(|w| {
-                let ws = w.read().unwrap();
-                let sid = ws.seg_id();
-                let hits = if ws.num_vectors() > 0 {
-                    ws.search(query, k).unwrap_or_default()
-                } else {
-                    vec![]
-                };
-                drop(ws);
-                hits.into_iter().map(|(id, dist)| (sid, id, dist)).collect::<Vec<_>>()
-            }).unwrap_or_default(),
-        );
+                .collect()
+        },
+        || {
+            writable
+                .map(|w| {
+                    let ws = w.read().unwrap();
+                    let sid = ws.seg_id();
+                    let hits = if ws.num_vectors() > 0 {
+                        ws.search(query, k).unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    drop(ws);
+                    hits.into_iter()
+                        .map(|(id, dist)| (sid, id, dist))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        },
+    );
     let mut candidates: Vec<(SegId, u32, f32)> = sealed_cands;
     candidates.extend(ws_cands);
     candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(CmpOrdering::Equal));
@@ -600,7 +663,8 @@ fn search_snapshot(
             None
         };
         let vector = if include_vector {
-            let from_sealed = sealed.iter()
+            let from_sealed = sealed
+                .iter()
                 .find(|s| s.seg_id() == seg_id)
                 .map(|s| s.read_vector(internal_id, dimension))
                 .transpose()?;
@@ -608,14 +672,23 @@ fn search_snapshot(
                 from_sealed
             } else if let Some(w) = writable {
                 let ws = w.read().unwrap();
-                if ws.seg_id() == seg_id { Some(ws.read_vector(internal_id, dimension)?) } else { None }
+                if ws.seg_id() == seg_id {
+                    Some(ws.read_vector(internal_id, dimension)?)
+                } else {
+                    None
+                }
             } else {
                 None
             }
         } else {
             None
         };
-        hits.push(SearchHit { doc_id, score: distance, metadata, vector });
+        hits.push(SearchHit {
+            doc_id,
+            score: distance,
+            metadata,
+            vector,
+        });
     }
     Ok(hits)
 }
@@ -628,7 +701,11 @@ fn search_exact_snapshot(
 ) -> Result<Vec<SearchHit>> {
     let dimension = snap.schema.dimension;
     if query.len() != dimension {
-        bail!("dimension mismatch: expected {}, got {}", dimension, query.len());
+        bail!(
+            "dimension mismatch: expected {}, got {}",
+            dimension,
+            query.len()
+        );
     }
     let storage = &*inner.storage;
     let id = &inner.id;
@@ -640,50 +717,76 @@ fn search_exact_snapshot(
         internal_id: u32,
     }
 
-    let sealed: Vec<&Arc<SealedSegment>> = snap.segs.iter()
-        .filter_map(|s| match s { SegmentSnapshot::Sealed(ss) => Some(ss), _ => None })
+    let sealed: Vec<&Arc<SealedSegment>> = snap
+        .segs
+        .iter()
+        .filter_map(|s| match s {
+            SegmentSnapshot::Sealed(ss) => Some(ss),
+            _ => None,
+        })
         .collect();
-    let writable = snap.segs.iter()
-        .find_map(|s| match s { SegmentSnapshot::Writable(w) => Some(w), _ => None });
+    let writable = snap.segs.iter().find_map(|s| match s {
+        SegmentSnapshot::Writable(w) => Some(w),
+        _ => None,
+    });
 
     let (sealed_cands, ws_cands): (Vec<HeapEntry>, Vec<HeapEntry>) = rayon::join(
-        || sealed.par_iter()
-            .flat_map(|seg| {
-                let sid = seg.seg_id();
-                (0..seg.num_vectors() as u32)
-                    .filter_map(|internal_id| {
-                        if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
-                            return None;
-                        }
-                        let vector = seg.read_vector(internal_id, dimension).ok()?;
-                        let distance = compute_distance(metric, query, &vector);
-                        Some(HeapEntry { distance, seg_id: sid, internal_id })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect(),
-        || writable.map(|w| {
-            let ws = w.read().unwrap();
-            let sid = ws.seg_id();
-            let n = ws.num_vectors() as u32;
-            let entries: Vec<HeapEntry> = (0..n)
-                .filter_map(|internal_id| {
-                    if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
-                        return None;
-                    }
-                    let vector = ws.read_vector(internal_id, dimension).ok()?;
-                    let distance = compute_distance(metric, query, &vector);
-                    Some(HeapEntry { distance, seg_id: sid, internal_id })
+        || {
+            sealed
+                .par_iter()
+                .flat_map(|seg| {
+                    let sid = seg.seg_id();
+                    (0..seg.num_vectors() as u32)
+                        .filter_map(|internal_id| {
+                            if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
+                                return None;
+                            }
+                            let vector = seg.read_vector(internal_id, dimension).ok()?;
+                            let distance = compute_distance(metric, query, &vector);
+                            Some(HeapEntry {
+                                distance,
+                                seg_id: sid,
+                                internal_id,
+                            })
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect();
-            drop(ws);
-            entries
-        }).unwrap_or_default(),
+                .collect()
+        },
+        || {
+            writable
+                .map(|w| {
+                    let ws = w.read().unwrap();
+                    let sid = ws.seg_id();
+                    let n = ws.num_vectors() as u32;
+                    let entries: Vec<HeapEntry> = (0..n)
+                        .filter_map(|internal_id| {
+                            if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
+                                return None;
+                            }
+                            let vector = ws.read_vector(internal_id, dimension).ok()?;
+                            let distance = compute_distance(metric, query, &vector);
+                            Some(HeapEntry {
+                                distance,
+                                seg_id: sid,
+                                internal_id,
+                            })
+                        })
+                        .collect();
+                    drop(ws);
+                    entries
+                })
+                .unwrap_or_default()
+        },
     );
     let mut candidates = sealed_cands;
     candidates.extend(ws_cands);
 
-    candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(CmpOrdering::Equal));
+    candidates.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(CmpOrdering::Equal)
+    });
     let top_k: Vec<HeapEntry> = candidates.into_iter().take(k).collect();
 
     let mut hits = Vec::with_capacity(top_k.len());
@@ -691,7 +794,12 @@ fn search_exact_snapshot(
         let doc_id = storage
             .get_reverse_doc(id, entry.seg_id, entry.internal_id)?
             .ok_or_else(|| anyhow!("reverse mapping not found"))?;
-        hits.push(SearchHit { doc_id, score: entry.distance, metadata: None, vector: None });
+        hits.push(SearchHit {
+            doc_id,
+            score: entry.distance,
+            metadata: None,
+            vector: None,
+        });
     }
     Ok(hits)
 }

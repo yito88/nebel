@@ -324,7 +324,11 @@ fn main() -> Result<()> {
             let hits = col.search(q, cli.k, false, false)?;
             lats.push(start.elapsed().as_secs_f64() * 1000.0);
             if let Some(ref er) = exact_results {
-                recs.push(recall_at_k(&er.query_results[i], &hits_to_ids(&hits), cli.k));
+                recs.push(recall_at_k(
+                    &er.query_results[i],
+                    &hits_to_ids(&hits),
+                    cli.k,
+                ));
             }
         }
         latencies_ms = lats;
@@ -340,9 +344,9 @@ fn main() -> Result<()> {
                     let start = Instant::now();
                     let hits = col.search(bench_queries[i], cli.k, false, false).unwrap();
                     let latency = start.elapsed().as_secs_f64() * 1000.0;
-                    let recall = exact_results.as_ref().map(|er| {
-                        recall_at_k(&er.query_results[i], &hits_to_ids(&hits), cli.k)
-                    });
+                    let recall = exact_results
+                        .as_ref()
+                        .map(|er| recall_at_k(&er.query_results[i], &hits_to_ids(&hits), cli.k));
                     (latency, recall)
                 })
                 .unzip()

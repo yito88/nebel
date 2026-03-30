@@ -8,12 +8,10 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    handle::{apply_entry, CollectionHandle, CollectionInner},
+    handle::{CollectionHandle, CollectionInner, apply_entry},
     segment::{SealedSegment, WritableSegment},
     storage::Storage,
-    types::{
-        CollectionId, CollectionSchema, Manifest, SegId, SegmentMeta, SegmentState,
-    },
+    types::{CollectionId, CollectionSchema, Manifest, SegId, SegmentMeta, SegmentState},
     wal::Wal,
 };
 
@@ -139,8 +137,8 @@ impl Db {
             }
         }
 
-        let writable_seg = writable_seg_opt
-            .ok_or_else(|| anyhow!("no writable segment found for '{}'", id))?;
+        let writable_seg =
+            writable_seg_opt.ok_or_else(|| anyhow!("no writable segment found for '{}'", id))?;
 
         let schema_arc = Arc::new(schema);
 
@@ -174,12 +172,16 @@ impl Db {
             self.storage.put_applied_seq(id, state.applied_seq)?;
             // Update next_seq so new writes start after the replayed records.
             let new_next = state.applied_seq + 1;
-            inner.next_seq.store(new_next, std::sync::atomic::Ordering::Relaxed);
+            inner
+                .next_seq
+                .store(new_next, std::sync::atomic::Ordering::Relaxed);
             // Publish recovered snapshot and advance visible_seq.
             let visible = state.applied_seq + 1;
             inner.publish_snapshot(&state);
             drop(state);
-            inner.visible_seq.store(visible, std::sync::atomic::Ordering::Release);
+            inner
+                .visible_seq
+                .store(visible, std::sync::atomic::Ordering::Release);
         }
 
         Ok(CollectionHandle::from_arc(inner))

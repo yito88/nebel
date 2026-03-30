@@ -210,7 +210,6 @@ impl WritableSegment {
         })
     }
 
-
     /// Append a vector to the segment and return its internal_id.
     pub fn insert(&mut self, vector: &[f32], dimension: usize) -> Result<u32> {
         let internal_id = self.meta.num_vectors;
@@ -370,7 +369,6 @@ impl SealedSegment {
         Ok(bytes_to_f32(&buf))
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Shared helpers

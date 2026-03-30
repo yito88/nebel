@@ -212,7 +212,11 @@ fn main() -> Result<()> {
                 &hits_to_ids(&col.search(query, cli.k, false, false)?),
                 cli.k,
             );
-            out.push(QueryResult { query_idx, exact_recall: exact_r, ann_recall: ann_r });
+            out.push(QueryResult {
+                query_idx,
+                exact_recall: exact_r,
+                ann_recall: ann_r,
+            });
             if (qi + 1) % 10 == 0 || qi + 1 == num_queries {
                 print!("\r  {}/{}", qi + 1, num_queries);
             }
@@ -238,7 +242,11 @@ fn main() -> Result<()> {
                         &hits_to_ids(&col.search(query, cli.k, false, false).unwrap()),
                         cli.k,
                     );
-                    QueryResult { query_idx, exact_recall: exact_r, ann_recall: ann_r }
+                    QueryResult {
+                        query_idx,
+                        exact_recall: exact_r,
+                        ann_recall: ann_r,
+                    }
                 })
                 .collect()
         });
