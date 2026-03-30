@@ -1,0 +1,117 @@
+name: Benchmark
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cache SIFT dataset
+        id: cache-sift
+        uses: actions/cache@v4
+        with:
+          path: data/raw/sift
+          key: sift-v1
+
+      - name: Download SIFT dataset
+        if: steps.cache-sift.outputs.cache-hit != 'true'
+        run: bash scripts/download_sift.sh
+
+      - name: Build bench binary
+        run: cargo build --release --bin bench
+
+      - name: Benchmark concurrency=1 (ingest + query)
+        run: |
+          mkdir -p results
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir data/bench-db \
+            --concurrency 1 \
+            --save-summary results/bench_c1.json
+
+      - name: Benchmark concurrency=2
+        run: |
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir data/bench-db \
+            --concurrency 2 \
+            --no-recall \
+            --save-summary results/bench_c2.json
+
+      - name: Benchmark concurrency=4
+        run: |
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir data/bench-db \
+            --concurrency 4 \
+            --no-recall \
+            --save-summary results/bench_c4.json
+
+      - name: Benchmark concurrency=8
+        run: |
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir data/bench-db \
+            --concurrency 8 \
+            --no-recall \
+            --save-summary results/bench_c8.json
+
+      - name: Benchmark concurrency=16
+        run: |
+          ./target/release/bench \
+            --base-file  data/raw/sift/sift_base.fvecs \
+            --query-file data/raw/sift/sift_query.fvecs \
+            --dataset-name sift \
+            --data-dir data/bench-db \
+            --concurrency 16 \
+            --no-recall \
+            --save-summary results/bench_c16.json
+
+      - name: Print summary
+        run: |
+          echo "| concurrency | QPS | avg_ms | p50_ms | p95_ms | p99_ms | recall |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          for f in results/bench_c*.json; do
+            python3 - "$f" >> $GITHUB_STEP_SUMMARY <<'EOF'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          recall = f"{d['avg_recall_at_k']:.4f}" if d.get('avg_recall_at_k') is not None else "-"
+          print(f"| {d['concurrency']} | {d['throughput_qps']:.1f} | {d['avg_latency_ms']:.2f} | {d['p50_latency_ms']:.2f} | {d['p95_latency_ms']:.2f} | {d['p99_latency_ms']:.2f} | {recall} |")
+          EOF
+          done
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: results/
