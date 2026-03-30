@@ -10,6 +10,27 @@ use serde_json::Value;
 
 pub(crate) const WAL_ROTATION_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct WalId(pub u64);
+
+impl WalId {
+    pub(crate) fn first() -> Self {
+        WalId(1)
+    }
+
+    pub(crate) fn next(self) -> Self {
+        WalId(self.0 + 1)
+    }
+
+    pub(crate) fn filename(self) -> String {
+        format!("{:06}.log", self.0)
+    }
+
+    pub(crate) fn parse(filename: &str) -> Option<Self> {
+        filename.strip_suffix(".log")?.parse().ok().map(WalId)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Record types (unchanged)
 // ---------------------------------------------------------------------------
@@ -47,7 +68,7 @@ pub(crate) enum WalSegmentState {
 }
 
 pub(crate) struct WalSegmentMeta {
-    pub wal_id: u64,
+    pub wal_id: WalId,
     pub path: PathBuf,
     pub start_seq: u64,       // seq of first record; 0 if empty
     pub end_seq: Option<u64>, // None while Active
@@ -61,21 +82,9 @@ pub(crate) struct WalSegmentMeta {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ApplyCursor {
-    pub current_wal_id: u64,
+    pub current_wal_id: WalId,
     pub current_offset: u64,
     pub last_applied_seq: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Filename helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn wal_filename(wal_id: u64) -> String {
-    format!("{:06}.log", wal_id)
-}
-
-pub(crate) fn parse_wal_id(filename: &str) -> Option<u64> {
-    filename.strip_suffix(".log")?.parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -98,23 +107,23 @@ impl Wal {
     pub(crate) fn open_dir(wal_dir: &Path) -> Result<Self> {
         fs::create_dir_all(wal_dir)?;
 
-        let mut id_paths: Vec<(u64, PathBuf)> = fs::read_dir(wal_dir)?
+        let mut id_paths: Vec<(WalId, PathBuf)> = fs::read_dir(wal_dir)?
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                parse_wal_id(&name).map(|id| (id, e.path()))
+                WalId::parse(&name).map(|id| (id, e.path()))
             })
             .collect();
         id_paths.sort_by_key(|(id, _)| *id);
 
         if id_paths.is_empty() {
-            let path = wal_dir.join(wal_filename(1));
+            let path = wal_dir.join(WalId::first().filename());
             let file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)?;
             let seg = WalSegmentMeta {
-                wal_id: 1,
+                wal_id: WalId::first(),
                 path,
                 start_seq: 0,
                 end_seq: None,
@@ -190,10 +199,10 @@ impl Wal {
 
     /// Close the current active segment and open a new one with the next wal_id.
     fn rotate(&mut self) -> Result<()> {
-        let new_wal_id = self.segments.last().unwrap().wal_id + 1;
+        let new_wal_id = self.segments.last().unwrap().wal_id.next();
         self.segments.last_mut().unwrap().state = WalSegmentState::Closed;
 
-        let new_path = self.wal_dir.join(wal_filename(new_wal_id));
+        let new_path = self.wal_dir.join(new_wal_id.filename());
         let new_file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -213,7 +222,7 @@ impl Wal {
 
     /// Return (wal_id, path) for all segments with wal_id >= the given id, sorted.
     /// Used by the apply worker to snapshot the segment list under a brief lock.
-    pub(crate) fn segment_paths_from(&self, wal_id: u64) -> Vec<(u64, PathBuf)> {
+    pub(crate) fn segment_paths_from(&self, wal_id: WalId) -> Vec<(WalId, PathBuf)> {
         self.segments
             .iter()
             .filter(|s| s.wal_id >= wal_id)
@@ -227,11 +236,11 @@ impl Wal {
         if !wal_dir.exists() {
             return Ok(vec![]);
         }
-        let mut id_paths: Vec<(u64, PathBuf)> = fs::read_dir(wal_dir)?
+        let mut id_paths: Vec<(WalId, PathBuf)> = fs::read_dir(wal_dir)?
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                parse_wal_id(&name).map(|id| (id, e.path()))
+                WalId::parse(&name).map(|id| (id, e.path()))
             })
             .collect();
         id_paths.sort_by_key(|(id, _)| *id);

@@ -23,7 +23,7 @@ use crate::{
         CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta, SegmentState,
         VectorEntry, WriteToken,
     },
-    wal::{ApplyCursor, Wal, WalOp, WalRecord},
+    wal::{ApplyCursor, Wal, WalId, WalOp, WalRecord},
 };
 
 const INGEST_BATCH_SIZE: usize = 2048;
@@ -476,7 +476,7 @@ fn apply_worker_loop(
         let cursor = cursor_opt.get_or_insert_with(|| {
             let applied = inner.apply_state.lock().unwrap().applied_seq;
             ApplyCursor {
-                current_wal_id: 1,
+                current_wal_id: WalId::first(),
                 current_offset: 0,
                 last_applied_seq: applied,
             }
@@ -547,7 +547,7 @@ fn apply_worker_loop(
 /// Returns the records and an updated cursor reflecting the new position.
 /// Does NOT hold the WAL mutex — callers must snapshot segment paths first.
 fn read_records_from_cursor(
-    segments: &[(u64, PathBuf)],
+    segments: &[(WalId, PathBuf)],
     cursor: &ApplyCursor,
     up_to_seq: u64,
     batch_size: usize,
