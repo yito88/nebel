@@ -28,6 +28,9 @@ const REVERSE_DOC: TableDefinition<&str, &str> = TableDefinition::new("reverse_d
 /// collection_name -> Manifest (JSON)
 const MANIFESTS: TableDefinition<&str, &str> = TableDefinition::new("manifests");
 
+/// collection_name -> last applied WAL seq (u64)
+const APPLIED_SEQ: TableDefinition<&str, u64> = TableDefinition::new("applied_seq");
+
 // key helpers
 
 fn seg_key(collection: &str, seg_id: SegId) -> String {
@@ -58,6 +61,7 @@ impl Storage {
         wtxn.open_table(METADATA)?;
         wtxn.open_table(REVERSE_DOC)?;
         wtxn.open_table(MANIFESTS)?;
+        wtxn.open_table(APPLIED_SEQ)?;
         wtxn.commit()?;
         Ok(Self { db })
     }
@@ -273,6 +277,24 @@ impl Storage {
                     meta_table.insert(mk.as_str(), mj.as_str())?;
                 }
             }
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Get the last applied WAL sequence number for a collection.
+    pub fn get_applied_seq(&self, id: &CollectionId) -> Result<Option<u64>> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(APPLIED_SEQ)?;
+        Ok(table.get(id.as_str())?.map(|v| v.value()))
+    }
+
+    /// Persist the last applied WAL sequence number for a collection.
+    pub fn put_applied_seq(&self, id: &CollectionId, seq: u64) -> Result<()> {
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut table = wtxn.open_table(APPLIED_SEQ)?;
+            table.insert(id.as_str(), seq)?;
         }
         wtxn.commit()?;
         Ok(())

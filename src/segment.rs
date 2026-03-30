@@ -17,9 +17,10 @@ const REBUILD_BUF_BYTES: usize = 256 * 1024 * 1024;
 const INDEX_BASENAME: &str = "index";
 
 // ---------------------------------------------------------------------------
-// HnswIndex — metric-polymorphic wrapper around hnsw_rs
+// HnswIndex
 // ---------------------------------------------------------------------------
 
+/// Metric-polymorphic wrapper around the `hnsw_rs` index types.
 enum HnswIndex {
     L2(Hnsw<'static, f32, DistL2>),
     Cosine(Hnsw<'static, f32, DistCosine>),
@@ -104,9 +105,10 @@ impl HnswIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Shared in-memory metadata
+// SegMeta
 // ---------------------------------------------------------------------------
 
+/// Shared in-memory metadata carried by both writable and sealed segments.
 #[allow(dead_code)]
 struct SegMeta {
     seg_id: SegId,
@@ -118,6 +120,7 @@ struct SegMeta {
 // WritableSegment
 // ---------------------------------------------------------------------------
 
+/// An append-only segment that accepts new vectors and maintains a live HNSW index.
 pub struct WritableSegment {
     meta: SegMeta,
     index: HnswIndex,
@@ -181,17 +184,26 @@ impl WritableSegment {
         Ok(seg)
     }
 
+    pub fn seg_id(&self) -> SegId {
+        self.meta.seg_id
+    }
+
     pub fn num_vectors(&self) -> usize {
         self.meta.num_vectors
     }
 
-    /// Seal this segment: persist the index to disk and return a `SealedSegment`.
-    pub fn seal(self) -> Result<SealedSegment> {
+    /// Non-consuming seal: persist the index to disk and return a new `SealedSegment`
+    /// while keeping this `WritableSegment` intact for ongoing searches.
+    pub(crate) fn persist_as_sealed(&self) -> Result<SealedSegment> {
         let metric = self.index.metric();
         self.index.file_dump(&self.meta.dir, INDEX_BASENAME)?;
         let (index, index_io) = load_index(&self.meta.dir, &metric)?;
         Ok(SealedSegment {
-            meta: self.meta,
+            meta: SegMeta {
+                seg_id: self.meta.seg_id,
+                num_vectors: self.meta.num_vectors,
+                dir: self.meta.dir.clone(),
+            },
             index,
             ef_search: self.ef_search,
             index_io,
@@ -297,6 +309,7 @@ impl WritableSegment {
 // SealedSegment
 // ---------------------------------------------------------------------------
 
+/// A read-only segment whose HNSW index has been persisted to disk and memory-mapped.
 pub struct SealedSegment {
     meta: SegMeta,
     index: HnswIndex,
@@ -306,6 +319,14 @@ pub struct SealedSegment {
 }
 
 impl SealedSegment {
+    pub fn seg_id(&self) -> SegId {
+        self.meta.seg_id
+    }
+
+    pub fn num_vectors(&self) -> usize {
+        self.meta.num_vectors
+    }
+
     /// Open an existing sealed segment by loading the persisted index.
     pub fn open(
         seg_id: SegId,
@@ -346,46 +367,6 @@ impl SealedSegment {
         let file = fs::File::open(&path)?;
         file.read_exact_at(&mut buf, offset)?;
         Ok(bytes_to_f32(&buf))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Segment enum
-// ---------------------------------------------------------------------------
-
-pub enum Segment {
-    Writable(WritableSegment),
-    Sealed(SealedSegment),
-}
-
-#[allow(dead_code)]
-impl Segment {
-    pub fn seg_id(&self) -> SegId {
-        match self {
-            Segment::Writable(s) => s.meta.seg_id,
-            Segment::Sealed(s) => s.meta.seg_id,
-        }
-    }
-
-    pub fn num_vectors(&self) -> usize {
-        match self {
-            Segment::Writable(s) => s.meta.num_vectors,
-            Segment::Sealed(s) => s.meta.num_vectors,
-        }
-    }
-
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
-        match self {
-            Segment::Writable(s) => s.search(query, k),
-            Segment::Sealed(s) => s.search(query, k),
-        }
-    }
-
-    pub fn read_vector(&self, internal_id: u32, dimension: usize) -> Result<Vec<f32>> {
-        match self {
-            Segment::Writable(s) => s.read_vector(internal_id, dimension),
-            Segment::Sealed(s) => s.read_vector(internal_id, dimension),
-        }
     }
 }
 

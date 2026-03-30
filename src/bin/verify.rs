@@ -7,9 +7,10 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{SeedableRng, seq::SliceRandom};
+use rayon::prelude::*;
 
 use nebel::{
-    Nebel,
+    Db,
     dataset::{load_groundtruth, load_vectors, write_raw_f32},
     eval::{hits_to_ids, recall_at_k},
     types::{CollectionId, CollectionSchema, Metric, SegmentParams},
@@ -70,6 +71,10 @@ struct Cli {
     /// If omitted, a temporary directory is used and discarded after the run.
     #[arg(long)]
     data_dir: Option<String>,
+
+    /// Number of concurrent query threads.
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,34 +144,44 @@ fn main() -> Result<()> {
         }
     }
 
-    let (db_dir, mut db, reused) = if let Some(ref dir) = cli.data_dir {
+    let (db_dir, col, reused) = if let Some(ref dir) = cli.data_dir {
         let path = PathBuf::from(dir);
-        let mut db = Nebel::open(&path)?;
-        let reused = db.load_collection(&col_id).is_ok();
-        (DbDir::Persistent(path), db, reused)
+        let db = Db::open(&path)?;
+        let (col, reused) = match db.collection(col_id.as_str()) {
+            Ok(h) => (h, true),
+            Err(_) => {
+                let schema = CollectionSchema {
+                    name: col_id.clone(),
+                    dimension: dim,
+                    metric: cli.metric.clone(),
+                    segment_params: params.clone(),
+                };
+                (db.create_collection(schema)?, false)
+            }
+        };
+        (DbDir::Persistent(path), col, reused)
     } else {
         let tmp = tempfile::tempdir()?;
         println!("DB temp dir: {}", tmp.path().display());
-        let db = Nebel::open(tmp.path())?;
-        (DbDir::Temp(tmp), db, false)
-    };
-
-    if reused {
-        println!("Reusing existing DB at {}", db_dir.path().display());
-    } else {
+        let db = Db::open(tmp.path())?;
         let schema = CollectionSchema {
             name: col_id.clone(),
             dimension: dim,
             metric: cli.metric.clone(),
             segment_params: params.clone(),
         };
-        db.create_collection(schema)?;
+        let col = db.create_collection(schema)?;
+        (DbDir::Temp(tmp), col, false)
+    };
 
+    if reused {
+        println!("Reusing existing DB at {}", db_dir.path().display());
+    } else {
         println!("Ingesting base vectors...");
         let ingest_start = Instant::now();
         let tmp_base = db_dir.path().join("base_vectors.raw");
         write_raw_f32(&tmp_base, &base_vectors)?;
-        let num_ingested = db.ingest_file(&col_id, &tmp_base)?;
+        let num_ingested = col.ingest_file(&tmp_base)?;
         println!(
             "  Ingested {} vectors in {:.2}s",
             num_ingested,
@@ -176,39 +191,78 @@ fn main() -> Result<()> {
 
     // 6. Run search_exact and search(ANN) for each query
     println!(
-        "Running verification ({} queries, k={})...",
-        num_queries, cli.k
+        "Running verification ({} queries, k={}, concurrency={})...",
+        num_queries, cli.k, cli.concurrency,
     );
 
-    let mut exact_recalls = Vec::with_capacity(num_queries);
-    let mut ann_recalls = Vec::with_capacity(num_queries);
-    let mut exact_low_recall: Vec<(usize, f64)> = Vec::new();
-
-    for (qi, &query_idx) in indices.iter().enumerate() {
-        let query = &all_queries[query_idx];
-        let gt = &all_groundtruth[query_idx];
-
-        // search_exact
-        let exact_hits = db.search_exact(&col_id, query, cli.k)?;
-        let exact_ids = hits_to_ids(&exact_hits);
-        let exact_r = recall_at_k(gt, &exact_ids, cli.k);
-        exact_recalls.push(exact_r);
-
-        if exact_r < 1.0 {
-            exact_low_recall.push((query_idx, exact_r));
-        }
-
-        // search (ANN)
-        let ann_hits = db.search(&col_id, query, cli.k, false, false)?;
-        let ann_ids = hits_to_ids(&ann_hits);
-        let ann_r = recall_at_k(gt, &ann_ids, cli.k);
-        ann_recalls.push(ann_r);
-
-        if (qi + 1) % 10 == 0 || qi + 1 == num_queries {
-            print!("\r  {}/{}", qi + 1, num_queries);
-        }
+    struct QueryResult {
+        query_idx: usize,
+        exact_recall: f64,
+        ann_recall: f64,
     }
+
+    let results: Vec<QueryResult> = if cli.concurrency <= 1 {
+        let mut out = Vec::with_capacity(num_queries);
+        for (qi, &query_idx) in indices.iter().enumerate() {
+            let query = &all_queries[query_idx];
+            let gt = &all_groundtruth[query_idx];
+            let exact_r = recall_at_k(gt, &hits_to_ids(&col.search_exact(query, cli.k)?), cli.k);
+            let ann_r = recall_at_k(
+                gt,
+                &hits_to_ids(&col.search(query, cli.k, false, false)?),
+                cli.k,
+            );
+            out.push(QueryResult {
+                query_idx,
+                exact_recall: exact_r,
+                ann_recall: ann_r,
+            });
+            if (qi + 1) % 10 == 0 || qi + 1 == num_queries {
+                print!("\r  {}/{}", qi + 1, num_queries);
+            }
+        }
+        out
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(cli.concurrency)
+            .build()?;
+        let mut out: Vec<QueryResult> = pool.install(|| {
+            indices
+                .par_iter()
+                .map(|&query_idx| {
+                    let query = &all_queries[query_idx];
+                    let gt = &all_groundtruth[query_idx];
+                    let exact_r = recall_at_k(
+                        gt,
+                        &hits_to_ids(&col.search_exact(query, cli.k).unwrap()),
+                        cli.k,
+                    );
+                    let ann_r = recall_at_k(
+                        gt,
+                        &hits_to_ids(&col.search(query, cli.k, false, false).unwrap()),
+                        cli.k,
+                    );
+                    QueryResult {
+                        query_idx,
+                        exact_recall: exact_r,
+                        ann_recall: ann_r,
+                    }
+                })
+                .collect()
+        });
+        out.sort_by_key(|r| r.query_idx);
+        out
+    };
     println!();
+
+    let exact_recalls: Vec<f64> = results.iter().map(|r| r.exact_recall).collect();
+    let ann_recalls: Vec<f64> = results.iter().map(|r| r.ann_recall).collect();
+    let exact_low_recall: Vec<(usize, f64)> = results
+        .iter()
+        .filter(|r| r.exact_recall < 1.0)
+        .map(|r| (r.query_idx, r.exact_recall))
+        .collect();
+    drop(results);
 
     // 7. Compute and print results
     let avg_exact_recall = exact_recalls.iter().sum::<f64>() / num_queries as f64;

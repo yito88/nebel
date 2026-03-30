@@ -480,6 +480,7 @@ dependencies = [
  "clap",
  "hnsw_rs",
  "rand",
+ "rayon",
  "redb",
  "serde",
  "serde_json",

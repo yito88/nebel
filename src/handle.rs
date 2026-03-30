@@ -1,0 +1,820 @@
+use std::{
+    cmp::Ordering as CmpOrdering,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Result, anyhow, bail};
+use rayon::prelude::*;
+use serde_json::Value;
+
+use crate::{
+    segment::{SealedSegment, WritableSegment, compute_distance},
+    snapshot::{CollectionSnapshot, SegmentSnapshot},
+    storage::Storage,
+    types::{
+        CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta, SegmentState,
+        VectorEntry, WriteToken,
+    },
+    wal::{Wal, WalOp, WalRecord},
+};
+
+const INGEST_BATCH_SIZE: usize = 2048;
+const APPLY_BATCH_SIZE: usize = 100;
+const APPLY_INTERVAL: Duration = Duration::from_millis(50);
+
+// ---------------------------------------------------------------------------
+// PendingNotify
+// ---------------------------------------------------------------------------
+
+/// Notification channel held by both `CollectionInner` and the apply worker.
+/// Lightweight (just a bool + condvar), no `Storage` reference.
+/// This allows the worker to wait WITHOUT holding an `Arc<CollectionInner>`,
+/// so `Storage`/`Database` can be freed as soon as the last handle drops.
+pub(crate) type PendingNotify = Arc<(Mutex<bool>, Condvar)>;
+
+// ---------------------------------------------------------------------------
+// ApplyState
+// ---------------------------------------------------------------------------
+
+/// Mutable state that the apply worker and sealing helpers share under a single `Mutex`.
+pub(crate) struct ApplyState {
+    pub(crate) sealed_segs: Vec<Arc<SealedSegment>>,
+    pub(crate) writable_seg: Arc<RwLock<WritableSegment>>,
+    pub(crate) manifest: Manifest,
+    pub(crate) applied_seq: u64,
+}
+
+// ---------------------------------------------------------------------------
+// CollectionInner
+// ---------------------------------------------------------------------------
+
+/// Shared core state for a single collection, owned behind an `Arc`.
+pub(crate) struct CollectionInner {
+    pub(crate) id: CollectionId,
+    pub(crate) schema: Arc<CollectionSchema>,
+    pub(crate) storage: Arc<Storage>,
+    pub(crate) base_dir: PathBuf,
+    pub(crate) apply_state: Mutex<ApplyState>,
+    pub(crate) snapshot: RwLock<Arc<CollectionSnapshot>>,
+    wal: Mutex<Wal>,
+    /// Shared with the worker thread — worker waits on this without holding
+    /// an Arc<CollectionInner>, so the database can be freed promptly on drop.
+    pub(crate) notify: PendingNotify,
+    pub(crate) shutdown: AtomicBool,
+    pub(crate) next_seq: AtomicU64,
+    pub(crate) visible_seq: AtomicU64,
+    pub(crate) visible: (Mutex<()>, Condvar),
+}
+
+impl CollectionInner {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        id: CollectionId,
+        storage: Arc<Storage>,
+        base_dir: PathBuf,
+        manifest: Manifest,
+        sealed_segs: Vec<Arc<SealedSegment>>,
+        writable_seg: Arc<RwLock<WritableSegment>>,
+        applied_seq: u64,
+        schema: Arc<CollectionSchema>,
+    ) -> Result<Arc<Self>> {
+        let wal_dir = base_dir.join(id.as_str());
+        fs::create_dir_all(&wal_dir)?;
+        let wal = Wal::open(&wal_dir.join("wal.log"))?;
+
+        let initial_segs = sealed_segs
+            .iter()
+            .map(|s| SegmentSnapshot::Sealed(Arc::clone(s)))
+            .chain(std::iter::once(SegmentSnapshot::Writable(Arc::clone(
+                &writable_seg,
+            ))))
+            .collect();
+        let initial_snap = Arc::new(CollectionSnapshot {
+            schema: Arc::clone(&schema),
+            segs: initial_segs,
+        });
+        Ok(Arc::new(Self {
+            id,
+            schema,
+            storage,
+            base_dir,
+            apply_state: Mutex::new(ApplyState {
+                sealed_segs,
+                writable_seg,
+                manifest,
+                applied_seq,
+            }),
+            snapshot: RwLock::new(initial_snap),
+            wal: Mutex::new(wal),
+            notify: Arc::new((Mutex::new(false), Condvar::new())),
+            shutdown: AtomicBool::new(false),
+            // Start at applied_seq + 1 so first WAL record gets seq > applied_seq,
+            // making the filter "r.seq > applied_seq" work correctly.
+            next_seq: AtomicU64::new(applied_seq + 1),
+            visible_seq: AtomicU64::new(applied_seq),
+            visible: (Mutex::new(()), Condvar::new()),
+        }))
+    }
+
+    pub(crate) fn publish_snapshot(&self, state: &ApplyState) {
+        let segs = state
+            .sealed_segs
+            .iter()
+            .map(|s| SegmentSnapshot::Sealed(Arc::clone(s)))
+            .chain(std::iter::once(SegmentSnapshot::Writable(Arc::clone(
+                &state.writable_seg,
+            ))))
+            .collect();
+        let snap = Arc::new(CollectionSnapshot {
+            schema: Arc::clone(&self.schema),
+            segs,
+        });
+        *self.snapshot.write().unwrap() = snap;
+    }
+
+    pub(crate) fn seg_dir(&self, seg_id: SegId) -> PathBuf {
+        self.base_dir
+            .join(self.id.as_str())
+            .join(format!("seg_{:03}", seg_id.as_u32()))
+    }
+
+    pub(crate) fn wal_path(&self) -> PathBuf {
+        self.base_dir.join(self.id.as_str()).join("wal.log")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CollectionHandle
+// ---------------------------------------------------------------------------
+
+/// Cheaply cloneable handle to a collection. Spawns a background apply worker on creation.
+#[derive(Clone)]
+pub struct CollectionHandle {
+    pub(crate) inner: Arc<CollectionInner>,
+}
+
+impl CollectionHandle {
+    pub(crate) fn from_arc(inner: Arc<CollectionInner>) -> Self {
+        // Clone the lightweight notify Arc for the worker; worker waits on
+        // this WITHOUT holding Arc<CollectionInner>, allowing prompt cleanup.
+        let notify = Arc::clone(&inner.notify);
+        let weak = Arc::downgrade(&inner);
+        thread::spawn(move || apply_worker_loop(weak, notify));
+        Self { inner }
+    }
+
+    // -----------------------------------------------------------------------
+    // Write operations — WAL path
+    // -----------------------------------------------------------------------
+
+    pub fn upsert(
+        &self,
+        doc_id: &str,
+        vector: &[f32],
+        metadata: Option<Value>,
+    ) -> Result<WriteToken> {
+        let inner = &self.inner;
+        if vector.len() != inner.schema.dimension {
+            bail!(
+                "dimension mismatch: expected {}, got {}",
+                inner.schema.dimension,
+                vector.len()
+            );
+        }
+        let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
+        inner.wal.lock().unwrap().append(&WalRecord {
+            seq,
+            op: WalOp::Upsert {
+                doc_id: doc_id.to_string(),
+                vector: vector.to_vec(),
+                metadata,
+            },
+        })?;
+        notify_worker(&inner.notify);
+        Ok(WriteToken(seq + 1))
+    }
+
+    pub fn delete(&self, doc_id: &str) -> Result<WriteToken> {
+        let inner = &self.inner;
+        let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
+        inner.wal.lock().unwrap().append(&WalRecord {
+            seq,
+            op: WalOp::Delete {
+                doc_id: doc_id.to_string(),
+            },
+        })?;
+        notify_worker(&inner.notify);
+        Ok(WriteToken(seq + 1))
+    }
+
+    pub fn update_metadata(&self, doc_id: &str, metadata: Value) -> Result<WriteToken> {
+        let inner = &self.inner;
+        let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
+        inner.wal.lock().unwrap().append(&WalRecord {
+            seq,
+            op: WalOp::UpdateMetadata {
+                doc_id: doc_id.to_string(),
+                metadata,
+            },
+        })?;
+        notify_worker(&inner.notify);
+        Ok(WriteToken(seq + 1))
+    }
+
+    // -----------------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------------
+
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        include_metadata: bool,
+        include_vector: bool,
+    ) -> Result<Vec<SearchHit>> {
+        let snap = { Arc::clone(&*self.inner.snapshot.read().unwrap()) };
+        search_snapshot(
+            &self.inner,
+            &snap,
+            query,
+            k,
+            include_metadata,
+            include_vector,
+        )
+    }
+
+    pub fn search_exact(&self, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
+        let snap = { Arc::clone(&*self.inner.snapshot.read().unwrap()) };
+        search_exact_snapshot(&self.inner, &snap, query, k)
+    }
+
+    // -----------------------------------------------------------------------
+    // Ingest (fast-path: bypasses WAL, directly applies to segments)
+    // -----------------------------------------------------------------------
+
+    pub fn ingest_file(&self, file_path: impl AsRef<Path>) -> Result<usize> {
+        let inner = &self.inner;
+        let storage = &*inner.storage;
+        let dimension = inner.schema.dimension;
+        let record_size = dimension * 4;
+
+        let mut file = fs::File::open(file_path)?;
+        let mut buf = vec![0u8; record_size * INGEST_BATCH_SIZE];
+        let mut count = 0usize;
+
+        loop {
+            let n_bytes = read_up_to(&mut file, &mut buf)?;
+            if n_bytes == 0 {
+                break;
+            }
+            if n_bytes % record_size != 0 {
+                bail!("partial record: {} trailing bytes", n_bytes % record_size);
+            }
+            let vectors: Vec<Vec<f32>> = buf[..n_bytes]
+                .chunks_exact(record_size)
+                .map(|c| {
+                    c.chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect()
+                })
+                .collect();
+            let doc_ids: Vec<String> = (count..count + vectors.len())
+                .map(|i| format!("doc_{}", i))
+                .collect();
+
+            let mut state = inner.apply_state.lock().unwrap();
+            if state.writable_seg.read().unwrap().num_vectors()
+                >= inner.schema.segment_params.segment_capacity
+            {
+                seal_and_new_segment(inner, &mut state)?;
+            }
+            let internal_ids = {
+                let mut ws = state.writable_seg.write().unwrap();
+                ws.insert_batch(&vectors, dimension)?
+            };
+            let seg_id = state.manifest.writable_segment;
+            let num_vectors = state.writable_seg.read().unwrap().num_vectors();
+            let entries: Vec<VectorEntry<'_>> = doc_ids
+                .iter()
+                .zip(internal_ids.iter())
+                .map(|(doc_id, &internal_id)| VectorEntry {
+                    doc_id: doc_id.as_str(),
+                    internal_id,
+                    metadata: None,
+                })
+                .collect();
+            storage.write_vector_entries(
+                &inner.id,
+                &SegmentMeta {
+                    seg_id,
+                    num_vectors,
+                    state: SegmentState::Writable,
+                },
+                &entries,
+            )?;
+            count += vectors.len();
+        }
+
+        // Publish snapshot so searches immediately see the ingested data.
+        {
+            let state = inner.apply_state.lock().unwrap();
+            inner.publish_snapshot(&state);
+        }
+
+        Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
+    // Visibility
+    // -----------------------------------------------------------------------
+
+    pub fn wait_visible(&self, token: WriteToken) -> Result<()> {
+        let inner = &self.inner;
+        if inner.visible_seq.load(Ordering::Acquire) >= token.0 {
+            return Ok(());
+        }
+        let guard = inner.visible.0.lock().unwrap();
+        drop(inner.visible.1.wait_while(guard, |_| {
+            inner.visible_seq.load(Ordering::Acquire) < token.0
+        }));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Segment management helpers (used in tests until Stage 4 test refactor)
+    // -----------------------------------------------------------------------
+
+    /// Seal the current writable segment and start a new one.
+    /// In Stage 4+, tests should use `segment_capacity: N` schema instead.
+    pub fn add_writable_segment(&self) -> Result<SegId> {
+        let inner = &self.inner;
+        // First, drain any pending WAL records so the writable segment
+        // is populated before we seal it.
+        self.drain_wal()?;
+        let mut state = inner.apply_state.lock().unwrap();
+        seal_and_new_segment(inner, &mut state)?;
+        Ok(state.manifest.writable_segment)
+    }
+
+    /// Apply all pending WAL records synchronously. Used by add_writable_segment.
+    fn drain_wal(&self) -> Result<()> {
+        let inner = &self.inner;
+        let records = Wal::read_from(&inner.wal_path())?;
+        let mut state = inner.apply_state.lock().unwrap();
+        let pending: Vec<WalRecord> = records
+            .into_iter()
+            .filter(|r| r.seq > state.applied_seq)
+            .collect();
+        for record in &pending {
+            apply_entry(inner, &mut state, record)?;
+        }
+        if !pending.is_empty() {
+            inner
+                .storage
+                .put_applied_seq(&inner.id, state.applied_seq)?;
+            let visible = state.applied_seq + 1;
+            inner.publish_snapshot(&state);
+            drop(state);
+            inner.visible_seq.fetch_max(visible, Ordering::Release);
+            inner.visible.1.notify_all();
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background apply worker
+// ---------------------------------------------------------------------------
+
+fn notify_worker(notify: &PendingNotify) {
+    *notify.0.lock().unwrap() = true;
+    notify.1.notify_one();
+}
+
+fn apply_worker_loop(weak: Weak<CollectionInner>, notify: PendingNotify) {
+    loop {
+        // Wait for work WITHOUT holding Arc<CollectionInner>.
+        // This allows Storage/Database to be freed when all handles drop.
+        {
+            let guard = notify.0.lock().unwrap();
+            let _ = notify
+                .1
+                .wait_timeout_while(guard, APPLY_INTERVAL, |hw| !*hw);
+        }
+
+        // Upgrade to do work. If the last strong Arc was dropped, we exit.
+        let inner = match weak.upgrade() {
+            Some(i) => i,
+            None => return,
+        };
+
+        if inner.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Read WAL and find pending records.
+        let records = match Wal::read_from(&inner.wal_path()) {
+            Ok(r) => r,
+            Err(_) => {
+                // Clear pending flag on error and retry next interval.
+                *notify.0.lock().unwrap() = false;
+                continue;
+            }
+        };
+
+        let current_applied = inner.apply_state.lock().unwrap().applied_seq;
+        let pending: Vec<WalRecord> = records
+            .into_iter()
+            .filter(|r| r.seq > current_applied)
+            .take(APPLY_BATCH_SIZE)
+            .collect();
+
+        if pending.is_empty() {
+            *notify.0.lock().unwrap() = false;
+            // inner drops here (Arc count decrements).
+            continue;
+        }
+
+        // Apply records.
+        let mut state = inner.apply_state.lock().unwrap();
+        for record in &pending {
+            if apply_entry(&inner, &mut state, record).is_err() {
+                break;
+            }
+        }
+
+        let _ = inner.storage.put_applied_seq(&inner.id, state.applied_seq);
+
+        let visible = state.applied_seq + 1;
+        inner.publish_snapshot(&state);
+        drop(state);
+
+        inner.visible_seq.fetch_max(visible, Ordering::Release);
+        inner.visible.1.notify_all();
+
+        // Clear pending flag; re-set if more records may exist.
+        *notify.0.lock().unwrap() = false;
+        // inner drops here.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// apply_entry
+// ---------------------------------------------------------------------------
+
+/// Apply a single WAL record to `state`. Shared between the apply worker and recovery.
+pub(crate) fn apply_entry(
+    inner: &CollectionInner,
+    state: &mut ApplyState,
+    record: &WalRecord,
+) -> Result<()> {
+    let storage = &*inner.storage;
+    let schema = &*inner.schema;
+    let id = &inner.id;
+
+    match &record.op {
+        WalOp::Upsert {
+            doc_id,
+            vector,
+            metadata,
+        } => {
+            if let Some(loc) = storage.get_doc_location(id, doc_id)? {
+                storage.set_tombstone(id, loc.seg_id, loc.internal_id)?;
+            }
+            if state.writable_seg.read().unwrap().num_vectors()
+                >= schema.segment_params.segment_capacity
+            {
+                seal_and_new_segment(inner, state)?;
+            }
+            let internal_id = {
+                let mut ws = state.writable_seg.write().unwrap();
+                ws.insert(vector, schema.dimension)?
+            };
+            let seg_id = state.manifest.writable_segment;
+            let num_vectors = state.writable_seg.read().unwrap().num_vectors();
+            storage.write_vector_entries(
+                id,
+                &SegmentMeta {
+                    seg_id,
+                    num_vectors,
+                    state: SegmentState::Writable,
+                },
+                &[VectorEntry {
+                    doc_id: doc_id.as_str(),
+                    internal_id,
+                    metadata: metadata.as_ref(),
+                }],
+            )?;
+        }
+        WalOp::Delete { doc_id } => {
+            if let Some(loc) = storage.get_doc_location(id, doc_id)? {
+                storage.set_tombstone(id, loc.seg_id, loc.internal_id)?;
+                storage.remove_doc_location(id, doc_id)?;
+            }
+        }
+        WalOp::UpdateMetadata { doc_id, metadata } => {
+            if let Some(loc) = storage.get_doc_location(id, doc_id)? {
+                storage.put_metadata(id, loc.seg_id, loc.internal_id, metadata)?;
+            }
+        }
+    }
+
+    state.applied_seq = record.seq;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sealing helper
+// ---------------------------------------------------------------------------
+
+/// Seal the current writable segment and create a fresh one, updating `state` and storage.
+pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplyState) -> Result<()> {
+    let storage = &*inner.storage;
+    let old_id = state.manifest.writable_segment;
+    let new_id = state.manifest.next_seg_id;
+    let new_dir = inner.seg_dir(new_id);
+
+    let num_vectors = state.writable_seg.read().unwrap().num_vectors();
+    let sealed = state.writable_seg.read().unwrap().persist_as_sealed()?;
+    let sealed_arc = Arc::new(sealed);
+
+    storage.put_segment(
+        &inner.id,
+        &SegmentMeta {
+            seg_id: old_id,
+            num_vectors,
+            state: SegmentState::Sealed,
+        },
+    )?;
+    storage.put_segment(&inner.id, &SegmentMeta::new(new_id))?;
+
+    let new_ws = WritableSegment::create(
+        new_id,
+        new_dir,
+        &inner.schema.metric,
+        &inner.schema.segment_params,
+    )?;
+
+    state.sealed_segs.push(sealed_arc);
+    state.manifest.active_segments.push(new_id);
+    state.manifest.writable_segment = new_id;
+    state.manifest.next_seg_id = new_id.next();
+    state.writable_seg = Arc::new(RwLock::new(new_ws));
+    storage.put_manifest(&inner.id, &state.manifest)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+fn search_snapshot(
+    inner: &CollectionInner,
+    snap: &CollectionSnapshot,
+    query: &[f32],
+    k: usize,
+    include_metadata: bool,
+    include_vector: bool,
+) -> Result<Vec<SearchHit>> {
+    let dimension = snap.schema.dimension;
+    if query.len() != dimension {
+        bail!(
+            "dimension mismatch: expected {}, got {}",
+            dimension,
+            query.len()
+        );
+    }
+    let storage = &*inner.storage;
+    let id = &inner.id;
+
+    let sealed: Vec<&Arc<SealedSegment>> = snap
+        .segs
+        .iter()
+        .filter_map(|s| match s {
+            SegmentSnapshot::Sealed(ss) => Some(ss),
+            _ => None,
+        })
+        .collect();
+    let writable = snap.segs.iter().find_map(|s| match s {
+        SegmentSnapshot::Writable(w) => Some(w),
+        _ => None,
+    });
+
+    let (sealed_cands, ws_cands) = rayon::join(
+        || {
+            sealed
+                .par_iter()
+                .filter(|s| s.num_vectors() > 0)
+                .flat_map(|seg| {
+                    let sid = seg.seg_id();
+                    seg.search(query, k)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |(id, dist)| (sid, id, dist))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        },
+        || {
+            writable
+                .map(|w| {
+                    let ws = w.read().unwrap();
+                    let sid = ws.seg_id();
+                    let hits = if ws.num_vectors() > 0 {
+                        ws.search(query, k).unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    drop(ws);
+                    hits.into_iter()
+                        .map(|(id, dist)| (sid, id, dist))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        },
+    );
+    let mut candidates: Vec<(SegId, u32, f32)> = sealed_cands;
+    candidates.extend(ws_cands);
+    candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(CmpOrdering::Equal));
+
+    let mut hits = Vec::new();
+    for (seg_id, internal_id, distance) in candidates {
+        if hits.len() >= k {
+            break;
+        }
+        if storage.is_tombstoned(id, seg_id, internal_id)? {
+            continue;
+        }
+        let doc_id = storage
+            .get_reverse_doc(id, seg_id, internal_id)?
+            .ok_or_else(|| anyhow!("reverse mapping not found"))?;
+        let metadata = if include_metadata {
+            storage.get_metadata(id, seg_id, internal_id)?
+        } else {
+            None
+        };
+        let vector = if include_vector {
+            let from_sealed = sealed
+                .iter()
+                .find(|s| s.seg_id() == seg_id)
+                .map(|s| s.read_vector(internal_id, dimension))
+                .transpose()?;
+            if from_sealed.is_some() {
+                from_sealed
+            } else if let Some(w) = writable {
+                let ws = w.read().unwrap();
+                if ws.seg_id() == seg_id {
+                    Some(ws.read_vector(internal_id, dimension)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        hits.push(SearchHit {
+            doc_id,
+            score: distance,
+            metadata,
+            vector,
+        });
+    }
+    Ok(hits)
+}
+
+fn search_exact_snapshot(
+    inner: &CollectionInner,
+    snap: &CollectionSnapshot,
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<SearchHit>> {
+    let dimension = snap.schema.dimension;
+    if query.len() != dimension {
+        bail!(
+            "dimension mismatch: expected {}, got {}",
+            dimension,
+            query.len()
+        );
+    }
+    let storage = &*inner.storage;
+    let id = &inner.id;
+    let metric = &snap.schema.metric;
+
+    struct HeapEntry {
+        distance: f32,
+        seg_id: SegId,
+        internal_id: u32,
+    }
+
+    let sealed: Vec<&Arc<SealedSegment>> = snap
+        .segs
+        .iter()
+        .filter_map(|s| match s {
+            SegmentSnapshot::Sealed(ss) => Some(ss),
+            _ => None,
+        })
+        .collect();
+    let writable = snap.segs.iter().find_map(|s| match s {
+        SegmentSnapshot::Writable(w) => Some(w),
+        _ => None,
+    });
+
+    let (sealed_cands, ws_cands): (Vec<HeapEntry>, Vec<HeapEntry>) = rayon::join(
+        || {
+            sealed
+                .par_iter()
+                .flat_map(|seg| {
+                    let sid = seg.seg_id();
+                    (0..seg.num_vectors() as u32)
+                        .filter_map(|internal_id| {
+                            if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
+                                return None;
+                            }
+                            let vector = seg.read_vector(internal_id, dimension).ok()?;
+                            let distance = compute_distance(metric, query, &vector);
+                            Some(HeapEntry {
+                                distance,
+                                seg_id: sid,
+                                internal_id,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        },
+        || {
+            writable
+                .map(|w| {
+                    let ws = w.read().unwrap();
+                    let sid = ws.seg_id();
+                    let n = ws.num_vectors() as u32;
+                    let entries: Vec<HeapEntry> = (0..n)
+                        .filter_map(|internal_id| {
+                            if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
+                                return None;
+                            }
+                            let vector = ws.read_vector(internal_id, dimension).ok()?;
+                            let distance = compute_distance(metric, query, &vector);
+                            Some(HeapEntry {
+                                distance,
+                                seg_id: sid,
+                                internal_id,
+                            })
+                        })
+                        .collect();
+                    drop(ws);
+                    entries
+                })
+                .unwrap_or_default()
+        },
+    );
+    let mut candidates = sealed_cands;
+    candidates.extend(ws_cands);
+
+    candidates.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(CmpOrdering::Equal)
+    });
+    let top_k: Vec<HeapEntry> = candidates.into_iter().take(k).collect();
+
+    let mut hits = Vec::with_capacity(top_k.len());
+    for entry in top_k {
+        let doc_id = storage
+            .get_reverse_doc(id, entry.seg_id, entry.internal_id)?
+            .ok_or_else(|| anyhow!("reverse mapping not found"))?;
+        hits.push(SearchHit {
+            doc_id,
+            score: entry.distance,
+            metadata: None,
+            vector: None,
+        });
+    }
+    Ok(hits)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match r.read(&mut buf[total..])? {
+            0 => break,
+            n => total += n,
+        }
+    }
+    Ok(total)
+}
