@@ -12,7 +12,7 @@ use crate::{
     segment::{SealedSegment, WritableSegment},
     storage::Storage,
     types::{CollectionId, CollectionSchema, Manifest, SegId, SegmentMeta, SegmentState},
-    wal::Wal,
+    wal::{Wal, WalRecord},
 };
 
 const DB_NAME: &str = "nebel.redb";
@@ -143,32 +143,16 @@ impl Db {
         let schema_arc = Arc::new(schema);
         let applied_seq_stored = self.storage.get_applied_seq(id)?.unwrap_or(0);
 
-        // --- Recovery: read all WAL records, wipe WAL, then replay ---
+        // --- Recovery ---
+        //
+        // Each WAL segment is applied and deleted individually.  The segment file is
+        // only removed after its records are applied and applied_seq is persisted, so a
+        // crash at any point leaves surviving files for the next open to re-read and
+        // re-apply (records already applied are skipped via the per-record seq check).
 
-        let col_dir = self.base_dir.join(id.as_str());
-        let old_wal_path = col_dir.join("wal.log"); // legacy single-file format
-        let wal_dir = col_dir.join("wal");           // current segmented format
-
-        // Step 1: Read all pending WAL records before touching the directory.
-        let all_records = if old_wal_path.exists() && !wal_dir.exists() {
-            Wal::read_legacy(&old_wal_path)?
-        } else {
-            Wal::read_all_from_dir(&wal_dir)?
-        };
-        let pending: Vec<_> = all_records
-            .into_iter()
-            .filter(|r| r.seq > applied_seq_stored)
-            .collect();
-
-        // Step 2: Wipe all WAL files so CollectionInner::new() opens a clean directory.
-        if old_wal_path.exists() {
-            fs::remove_file(&old_wal_path)?;
-        }
-        if wal_dir.exists() {
-            fs::remove_dir_all(&wal_dir)?;
-        }
-
-        // Step 3: Create CollectionInner — opens fresh wal/ dir, creates 000001.log.
+        // Step 1: Create CollectionInner.
+        // Wal::open_dir marks every pre-existing segment Closed and opens a fresh
+        // Active segment at max_id.next(), so new writes never touch recovery files.
         let inner = CollectionInner::new(
             id.clone(),
             Arc::clone(&self.storage),
@@ -180,31 +164,56 @@ impl Db {
             schema_arc,
         )?;
 
-        // Step 4: Replay pending WAL records against the freshly-opened inner.
-        if !pending.is_empty() {
-            let mut state = inner.apply_state.lock().unwrap();
-            for record in &pending {
-                apply_entry(&inner, &mut state, record)?;
+        // Step 2: Process each pre-existing (Closed) WAL segment in ascending ID order.
+        // Snapshot the list first; new writes only go to the Active segment.
+        let recovery_segs = inner.wal.lock().unwrap().recovery_segments();
+        for (wal_id, path) in recovery_segs {
+            let records = Wal::read_segment(&path)?;
+            Self::apply_and_persist(&records, &inner, &self.storage, id)?;
+            inner.wal.lock().unwrap().remove_segment(wal_id)?;
+        }
+
+        // Step 4: Sync sequence counters with the final applied_seq.
+        {
+            let state = inner.apply_state.lock().unwrap();
+            let applied = state.applied_seq;
+            if applied > applied_seq_stored {
+                inner
+                    .next_seq
+                    .store(applied + 1, std::sync::atomic::Ordering::Relaxed);
+                inner
+                    .durable_seq
+                    .store(applied, std::sync::atomic::Ordering::Release);
+                inner.publish_snapshot(&state);
+                drop(state);
+                inner
+                    .visible_seq
+                    .store(applied + 1, std::sync::atomic::Ordering::Release);
             }
-            self.storage.put_applied_seq(id, state.applied_seq)?;
-            let new_next = state.applied_seq + 1;
-            inner
-                .next_seq
-                .store(new_next, std::sync::atomic::Ordering::Relaxed);
-            // durable_seq must also advance so the worker doesn't scan empty WAL
-            // looking for records that were already replayed here.
-            inner
-                .durable_seq
-                .store(state.applied_seq, std::sync::atomic::Ordering::Release);
-            let visible = state.applied_seq + 1;
-            inner.publish_snapshot(&state);
-            drop(state);
-            inner
-                .visible_seq
-                .store(visible, std::sync::atomic::Ordering::Release);
         }
 
         Ok(CollectionHandle::from_arc(inner))
+    }
+
+    /// Apply records (skipping already-applied ones by seq) and persist applied_seq.
+    fn apply_and_persist(
+        records: &[WalRecord],
+        inner: &CollectionInner,
+        storage: &Storage,
+        id: &CollectionId,
+    ) -> Result<()> {
+        let mut state = inner.apply_state.lock().unwrap();
+        let before = state.applied_seq;
+        for record in records {
+            if record.seq <= state.applied_seq {
+                continue;
+            }
+            apply_entry(inner, &mut state, record)?;
+        }
+        if state.applied_seq > before {
+            storage.put_applied_seq(id, state.applied_seq)?;
+        }
+        Ok(())
     }
 
     fn seg_dir(&self, id: &CollectionId, seg_id: SegId) -> PathBuf {

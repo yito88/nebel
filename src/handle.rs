@@ -91,7 +91,7 @@ pub(crate) struct CollectionInner {
     pub(crate) base_dir: PathBuf,
     pub(crate) apply_state: Mutex<ApplyState>,
     pub(crate) snapshot: RwLock<Arc<CollectionSnapshot>>,
-    wal: Mutex<Wal>,
+    pub(crate) wal: Mutex<Wal>,
     /// Shared with the worker thread — worker waits on this without holding
     /// an Arc<CollectionInner>, so the database can be freed promptly on drop.
     pub(crate) notify: PendingNotify,

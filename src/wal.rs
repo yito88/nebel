@@ -104,6 +104,13 @@ impl Wal {
     /// - If the directory is empty, creates `000001.log` as the first active segment.
     /// - If segments already exist, reconstructs metadata by scanning them, marks all
     ///   but the last as Closed, and opens the last in append mode.
+    /// Open (or create) a segmented WAL directory.
+    ///
+    /// - **Empty / absent directory**: creates `WalId::first()` as the sole Active segment.
+    /// - **Existing segments**: marks every existing segment Closed (they are recovery
+    ///   candidates), then creates a new Active segment at `max_id.next()`.  The caller
+    ///   is responsible for draining the Closed segments via `remove_segment` once their
+    ///   records have been applied.
     pub(crate) fn open_dir(wal_dir: &Path) -> Result<Self> {
         fs::create_dir_all(wal_dir)?;
 
@@ -116,59 +123,83 @@ impl Wal {
             .collect();
         id_paths.sort_by_key(|(id, _)| *id);
 
+        // Fresh directory — create the first segment.
         if id_paths.is_empty() {
             let path = wal_dir.join(WalId::first().filename());
             let file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)?;
-            let seg = WalSegmentMeta {
-                wal_id: WalId::first(),
-                path,
-                start_seq: 0,
-                end_seq: None,
-                byte_size: 0,
-                record_count: 0,
-                state: WalSegmentState::Active,
-            };
             return Ok(Self {
                 wal_dir: wal_dir.to_path_buf(),
-                segments: vec![seg],
+                segments: vec![WalSegmentMeta {
+                    wal_id: WalId::first(),
+                    path,
+                    start_seq: 0,
+                    end_seq: None,
+                    byte_size: 0,
+                    record_count: 0,
+                    state: WalSegmentState::Active,
+                }],
                 writer: BufWriter::new(file),
             });
         }
 
-        // Reconstruct metadata for existing segments.
-        let mut segments = Vec::with_capacity(id_paths.len());
-        for (i, (wal_id, path)) in id_paths.iter().enumerate() {
-            let is_last = i == id_paths.len() - 1;
+        // Existing segments: mark all Closed, open a new Active at max+1.
+        let mut segments = Vec::with_capacity(id_paths.len() + 1);
+        for (wal_id, path) in &id_paths {
             let (start_seq, end_seq, byte_size, record_count) = scan_segment_meta(path)?;
             segments.push(WalSegmentMeta {
                 wal_id: *wal_id,
                 path: path.clone(),
                 start_seq,
-                end_seq: if is_last { None } else { end_seq },
+                end_seq,
                 byte_size,
                 record_count,
-                state: if is_last {
-                    WalSegmentState::Active
-                } else {
-                    WalSegmentState::Closed
-                },
+                state: WalSegmentState::Closed,
             });
         }
 
-        let active_path = &segments.last().unwrap().path;
-        let file = fs::OpenOptions::new()
+        let new_wal_id = segments.last().unwrap().wal_id.next();
+        let new_path = wal_dir.join(new_wal_id.filename());
+        let new_file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(active_path)?;
+            .open(&new_path)?;
+        segments.push(WalSegmentMeta {
+            wal_id: new_wal_id,
+            path: new_path,
+            start_seq: 0,
+            end_seq: None,
+            byte_size: 0,
+            record_count: 0,
+            state: WalSegmentState::Active,
+        });
 
         Ok(Self {
             wal_dir: wal_dir.to_path_buf(),
             segments,
-            writer: BufWriter::new(file),
+            writer: BufWriter::new(new_file),
         })
+    }
+
+    /// Snapshot the (wal_id, path) of every Closed segment, in ascending ID order.
+    /// These are the segments that need to be replayed and removed during recovery.
+    pub(crate) fn recovery_segments(&self) -> Vec<(WalId, PathBuf)> {
+        self.segments
+            .iter()
+            .filter(|s| s.state == WalSegmentState::Closed)
+            .map(|s| (s.wal_id, s.path.clone()))
+            .collect()
+    }
+
+    /// Delete a segment file and remove it from the in-memory list.
+    pub(crate) fn remove_segment(&mut self, wal_id: WalId) -> Result<()> {
+        if let Some(pos) = self.segments.iter().position(|s| s.wal_id == wal_id) {
+            let seg = self.segments.remove(pos);
+            fs::remove_file(&seg.path)?;
+        }
+        Ok(())
     }
 
     /// Append a record durably. Format: 4-byte LE length + JSON body + '\n'.
@@ -230,8 +261,7 @@ impl Wal {
             .collect()
     }
 
-    /// Read all valid records from all segments in a WAL directory, in wal_id order.
-    /// Used for recovery and drain_wal.
+    /// Read all valid records from all segments in the WAL directory, in wal_id order.
     pub(crate) fn read_all_from_dir(wal_dir: &Path) -> Result<Vec<WalRecord>> {
         if !wal_dir.exists() {
             return Ok(vec![]);
@@ -244,7 +274,6 @@ impl Wal {
             })
             .collect();
         id_paths.sort_by_key(|(id, _)| *id);
-
         let mut records = Vec::new();
         for (_, path) in &id_paths {
             records.extend(read_segment_records(path)?);
@@ -252,8 +281,8 @@ impl Wal {
         Ok(records)
     }
 
-    /// Read all valid records from a legacy single-file `wal.log` (migration path).
-    pub(crate) fn read_legacy(path: &Path) -> Result<Vec<WalRecord>> {
+    /// Read all valid records from a single segment file.
+    pub(crate) fn read_segment(path: &Path) -> Result<Vec<WalRecord>> {
         read_segment_records(path)
     }
 }
