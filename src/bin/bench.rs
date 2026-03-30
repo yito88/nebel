@@ -338,7 +338,7 @@ fn main() -> Result<()> {
                 .into_par_iter()
                 .map(|i| {
                     let start = Instant::now();
-                    let hits = col.search(&bench_queries[i], cli.k, false, false).unwrap();
+                    let hits = col.search(bench_queries[i], cli.k, false, false).unwrap();
                     let latency = start.elapsed().as_secs_f64() * 1000.0;
                     let recall = exact_results.as_ref().map(|er| {
                         recall_at_k(&er.query_results[i], &hits_to_ids(&hits), cli.k)

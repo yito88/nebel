@@ -210,18 +210,6 @@ impl WritableSegment {
         })
     }
 
-    /// Seal this segment: persist the index to disk and return a `SealedSegment`.
-    pub fn seal(self) -> Result<SealedSegment> {
-        let metric = self.index.metric();
-        self.index.file_dump(&self.meta.dir, INDEX_BASENAME)?;
-        let (index, index_io) = load_index(&self.meta.dir, &metric)?;
-        Ok(SealedSegment {
-            meta: self.meta,
-            index,
-            ef_search: self.ef_search,
-            index_io,
-        })
-    }
 
     /// Append a vector to the segment and return its internal_id.
     pub fn insert(&mut self, vector: &[f32], dimension: usize) -> Result<u32> {
@@ -388,6 +376,7 @@ impl SealedSegment {
 // ---------------------------------------------------------------------------
 
 /// Unified segment type that is either writable or sealed.
+#[allow(dead_code)]
 pub enum Segment {
     Writable(WritableSegment),
     Sealed(SealedSegment),

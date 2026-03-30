@@ -177,7 +177,7 @@ impl Db {
             inner.next_seq.store(new_next, std::sync::atomic::Ordering::Relaxed);
             // Publish recovered snapshot and advance visible_seq.
             let visible = state.applied_seq + 1;
-            inner.publish_snapshot(&state, visible);
+            inner.publish_snapshot(&state);
             drop(state);
             inner.visible_seq.store(visible, std::sync::atomic::Ordering::Release);
         }

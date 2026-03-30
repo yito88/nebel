@@ -76,6 +76,7 @@ pub(crate) struct CollectionInner {
 }
 
 impl CollectionInner {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: CollectionId,
         storage: Arc<Storage>,
@@ -94,7 +95,6 @@ impl CollectionInner {
             schema: Arc::clone(&schema),
             sealed_segs: sealed_segs.clone(),
             writable_seg: Arc::clone(&writable_seg),
-            visible_seq: applied_seq,
         });
         Ok(Arc::new(Self {
             id,
@@ -119,12 +119,11 @@ impl CollectionInner {
         }))
     }
 
-    pub(crate) fn publish_snapshot(&self, state: &ApplyState, visible_seq: u64) {
+    pub(crate) fn publish_snapshot(&self, state: &ApplyState) {
         let snap = Arc::new(CollectionSnapshot {
             schema: Arc::clone(&self.schema),
             sealed_segs: state.sealed_segs.clone(),
             writable_seg: Arc::clone(&state.writable_seg),
-            visible_seq,
         });
         *self.snapshot.write().unwrap() = snap;
     }
@@ -298,8 +297,7 @@ impl CollectionHandle {
         // Publish snapshot so searches immediately see the ingested data.
         {
             let state = inner.apply_state.lock().unwrap();
-            let visible = inner.visible_seq.load(Ordering::Acquire);
-            inner.publish_snapshot(&state, visible);
+            inner.publish_snapshot(&state);
         }
 
         Ok(count)
@@ -352,7 +350,7 @@ impl CollectionHandle {
         if !pending.is_empty() {
             inner.storage.put_applied_seq(&inner.id, state.applied_seq)?;
             let visible = state.applied_seq + 1;
-            inner.publish_snapshot(&state, visible);
+            inner.publish_snapshot(&state);
             drop(state);
             inner.visible_seq.fetch_max(visible, Ordering::Release);
             inner.visible.1.notify_all();
@@ -423,7 +421,7 @@ fn apply_worker_loop(weak: Weak<CollectionInner>, notify: PendingNotify) {
         let _ = inner.storage.put_applied_seq(&inner.id, state.applied_seq);
 
         let visible = state.applied_seq + 1;
-        inner.publish_snapshot(&state, visible);
+        inner.publish_snapshot(&state);
         drop(state);
 
         inner.visible_seq.fetch_max(visible, Ordering::Release);
