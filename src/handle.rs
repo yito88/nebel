@@ -32,18 +32,20 @@ const APPLY_BATCH_SIZE: usize = 100;
 const APPLY_INTERVAL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
-// Notification channel — held by both CollectionInner AND the apply worker.
-// Lightweight (just a bool + condvar), no Storage reference.
-// This allows the worker to wait WITHOUT holding an Arc<CollectionInner>,
-// so Storage/Database can be freed as soon as the last handle drops.
+// PendingNotify
 // ---------------------------------------------------------------------------
 
+/// Notification channel held by both `CollectionInner` and the apply worker.
+/// Lightweight (just a bool + condvar), no `Storage` reference.
+/// This allows the worker to wait WITHOUT holding an `Arc<CollectionInner>`,
+/// so `Storage`/`Database` can be freed as soon as the last handle drops.
 pub(crate) type PendingNotify = Arc<(Mutex<bool>, Condvar)>;
 
 // ---------------------------------------------------------------------------
 // ApplyState
 // ---------------------------------------------------------------------------
 
+/// Mutable state that the apply worker and sealing helpers share under a single `Mutex`.
 pub(crate) struct ApplyState {
     pub(crate) sealed_segs: Vec<Arc<SealedSegment>>,
     pub(crate) writable_seg: Arc<RwLock<WritableSegment>>,
@@ -55,6 +57,7 @@ pub(crate) struct ApplyState {
 // CollectionInner
 // ---------------------------------------------------------------------------
 
+/// Shared core state for a single collection, owned behind an `Arc`.
 pub(crate) struct CollectionInner {
     pub(crate) id: CollectionId,
     pub(crate) schema: Arc<CollectionSchema>,
@@ -141,6 +144,7 @@ impl CollectionInner {
 // CollectionHandle
 // ---------------------------------------------------------------------------
 
+/// Cheaply cloneable handle to a collection. Spawns a background apply worker on creation.
 #[derive(Clone)]
 pub struct CollectionHandle {
     pub(crate) inner: Arc<CollectionInner>,
@@ -432,9 +436,10 @@ fn apply_worker_loop(weak: Weak<CollectionInner>, notify: PendingNotify) {
 }
 
 // ---------------------------------------------------------------------------
-// apply_entry — shared between apply worker and recovery
+// apply_entry
 // ---------------------------------------------------------------------------
 
+/// Apply a single WAL record to `state`. Shared between the apply worker and recovery.
 pub(crate) fn apply_entry(
     inner: &CollectionInner,
     state: &mut ApplyState,
@@ -487,6 +492,7 @@ pub(crate) fn apply_entry(
 // Sealing helper
 // ---------------------------------------------------------------------------
 
+/// Seal the current writable segment and create a fresh one, updating `state` and storage.
 pub(crate) fn seal_and_new_segment(
     inner: &CollectionInner,
     state: &mut ApplyState,

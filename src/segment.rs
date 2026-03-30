@@ -17,9 +17,10 @@ const REBUILD_BUF_BYTES: usize = 256 * 1024 * 1024;
 const INDEX_BASENAME: &str = "index";
 
 // ---------------------------------------------------------------------------
-// HnswIndex — metric-polymorphic wrapper around hnsw_rs
+// HnswIndex
 // ---------------------------------------------------------------------------
 
+/// Metric-polymorphic wrapper around the `hnsw_rs` index types.
 enum HnswIndex {
     L2(Hnsw<'static, f32, DistL2>),
     Cosine(Hnsw<'static, f32, DistCosine>),
@@ -104,9 +105,10 @@ impl HnswIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Shared in-memory metadata
+// SegMeta
 // ---------------------------------------------------------------------------
 
+/// Shared in-memory metadata carried by both writable and sealed segments.
 #[allow(dead_code)]
 struct SegMeta {
     seg_id: SegId,
@@ -118,6 +120,7 @@ struct SegMeta {
 // WritableSegment
 // ---------------------------------------------------------------------------
 
+/// An append-only segment that accepts new vectors and maintains a live HNSW index.
 pub struct WritableSegment {
     meta: SegMeta,
     index: HnswIndex,
@@ -319,6 +322,7 @@ impl WritableSegment {
 // SealedSegment
 // ---------------------------------------------------------------------------
 
+/// A read-only segment whose HNSW index has been persisted to disk and memory-mapped.
 pub struct SealedSegment {
     meta: SegMeta,
     index: HnswIndex,
@@ -383,6 +387,7 @@ impl SealedSegment {
 // Segment enum
 // ---------------------------------------------------------------------------
 
+/// Unified segment type that is either writable or sealed.
 pub enum Segment {
     Writable(WritableSegment),
     Sealed(SealedSegment),
