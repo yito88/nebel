@@ -91,6 +91,11 @@ struct Cli {
     /// Number of concurrent query threads during the ANN benchmark phase.
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
+
+    /// Skip recall computation — exact results are neither loaded nor computed.
+    /// Only throughput and latency are reported.
+    #[arg(long, default_value_t = false)]
+    no_recall: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +124,8 @@ struct BenchmarkSummary {
     p95_latency_ms: f64,
     p99_latency_ms: f64,
 
-    avg_recall_at_k: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avg_recall_at_k: Option<f64>,
 
     concurrency: usize,
     throughput_qps: f64,
@@ -243,55 +249,60 @@ fn main() -> Result<()> {
         let _ = col.search(q, cli.k, false, false)?;
     }
 
-    // 6. Exact results: load or compute
-    let auto_exact = cli
-        .data_dir
-        .as_ref()
-        .map(|d| PathBuf::from(d).join("exact_results.json"));
-    let load_exact = cli
-        .load_exact_results
-        .as_deref()
-        .map(PathBuf::from)
-        .or(auto_exact.clone());
-    let save_exact = cli
-        .save_exact_results
-        .as_deref()
-        .map(PathBuf::from)
-        .or(auto_exact);
-
-    let exact_results: ExactResults = if let Some(ref path) = load_exact.filter(|p| p.exists()) {
-        println!("Loading exact results from {}...", path.display());
-        let data = fs::read_to_string(path)?;
-        serde_json::from_str(&data)?
+    // 6. Exact results: load or compute (skipped when --no-recall)
+    let exact_results: Option<ExactResults> = if cli.no_recall {
+        None
     } else {
-        println!(
-            "Computing exact results for {} queries (brute-force)...",
-            bench_queries.len()
-        );
-        let exact_start = Instant::now();
-        let mut query_results = Vec::with_capacity(bench_queries.len());
-        for (i, q) in bench_queries.iter().enumerate() {
-            let hits = col.search_exact(q, cli.k)?;
-            query_results.push(hits_to_ids(&hits));
-            if (i + 1) % 10 == 0 || i + 1 == bench_queries.len() {
-                print!("\r  {}/{}", i + 1, bench_queries.len());
+        let auto_exact = cli
+            .data_dir
+            .as_ref()
+            .map(|d| PathBuf::from(d).join("exact_results.json"));
+        let load_exact = cli
+            .load_exact_results
+            .as_deref()
+            .map(PathBuf::from)
+            .or(auto_exact.clone());
+        let save_exact = cli
+            .save_exact_results
+            .as_deref()
+            .map(PathBuf::from)
+            .or(auto_exact);
+
+        let results = if let Some(ref path) = load_exact.filter(|p| p.exists()) {
+            println!("Loading exact results from {}...", path.display());
+            let data = fs::read_to_string(path)?;
+            serde_json::from_str(&data)?
+        } else {
+            println!(
+                "Computing exact results for {} queries (brute-force)...",
+                bench_queries.len()
+            );
+            let exact_start = Instant::now();
+            let mut query_results = Vec::with_capacity(bench_queries.len());
+            for (i, q) in bench_queries.iter().enumerate() {
+                let hits = col.search_exact(q, cli.k)?;
+                query_results.push(hits_to_ids(&hits));
+                if (i + 1) % 10 == 0 || i + 1 == bench_queries.len() {
+                    print!("\r  {}/{}", i + 1, bench_queries.len());
+                }
             }
-        }
-        println!(" done in {:.2}s", exact_start.elapsed().as_secs_f64());
-        let results = ExactResults {
-            dataset_name: cli.dataset_name.clone(),
-            metric: cli.metric.clone(),
-            k: cli.k,
-            query_results,
+            println!(" done in {:.2}s", exact_start.elapsed().as_secs_f64());
+            let r = ExactResults {
+                dataset_name: cli.dataset_name.clone(),
+                metric: cli.metric.clone(),
+                k: cli.k,
+                query_results,
+            };
+            if let Some(ref path) = save_exact {
+                println!("Saving exact results to {}...", path.display());
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, serde_json::to_string_pretty(&r)?)?;
+            }
+            r
         };
-        if let Some(ref path) = save_exact {
-            println!("Saving exact results to {}...", path.display());
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(path, serde_json::to_string_pretty(&results)?)?;
-        }
-        results
+        Some(results)
     };
 
     // 7. ANN benchmark
@@ -303,36 +314,41 @@ fn main() -> Result<()> {
     );
 
     let bench_start = Instant::now();
-    let (mut latencies_ms, recalls): (Vec<f64>, Vec<f64>) = if cli.concurrency <= 1 {
-        let mut latencies = Vec::with_capacity(bench_queries.len());
-        let mut recalls = Vec::with_capacity(bench_queries.len());
+    let mut latencies_ms: Vec<f64>;
+    let recalls: Vec<f64>;
+    if cli.concurrency <= 1 {
+        let mut lats = Vec::with_capacity(bench_queries.len());
+        let mut recs = Vec::with_capacity(bench_queries.len());
         for (i, q) in bench_queries.iter().enumerate() {
             let start = Instant::now();
             let hits = col.search(q, cli.k, false, false)?;
-            latencies.push(start.elapsed().as_secs_f64() * 1000.0);
-            recalls.push(recall_at_k(&exact_results.query_results[i], &hits_to_ids(&hits), cli.k));
+            lats.push(start.elapsed().as_secs_f64() * 1000.0);
+            if let Some(ref er) = exact_results {
+                recs.push(recall_at_k(&er.query_results[i], &hits_to_ids(&hits), cli.k));
+            }
         }
-        (latencies, recalls)
+        latencies_ms = lats;
+        recalls = recs;
     } else {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cli.concurrency)
             .build()?;
-        pool.install(|| {
+        let (lats, opt_recs): (Vec<f64>, Vec<Option<f64>>) = pool.install(|| {
             (0..bench_queries.len())
                 .into_par_iter()
                 .map(|i| {
                     let start = Instant::now();
                     let hits = col.search(&bench_queries[i], cli.k, false, false).unwrap();
                     let latency = start.elapsed().as_secs_f64() * 1000.0;
-                    let recall = recall_at_k(
-                        &exact_results.query_results[i],
-                        &hits_to_ids(&hits),
-                        cli.k,
-                    );
+                    let recall = exact_results.as_ref().map(|er| {
+                        recall_at_k(&er.query_results[i], &hits_to_ids(&hits), cli.k)
+                    });
                     (latency, recall)
                 })
                 .unzip()
-        })
+        });
+        latencies_ms = lats;
+        recalls = opt_recs.into_iter().flatten().collect();
     };
     let wall_secs = bench_start.elapsed().as_secs_f64();
     let throughput_qps = bench_queries.len() as f64 / wall_secs;
@@ -343,7 +359,11 @@ fn main() -> Result<()> {
     let p50 = percentile(&latencies_ms, 50.0);
     let p95 = percentile(&latencies_ms, 95.0);
     let p99 = percentile(&latencies_ms, 99.0);
-    let avg_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
+    let avg_recall: Option<f64> = if recalls.is_empty() {
+        None
+    } else {
+        Some(recalls.iter().sum::<f64>() / recalls.len() as f64)
+    };
 
     let summary = BenchmarkSummary {
         dataset_name: cli.dataset_name.clone(),
@@ -378,11 +398,10 @@ fn main() -> Result<()> {
     println!("P95 latency:      {:.3} ms", summary.p95_latency_ms);
     println!("P99 latency:      {:.3} ms", summary.p99_latency_ms);
     println!("---");
-    println!(
-        "Avg recall@{}:    {:.4}",
-        summary.k, summary.avg_recall_at_k
-    );
-    println!("---");
+    if let Some(avg_recall) = summary.avg_recall_at_k {
+        println!("Avg recall@{}:    {:.4}", summary.k, avg_recall);
+        println!("---");
+    }
     println!(
         "HNSW params:      m={} ef_c={} ef_s={} cap={}",
         summary.params.m,
