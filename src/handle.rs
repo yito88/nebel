@@ -23,7 +23,7 @@ use crate::{
         CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta, SegmentState,
         VectorEntry, WriteToken,
     },
-    wal::{Wal, WalOp, WalRecord},
+    wal::{ApplyCursor, Wal, WalOp, WalRecord},
 };
 
 const INGEST_BATCH_SIZE: usize = 2048;
@@ -96,6 +96,9 @@ pub(crate) struct CollectionInner {
     /// an Arc<CollectionInner>, so the database can be freed promptly on drop.
     pub(crate) notify: PendingNotify,
     pub(crate) next_seq: AtomicU64,
+    /// Highest seq that has been fsync'd to WAL. Updated by writers after sync_all.
+    /// The apply worker only processes records up to this value.
+    pub(crate) durable_seq: AtomicU64,
     pub(crate) visible_seq: AtomicU64,
     pub(crate) visible: (Mutex<()>, Condvar),
 }
@@ -112,9 +115,7 @@ impl CollectionInner {
         applied_seq: u64,
         schema: Arc<CollectionSchema>,
     ) -> Result<Arc<Self>> {
-        let wal_dir = base_dir.join(id.as_str());
-        fs::create_dir_all(&wal_dir)?;
-        let wal = Wal::open(&wal_dir.join("wal.log"))?;
+        let wal = Wal::open_dir(&base_dir.join(id.as_str()).join("wal"))?;
 
         let initial_segs = sealed_segs
             .iter()
@@ -141,9 +142,12 @@ impl CollectionInner {
             snapshot: RwLock::new(initial_snap),
             wal: Mutex::new(wal),
             notify: Arc::new((Mutex::new(false), Condvar::new())),
-            // Start at applied_seq + 1 so first WAL record gets seq > applied_seq,
-            // making the filter "r.seq > applied_seq" work correctly.
+            // Start at applied_seq + 1 so first WAL record gets seq > applied_seq.
             next_seq: AtomicU64::new(applied_seq + 1),
+            // durable_seq starts at applied_seq: after recovery WAL is empty, so the
+            // worker's cursor (last_applied_seq = applied_seq) won't read anything
+            // until a real write bumps durable_seq above applied_seq.
+            durable_seq: AtomicU64::new(applied_seq),
             visible_seq: AtomicU64::new(applied_seq),
             visible: (Mutex::new(()), Condvar::new()),
         }))
@@ -171,8 +175,8 @@ impl CollectionInner {
             .join(format!("seg_{:03}", seg_id.as_u32()))
     }
 
-    pub(crate) fn wal_path(&self) -> PathBuf {
-        self.base_dir.join(self.id.as_str()).join("wal.log")
+    pub(crate) fn wal_dir(&self) -> PathBuf {
+        self.base_dir.join(self.id.as_str()).join("wal")
     }
 }
 
@@ -235,6 +239,7 @@ impl CollectionHandle {
                 metadata,
             },
         })?;
+        inner.durable_seq.fetch_max(seq, Ordering::Release);
         notify_worker(&inner.notify);
         Ok(WriteToken(seq + 1))
     }
@@ -248,6 +253,7 @@ impl CollectionHandle {
                 doc_id: doc_id.to_string(),
             },
         })?;
+        inner.durable_seq.fetch_max(seq, Ordering::Release);
         notify_worker(&inner.notify);
         Ok(WriteToken(seq + 1))
     }
@@ -262,6 +268,7 @@ impl CollectionHandle {
                 metadata,
             },
         })?;
+        inner.durable_seq.fetch_max(seq, Ordering::Release);
         notify_worker(&inner.notify);
         Ok(WriteToken(seq + 1))
     }
@@ -404,7 +411,7 @@ impl CollectionHandle {
     /// Apply all pending WAL records synchronously. Used by add_writable_segment.
     fn drain_wal(&self) -> Result<()> {
         let inner = &self.inner;
-        let records = Wal::read_from(&inner.wal_path())?;
+        let records = Wal::read_all_from_dir(&inner.wal_dir())?;
         let mut state = inner.apply_state.lock().unwrap();
         let pending: Vec<WalRecord> = records
             .into_iter()
@@ -441,6 +448,10 @@ fn apply_worker_loop(
     notify: PendingNotify,
     shutdown: Arc<AtomicBool>,
 ) {
+    // The cursor is local to this thread — no need to persist it.
+    // After recovery, WAL is always wiped and starts fresh from wal_id=1.
+    let mut cursor_opt: Option<ApplyCursor> = None;
+
     loop {
         // Wait for work WITHOUT holding Arc<CollectionInner>.
         {
@@ -461,32 +472,47 @@ fn apply_worker_loop(
             None => return,
         };
 
-        // Read WAL and find pending records.
-        let records = match Wal::read_from(&inner.wal_path()) {
-            Ok(r) => r,
-            Err(_) => {
-                // Clear pending flag on error and retry next interval.
-                *notify.0.lock().unwrap() = false;
-                continue;
+        // Initialize cursor on the first iteration.
+        let cursor = cursor_opt.get_or_insert_with(|| {
+            let applied = inner.apply_state.lock().unwrap().applied_seq;
+            ApplyCursor {
+                current_wal_id: 1,
+                current_offset: 0,
+                last_applied_seq: applied,
             }
-        };
+        });
 
-        let current_applied = inner.apply_state.lock().unwrap().applied_seq;
-        let pending: Vec<WalRecord> = records
-            .into_iter()
-            .filter(|r| r.seq > current_applied)
-            .take(APPLY_BATCH_SIZE)
-            .collect();
+        // Only work if there are records durably written beyond what we've applied.
+        let durable = inner.durable_seq.load(Ordering::Acquire);
+        if durable <= cursor.last_applied_seq {
+            *notify.0.lock().unwrap() = false;
+            continue;
+        }
+
+        // Snapshot segment paths briefly under lock; read files without holding it.
+        let segments = inner.wal.lock().unwrap().segment_paths_from(cursor.current_wal_id);
+
+        let (pending, new_cursor) =
+            match read_records_from_cursor(&segments, cursor, durable, APPLY_BATCH_SIZE) {
+                Ok(r) => r,
+                Err(_) => {
+                    *notify.0.lock().unwrap() = false;
+                    continue;
+                }
+            };
 
         if pending.is_empty() {
             *notify.0.lock().unwrap() = false;
-            // inner drops here (Arc count decrements).
             continue;
         }
 
         // Apply records.
         let mut state = inner.apply_state.lock().unwrap();
         for record in &pending {
+            // Idempotency guard: skip if somehow already applied.
+            if record.seq <= state.applied_seq {
+                continue;
+            }
             if apply_entry(&inner, &mut state, record).is_err() {
                 break;
             }
@@ -494,17 +520,100 @@ fn apply_worker_loop(
 
         let _ = inner.storage.put_applied_seq(&inner.id, state.applied_seq);
 
-        let visible = state.applied_seq + 1;
+        let applied = state.applied_seq;
         inner.publish_snapshot(&state);
         drop(state);
 
-        inner.visible_seq.fetch_max(visible, Ordering::Release);
+        inner.visible_seq.fetch_max(applied + 1, Ordering::Release);
         inner.visible.1.notify_all();
+
+        // Advance cursor; keep physical position from new_cursor, update logical seq.
+        *cursor = ApplyCursor {
+            last_applied_seq: applied,
+            ..new_cursor
+        };
 
         // Clear pending flag; re-set if more records may exist.
         *notify.0.lock().unwrap() = false;
         // inner drops here.
     }
+}
+
+// ---------------------------------------------------------------------------
+// read_records_from_cursor
+// ---------------------------------------------------------------------------
+
+/// Read up to `batch_size` WAL records starting from `cursor`, stopping at `up_to_seq`.
+/// Returns the records and an updated cursor reflecting the new position.
+/// Does NOT hold the WAL mutex — callers must snapshot segment paths first.
+fn read_records_from_cursor(
+    segments: &[(u64, PathBuf)],
+    cursor: &ApplyCursor,
+    up_to_seq: u64,
+    batch_size: usize,
+) -> Result<(Vec<WalRecord>, ApplyCursor)> {
+    use std::io::Read;
+
+    let mut records = Vec::new();
+    let mut new_cursor = ApplyCursor {
+        current_wal_id: cursor.current_wal_id,
+        current_offset: cursor.current_offset,
+        last_applied_seq: cursor.last_applied_seq,
+    };
+
+    'outer: for (wal_id, path) in segments.iter().filter(|(id, _)| *id >= cursor.current_wal_id) {
+        if !path.exists() {
+            continue;
+        }
+
+        let start_offset = if *wal_id == cursor.current_wal_id {
+            cursor.current_offset as usize
+        } else {
+            0
+        };
+
+        let mut file = fs::File::open(path)?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+
+        let mut pos = start_offset;
+        while pos + 4 <= data.len() {
+            let len = u32::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+            ]) as usize;
+            pos += 4;
+            if pos + len > data.len() {
+                break;
+            }
+            let body = &data[pos..pos + len];
+            let rec = match serde_json::from_slice::<WalRecord>(body) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            pos += len;
+            if pos < data.len() && data[pos] == b'\n' {
+                pos += 1;
+            }
+
+            if rec.seq > up_to_seq {
+                break 'outer;
+            }
+
+            new_cursor.current_wal_id = *wal_id;
+            new_cursor.current_offset = pos as u64;
+            new_cursor.last_applied_seq = rec.seq;
+            records.push(rec);
+
+            if records.len() >= batch_size {
+                break 'outer;
+            }
+        }
+    }
+
+    Ok((records, new_cursor))
 }
 
 // ---------------------------------------------------------------------------

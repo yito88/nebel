@@ -141,10 +141,34 @@ impl Db {
             writable_seg_opt.ok_or_else(|| anyhow!("no writable segment found for '{}'", id))?;
 
         let schema_arc = Arc::new(schema);
-
-        // Build CollectionInner with the persisted state.
-        // applied_seq_stored is passed so next_seq = applied_seq_stored + 1.
         let applied_seq_stored = self.storage.get_applied_seq(id)?.unwrap_or(0);
+
+        // --- Recovery: read all WAL records, wipe WAL, then replay ---
+
+        let col_dir = self.base_dir.join(id.as_str());
+        let old_wal_path = col_dir.join("wal.log"); // legacy single-file format
+        let wal_dir = col_dir.join("wal");           // current segmented format
+
+        // Step 1: Read all pending WAL records before touching the directory.
+        let all_records = if old_wal_path.exists() && !wal_dir.exists() {
+            Wal::read_legacy(&old_wal_path)?
+        } else {
+            Wal::read_all_from_dir(&wal_dir)?
+        };
+        let pending: Vec<_> = all_records
+            .into_iter()
+            .filter(|r| r.seq > applied_seq_stored)
+            .collect();
+
+        // Step 2: Wipe all WAL files so CollectionInner::new() opens a clean directory.
+        if old_wal_path.exists() {
+            fs::remove_file(&old_wal_path)?;
+        }
+        if wal_dir.exists() {
+            fs::remove_dir_all(&wal_dir)?;
+        }
+
+        // Step 3: Create CollectionInner — opens fresh wal/ dir, creates 000001.log.
         let inner = CollectionInner::new(
             id.clone(),
             Arc::clone(&self.storage),
@@ -156,26 +180,22 @@ impl Db {
             schema_arc,
         )?;
 
-        // --- Stage 6: Replay any unapplied WAL records ---
-        let wal_path = self.base_dir.join(id.as_str()).join("wal.log");
-        let pending_records: Vec<_> = Wal::read_from(&wal_path)?
-            .into_iter()
-            .filter(|r| r.seq > applied_seq_stored)
-            .collect();
-
-        if !pending_records.is_empty() {
+        // Step 4: Replay pending WAL records against the freshly-opened inner.
+        if !pending.is_empty() {
             let mut state = inner.apply_state.lock().unwrap();
-            for record in &pending_records {
+            for record in &pending {
                 apply_entry(&inner, &mut state, record)?;
             }
-            // Persist new applied_seq.
             self.storage.put_applied_seq(id, state.applied_seq)?;
-            // Update next_seq so new writes start after the replayed records.
             let new_next = state.applied_seq + 1;
             inner
                 .next_seq
                 .store(new_next, std::sync::atomic::Ordering::Relaxed);
-            // Publish recovered snapshot and advance visible_seq.
+            // durable_seq must also advance so the worker doesn't scan empty WAL
+            // looking for records that were already replayed here.
+            inner
+                .durable_seq
+                .store(state.applied_seq, std::sync::atomic::Ordering::Release);
             let visible = state.applied_seq + 1;
             inner.publish_snapshot(&state);
             drop(state);
