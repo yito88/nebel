@@ -41,6 +41,33 @@ const APPLY_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) type PendingNotify = Arc<(Mutex<bool>, Condvar)>;
 
 // ---------------------------------------------------------------------------
+// WorkerGuard
+// ---------------------------------------------------------------------------
+
+/// Joins the background apply worker when the last `CollectionHandle` drops.
+/// Declared before `inner` in `CollectionHandle` so Rust's field-drop order
+/// guarantees the thread exits before `CollectionInner` (and `Storage`) is freed.
+struct WorkerGuard {
+    shutdown: Arc<AtomicBool>,
+    notify: PendingNotify,
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        {
+            let mut pending = self.notify.0.lock().unwrap();
+            *pending = true;
+        }
+        self.notify.1.notify_one();
+        if let Some(h) = self.handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ApplyState
 // ---------------------------------------------------------------------------
 
@@ -68,7 +95,6 @@ pub(crate) struct CollectionInner {
     /// Shared with the worker thread — worker waits on this without holding
     /// an Arc<CollectionInner>, so the database can be freed promptly on drop.
     pub(crate) notify: PendingNotify,
-    pub(crate) shutdown: AtomicBool,
     pub(crate) next_seq: AtomicU64,
     pub(crate) visible_seq: AtomicU64,
     pub(crate) visible: (Mutex<()>, Condvar),
@@ -115,7 +141,6 @@ impl CollectionInner {
             snapshot: RwLock::new(initial_snap),
             wal: Mutex::new(wal),
             notify: Arc::new((Mutex::new(false), Condvar::new())),
-            shutdown: AtomicBool::new(false),
             // Start at applied_seq + 1 so first WAL record gets seq > applied_seq,
             // making the filter "r.seq > applied_seq" work correctly.
             next_seq: AtomicU64::new(applied_seq + 1),
@@ -158,17 +183,29 @@ impl CollectionInner {
 /// Cheaply cloneable handle to a collection. Spawns a background apply worker on creation.
 #[derive(Clone)]
 pub struct CollectionHandle {
+    /// Dropped before `inner` — joins the worker thread so the redb lock is
+    /// released deterministically before `Storage` is freed.
+    _guard: Arc<WorkerGuard>,
     pub(crate) inner: Arc<CollectionInner>,
 }
 
 impl CollectionHandle {
     pub(crate) fn from_arc(inner: Arc<CollectionInner>) -> Self {
-        // Clone the lightweight notify Arc for the worker; worker waits on
-        // this WITHOUT holding Arc<CollectionInner>, allowing prompt cleanup.
         let notify = Arc::clone(&inner.notify);
+        let shutdown = Arc::new(AtomicBool::new(false));
         let weak = Arc::downgrade(&inner);
-        thread::spawn(move || apply_worker_loop(weak, notify));
-        Self { inner }
+        let shutdown2 = Arc::clone(&shutdown);
+        let notify2 = Arc::clone(&notify);
+        let handle = thread::spawn(move || apply_worker_loop(weak, notify2, shutdown2));
+        let guard = Arc::new(WorkerGuard {
+            shutdown,
+            notify,
+            handle: Mutex::new(Some(handle)),
+        });
+        Self {
+            _guard: guard,
+            inner,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -399,26 +436,30 @@ fn notify_worker(notify: &PendingNotify) {
     notify.1.notify_one();
 }
 
-fn apply_worker_loop(weak: Weak<CollectionInner>, notify: PendingNotify) {
+fn apply_worker_loop(
+    weak: Weak<CollectionInner>,
+    notify: PendingNotify,
+    shutdown: Arc<AtomicBool>,
+) {
     loop {
         // Wait for work WITHOUT holding Arc<CollectionInner>.
-        // This allows Storage/Database to be freed when all handles drop.
         {
             let guard = notify.0.lock().unwrap();
-            let _ = notify
-                .1
-                .wait_timeout_while(guard, APPLY_INTERVAL, |hw| !*hw);
+            let _ = notify.1.wait_timeout_while(guard, APPLY_INTERVAL, |hw| {
+                !*hw && !shutdown.load(Ordering::Acquire)
+            });
         }
 
-        // Upgrade to do work. If the last strong Arc was dropped, we exit.
+        // Check shutdown before upgrading so we never resurrect the Arc
+        // after the last CollectionHandle has been dropped.
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
         let inner = match weak.upgrade() {
             Some(i) => i,
             None => return,
         };
-
-        if inner.shutdown.load(Ordering::Relaxed) {
-            return;
-        }
 
         // Read WAL and find pending records.
         let records = match Wal::read_from(&inner.wal_path()) {
