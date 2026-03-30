@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nebel CI Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; }
+    header { padding: 1.5rem 2rem; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 1rem; }
+    header h1 { font-size: 1.4rem; font-weight: 600; }
+    header a { color: #58a6ff; text-decoration: none; font-size: 0.9rem; }
+    nav { display: flex; gap: 0; padding: 0 2rem; border-bottom: 1px solid #30363d; }
+    nav button {
+      background: none; border: none; color: #8b949e; padding: 0.75rem 1.25rem;
+      cursor: pointer; font-size: 0.95rem; border-bottom: 2px solid transparent; transition: color 0.15s;
+    }
+    nav button.active { color: #e6edf3; border-bottom-color: #58a6ff; }
+    nav button:hover:not(.active) { color: #c9d1d9; }
+    .tab { display: none; padding: 2rem; }
+    .tab.active { display: block; }
+    .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem; }
+    @media (max-width: 900px) { .charts { grid-template-columns: 1fr; } }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.25rem; }
+    .card h3 { font-size: 0.9rem; font-weight: 600; color: #8b949e; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    canvas { max-height: 260px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+    th { text-align: left; padding: 0.6rem 0.75rem; background: #161b22; color: #8b949e; font-weight: 600; border-bottom: 1px solid #30363d; }
+    td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #21262d; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #161b22; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .pass { color: #3fb950; }
+    .fail { color: #f85149; }
+    .empty { text-align: center; color: #8b949e; padding: 3rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Nebel CI Dashboard</h1>
+    <a href="https://github.com/yito88/nebel" target="_blank">GitHub →</a>
+  </header>
+  <nav>
+    <button class="active" onclick="showTab('benchmark', this)">Benchmark</button>
+    <button onclick="showTab('verification', this)">Verification</button>
+  </nav>
+
+  <div id="benchmark" class="tab active">
+    <div class="charts">
+      <div class="card">
+        <h3>Throughput (QPS) over time</h3>
+        <canvas id="qpsChart"></canvas>
+      </div>
+      <div class="card">
+        <h3>p95 Latency (ms) over time</h3>
+        <canvas id="p95Chart"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Recent Runs</h3>
+      <div id="benchTable"></div>
+    </div>
+  </div>
+
+  <div id="verification" class="tab">
+    <div class="charts">
+      <div class="card" style="grid-column: 1 / -1">
+        <h3>ANN Recall over time</h3>
+        <canvas id="recallChart"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Recent Runs</h3>
+      <div id="verifyTable"></div>
+    </div>
+  </div>
+
+  <script>
+    function showTab(name, btn) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+      document.getElementById(name).classList.add('active');
+      btn.classList.add('active');
+    }
+
+    const COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#39c5cf'];
+    const CONCURRENCIES = [1, 2, 4, 8, 16];
+
+    function fmtDate(iso) {
+      const d = new Date(iso);
+      return d.toISOString().slice(0, 16).replace('T', ' ');
+    }
+
+    async function loadJSON(path) {
+      try {
+        const r = await fetch(path);
+        if (!r.ok) return [];
+        return await r.json();
+      } catch { return []; }
+    }
+
+    async function initBenchmark() {
+      const history = await loadJSON('data/benchmark.json');
+      if (!history.length) {
+        document.getElementById('benchTable').innerHTML = '<p class="empty">No benchmark data yet.</p>';
+        return;
+      }
+
+      const recent = history.slice(-30);
+      const labels = recent.map(r => fmtDate(r.date));
+
+      // QPS chart — one line per concurrency
+      const qpsDatasets = CONCURRENCIES.map((c, i) => ({
+        label: `c=${c}`,
+        data: recent.map(r => {
+          const res = r.results.find(x => x.concurrency === c);
+          return res ? res.throughput_qps : null;
+        }),
+        borderColor: COLORS[i],
+        backgroundColor: COLORS[i] + '22',
+        tension: 0.3,
+        spanGaps: true,
+      }));
+
+      new Chart(document.getElementById('qpsChart'), {
+        type: 'line',
+        data: { labels, datasets: qpsDatasets },
+        options: chartOpts('QPS'),
+      });
+
+      // p95 chart
+      const p95Datasets = CONCURRENCIES.map((c, i) => ({
+        label: `c=${c}`,
+        data: recent.map(r => {
+          const res = r.results.find(x => x.concurrency === c);
+          return res ? res.p95_latency_ms : null;
+        }),
+        borderColor: COLORS[i],
+        backgroundColor: COLORS[i] + '22',
+        tension: 0.3,
+        spanGaps: true,
+      }));
+
+      new Chart(document.getElementById('p95Chart'), {
+        type: 'line',
+        data: { labels, datasets: p95Datasets },
+        options: chartOpts('ms'),
+      });
+
+      // Table — most recent 20 runs, reversed
+      const rows = history.slice(-20).reverse().map(r => {
+        const byC = Object.fromEntries(r.results.map(x => [x.concurrency, x]));
+        const c1 = byC[1] || {};
+        return `<tr>
+          <td>${fmtDate(r.date)}</td>
+          <td><a href="${r.run_url}" target="_blank">#${r.run_number}</a></td>
+          <td><a href="https://github.com/yito88/nebel/commit/${r.commit}" target="_blank">${r.commit}</a></td>
+          <td>${c1.throughput_qps != null ? c1.throughput_qps.toFixed(1) : '-'}</td>
+          <td>${c1.avg_latency_ms != null ? c1.avg_latency_ms.toFixed(2) : '-'}</td>
+          <td>${c1.p95_latency_ms != null ? c1.p95_latency_ms.toFixed(2) : '-'}</td>
+          <td>${c1.avg_recall_at_k != null ? c1.avg_recall_at_k.toFixed(4) : '-'}</td>
+        </tr>`;
+      }).join('');
+
+      document.getElementById('benchTable').innerHTML = `
+        <table>
+          <thead><tr>
+            <th>Date</th><th>Run</th><th>Commit</th>
+            <th>QPS (c=1)</th><th>avg_ms</th><th>p95_ms</th><th>Recall</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    async function initVerification() {
+      const history = await loadJSON('data/verification.json');
+      if (!history.length) {
+        document.getElementById('verifyTable').innerHTML = '<p class="empty">No verification data yet.</p>';
+        return;
+      }
+
+      const recent = history.slice(-30);
+      const labels = recent.map(r => fmtDate(r.date));
+
+      new Chart(document.getElementById('recallChart'), {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [{
+            label: 'ANN Recall',
+            data: recent.map(r => r.ann_recall),
+            borderColor: '#58a6ff',
+            backgroundColor: '#58a6ff22',
+            tension: 0.3,
+            spanGaps: true,
+          }, {
+            label: 'Threshold (0.9)',
+            data: labels.map(() => 0.9),
+            borderColor: '#f85149',
+            borderDash: [6, 3],
+            pointRadius: 0,
+          }],
+        },
+        options: { ...chartOpts('Recall'), scales: { y: { ...chartOpts('Recall').scales.y, min: 0.8, max: 1.0 } } },
+      });
+
+      const rows = history.slice(-20).reverse().map(r => {
+        const cls = r.passed ? 'pass' : 'fail';
+        const label = r.passed ? 'PASS' : 'FAIL';
+        return `<tr>
+          <td>${fmtDate(r.date)}</td>
+          <td><a href="${r.run_url}" target="_blank">#${r.run_number}</a></td>
+          <td><a href="https://github.com/yito88/nebel/commit/${r.commit}" target="_blank">${r.commit}</a></td>
+          <td>${r.ann_recall != null ? r.ann_recall.toFixed(4) : 'N/A'}</td>
+          <td class="${cls}">${label}</td>
+        </tr>`;
+      }).join('');
+
+      document.getElementById('verifyTable').innerHTML = `
+        <table>
+          <thead><tr>
+            <th>Date</th><th>Run</th><th>Commit</th><th>ANN Recall</th><th>Status</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    function chartOpts(yLabel) {
+      return {
+        responsive: true,
+        plugins: { legend: { labels: { color: '#8b949e', boxWidth: 12 } } },
+        scales: {
+          x: { ticks: { color: '#8b949e', maxRotation: 30 }, grid: { color: '#21262d' } },
+          y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' }, title: { display: true, text: yLabel, color: '#8b949e' } },
+        },
+      };
+    }
+
+    initBenchmark();
+    initVerification();
+  </script>
+</body>
+</html>
