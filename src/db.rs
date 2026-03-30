@@ -12,7 +12,7 @@ use crate::{
     segment::{SealedSegment, WritableSegment},
     storage::Storage,
     types::{CollectionId, CollectionSchema, Manifest, SegId, SegmentMeta, SegmentState},
-    wal::Wal,
+    wal::{Wal, WalRecord},
 };
 
 const DB_NAME: &str = "nebel.redb";
@@ -141,10 +141,18 @@ impl Db {
             writable_seg_opt.ok_or_else(|| anyhow!("no writable segment found for '{}'", id))?;
 
         let schema_arc = Arc::new(schema);
-
-        // Build CollectionInner with the persisted state.
-        // applied_seq_stored is passed so next_seq = applied_seq_stored + 1.
         let applied_seq_stored = self.storage.get_applied_seq(id)?.unwrap_or(0);
+
+        // --- Recovery ---
+        //
+        // Each WAL segment is applied and deleted individually.  The segment file is
+        // only removed after its records are applied and applied_seq is persisted, so a
+        // crash at any point leaves surviving files for the next open to re-read and
+        // re-apply (records already applied are skipped via the per-record seq check).
+
+        // Step 1: Create CollectionInner.
+        // Wal::open_dir marks every pre-existing segment Closed and opens a fresh
+        // Active segment at max_id.next(), so new writes never touch recovery files.
         let inner = CollectionInner::new(
             id.clone(),
             Arc::clone(&self.storage),
@@ -156,35 +164,56 @@ impl Db {
             schema_arc,
         )?;
 
-        // --- Stage 6: Replay any unapplied WAL records ---
-        let wal_path = self.base_dir.join(id.as_str()).join("wal.log");
-        let pending_records: Vec<_> = Wal::read_from(&wal_path)?
-            .into_iter()
-            .filter(|r| r.seq > applied_seq_stored)
-            .collect();
+        // Step 2: Process each pre-existing (Closed) WAL segment in ascending ID order.
+        // Snapshot the list first; new writes only go to the Active segment.
+        let recovery_segs = inner.wal.lock().unwrap().recovery_segments();
+        for (wal_id, path) in recovery_segs {
+            let records = Wal::read_segment(&path)?;
+            Self::apply_and_persist(&records, &inner, &self.storage, id)?;
+            inner.wal.lock().unwrap().remove_segment(wal_id)?;
+        }
 
-        if !pending_records.is_empty() {
-            let mut state = inner.apply_state.lock().unwrap();
-            for record in &pending_records {
-                apply_entry(&inner, &mut state, record)?;
+        // Step 4: Sync sequence counters with the final applied_seq.
+        {
+            let state = inner.apply_state.lock().unwrap();
+            let applied = state.applied_seq;
+            if applied > applied_seq_stored {
+                inner
+                    .next_seq
+                    .store(applied + 1, std::sync::atomic::Ordering::Relaxed);
+                inner
+                    .durable_seq
+                    .store(applied, std::sync::atomic::Ordering::Release);
+                inner.publish_snapshot(&state);
+                drop(state);
+                inner
+                    .visible_seq
+                    .store(applied + 1, std::sync::atomic::Ordering::Release);
             }
-            // Persist new applied_seq.
-            self.storage.put_applied_seq(id, state.applied_seq)?;
-            // Update next_seq so new writes start after the replayed records.
-            let new_next = state.applied_seq + 1;
-            inner
-                .next_seq
-                .store(new_next, std::sync::atomic::Ordering::Relaxed);
-            // Publish recovered snapshot and advance visible_seq.
-            let visible = state.applied_seq + 1;
-            inner.publish_snapshot(&state);
-            drop(state);
-            inner
-                .visible_seq
-                .store(visible, std::sync::atomic::Ordering::Release);
         }
 
         Ok(CollectionHandle::from_arc(inner))
+    }
+
+    /// Apply records (skipping already-applied ones by seq) and persist applied_seq.
+    fn apply_and_persist(
+        records: &[WalRecord],
+        inner: &CollectionInner,
+        storage: &Storage,
+        id: &CollectionId,
+    ) -> Result<()> {
+        let mut state = inner.apply_state.lock().unwrap();
+        let before = state.applied_seq;
+        for record in records {
+            if record.seq <= state.applied_seq {
+                continue;
+            }
+            apply_entry(inner, &mut state, record)?;
+        }
+        if state.applied_seq > before {
+            storage.put_applied_seq(id, state.applied_seq)?;
+        }
+        Ok(())
     }
 
     fn seg_dir(&self, id: &CollectionId, seg_id: SegId) -> PathBuf {
