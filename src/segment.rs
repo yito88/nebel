@@ -371,47 +371,6 @@ impl SealedSegment {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Segment enum
-// ---------------------------------------------------------------------------
-
-/// Unified segment type that is either writable or sealed.
-#[allow(dead_code)]
-pub enum Segment {
-    Writable(WritableSegment),
-    Sealed(SealedSegment),
-}
-
-#[allow(dead_code)]
-impl Segment {
-    pub fn seg_id(&self) -> SegId {
-        match self {
-            Segment::Writable(s) => s.meta.seg_id,
-            Segment::Sealed(s) => s.meta.seg_id,
-        }
-    }
-
-    pub fn num_vectors(&self) -> usize {
-        match self {
-            Segment::Writable(s) => s.meta.num_vectors,
-            Segment::Sealed(s) => s.meta.num_vectors,
-        }
-    }
-
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
-        match self {
-            Segment::Writable(s) => s.search(query, k),
-            Segment::Sealed(s) => s.search(query, k),
-        }
-    }
-
-    pub fn read_vector(&self, internal_id: u32, dimension: usize) -> Result<Vec<f32>> {
-        match self {
-            Segment::Writable(s) => s.read_vector(internal_id, dimension),
-            Segment::Sealed(s) => s.read_vector(internal_id, dimension),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Shared helpers

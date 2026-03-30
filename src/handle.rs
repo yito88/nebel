@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::{
     segment::{SealedSegment, WritableSegment, compute_distance},
-    snapshot::CollectionSnapshot,
+    snapshot::{CollectionSnapshot, SegmentSnapshot},
     storage::Storage,
     types::{
         CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta,
@@ -91,10 +91,13 @@ impl CollectionInner {
         fs::create_dir_all(&wal_dir)?;
         let wal = Wal::open(&wal_dir.join("wal.log"))?;
 
+        let initial_segs = sealed_segs.iter()
+            .map(|s| SegmentSnapshot::Sealed(Arc::clone(s)))
+            .chain(std::iter::once(SegmentSnapshot::Writable(Arc::clone(&writable_seg))))
+            .collect();
         let initial_snap = Arc::new(CollectionSnapshot {
             schema: Arc::clone(&schema),
-            sealed_segs: sealed_segs.clone(),
-            writable_seg: Arc::clone(&writable_seg),
+            segs: initial_segs,
         });
         Ok(Arc::new(Self {
             id,
@@ -120,11 +123,11 @@ impl CollectionInner {
     }
 
     pub(crate) fn publish_snapshot(&self, state: &ApplyState) {
-        let snap = Arc::new(CollectionSnapshot {
-            schema: Arc::clone(&self.schema),
-            sealed_segs: state.sealed_segs.clone(),
-            writable_seg: Arc::clone(&state.writable_seg),
-        });
+        let segs = state.sealed_segs.iter()
+            .map(|s| SegmentSnapshot::Sealed(Arc::clone(s)))
+            .chain(std::iter::once(SegmentSnapshot::Writable(Arc::clone(&state.writable_seg))))
+            .collect();
+        let snap = Arc::new(CollectionSnapshot { schema: Arc::clone(&self.schema), segs });
         *self.snapshot.write().unwrap() = snap;
     }
 
@@ -546,29 +549,38 @@ fn search_snapshot(
     let storage = &*inner.storage;
     let id = &inner.id;
 
-    let sealed_candidates: Vec<(SegId, u32, f32)> = snap
-        .sealed_segs
-        .par_iter()
-        .filter(|seg| seg.num_vectors() > 0)
-        .flat_map(|seg| {
-            let sid = seg.seg_id();
-            seg.search(query, k)
-                .unwrap_or_default()
-                .into_iter()
-                .map(move |(internal_id, distance)| (sid, internal_id, distance))
-                .collect::<Vec<_>>()
-        })
+    let sealed: Vec<&Arc<SealedSegment>> = snap.segs.iter()
+        .filter_map(|s| match s { SegmentSnapshot::Sealed(ss) => Some(ss), _ => None })
         .collect();
-    let mut candidates: Vec<(SegId, u32, f32)> = sealed_candidates;
-    {
-        let ws = snap.writable_seg.read().unwrap();
-        let sid = ws.seg_id();
-        if ws.num_vectors() > 0 {
-            for (internal_id, distance) in ws.search(query, k)? {
-                candidates.push((sid, internal_id, distance));
-            }
-        }
-    }
+    let writable = snap.segs.iter()
+        .find_map(|s| match s { SegmentSnapshot::Writable(w) => Some(w), _ => None });
+
+    let (sealed_cands, ws_cands) = rayon::join(
+            || sealed.par_iter()
+                .filter(|s| s.num_vectors() > 0)
+                .flat_map(|seg| {
+                    let sid = seg.seg_id();
+                    seg.search(query, k)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |(id, dist)| (sid, id, dist))
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            || writable.map(|w| {
+                let ws = w.read().unwrap();
+                let sid = ws.seg_id();
+                let hits = if ws.num_vectors() > 0 {
+                    ws.search(query, k).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                drop(ws);
+                hits.into_iter().map(|(id, dist)| (sid, id, dist)).collect::<Vec<_>>()
+            }).unwrap_or_default(),
+        );
+    let mut candidates: Vec<(SegId, u32, f32)> = sealed_cands;
+    candidates.extend(ws_cands);
     candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(CmpOrdering::Equal));
 
     let mut hits = Vec::new();
@@ -588,16 +600,17 @@ fn search_snapshot(
             None
         };
         let vector = if include_vector {
-            let found = snap.sealed_segs.iter().find(|s| s.seg_id() == seg_id);
-            if let Some(seg) = found {
-                Some(seg.read_vector(internal_id, dimension)?)
+            let from_sealed = sealed.iter()
+                .find(|s| s.seg_id() == seg_id)
+                .map(|s| s.read_vector(internal_id, dimension))
+                .transpose()?;
+            if from_sealed.is_some() {
+                from_sealed
+            } else if let Some(w) = writable {
+                let ws = w.read().unwrap();
+                if ws.seg_id() == seg_id { Some(ws.read_vector(internal_id, dimension)?) } else { None }
             } else {
-                let ws = snap.writable_seg.read().unwrap();
-                if ws.seg_id() == seg_id {
-                    Some(ws.read_vector(internal_id, dimension)?)
-                } else {
-                    None
-                }
+                None
             }
         } else {
             None
@@ -627,38 +640,48 @@ fn search_exact_snapshot(
         internal_id: u32,
     }
 
-    // Scan sealed segments in parallel, collecting (distance, seg_id, internal_id) tuples.
-    let mut candidates: Vec<HeapEntry> = snap
-        .sealed_segs
-        .par_iter()
-        .flat_map(|seg| {
-            let sid = seg.seg_id();
-            (0..seg.num_vectors() as u32)
+    let sealed: Vec<&Arc<SealedSegment>> = snap.segs.iter()
+        .filter_map(|s| match s { SegmentSnapshot::Sealed(ss) => Some(ss), _ => None })
+        .collect();
+    let writable = snap.segs.iter()
+        .find_map(|s| match s { SegmentSnapshot::Writable(w) => Some(w), _ => None });
+
+    let (sealed_cands, ws_cands): (Vec<HeapEntry>, Vec<HeapEntry>) = rayon::join(
+        || sealed.par_iter()
+            .flat_map(|seg| {
+                let sid = seg.seg_id();
+                (0..seg.num_vectors() as u32)
+                    .filter_map(|internal_id| {
+                        if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
+                            return None;
+                        }
+                        let vector = seg.read_vector(internal_id, dimension).ok()?;
+                        let distance = compute_distance(metric, query, &vector);
+                        Some(HeapEntry { distance, seg_id: sid, internal_id })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+        || writable.map(|w| {
+            let ws = w.read().unwrap();
+            let sid = ws.seg_id();
+            let n = ws.num_vectors() as u32;
+            let entries: Vec<HeapEntry> = (0..n)
                 .filter_map(|internal_id| {
                     if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
                         return None;
                     }
-                    let vector = seg.read_vector(internal_id, dimension).ok()?;
+                    let vector = ws.read_vector(internal_id, dimension).ok()?;
                     let distance = compute_distance(metric, query, &vector);
                     Some(HeapEntry { distance, seg_id: sid, internal_id })
                 })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    // Scan the writable segment sequentially (holds read lock, no nested parallelism).
-    {
-        let ws = snap.writable_seg.read().unwrap();
-        let sid = ws.seg_id();
-        for internal_id in 0..ws.num_vectors() as u32 {
-            if storage.is_tombstoned(id, sid, internal_id)? {
-                continue;
-            }
-            let vector = ws.read_vector(internal_id, dimension)?;
-            let distance = compute_distance(metric, query, &vector);
-            candidates.push(HeapEntry { distance, seg_id: sid, internal_id });
-        }
-    }
+                .collect();
+            drop(ws);
+            entries
+        }).unwrap_or_default(),
+    );
+    let mut candidates = sealed_cands;
+    candidates.extend(ws_cands);
 
     candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(CmpOrdering::Equal));
     let top_k: Vec<HeapEntry> = candidates.into_iter().take(k).collect();
