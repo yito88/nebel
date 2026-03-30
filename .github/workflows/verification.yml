@@ -12,6 +12,9 @@ jobs:
   verify:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -61,3 +64,77 @@ jobs:
               raise SystemExit(f'FAIL: ANN recall {recall:.4f} is below threshold 0.9')
           print(f'OK: ANN recall {recall:.4f} >= 0.9')
           "
+
+      - name: Print summary
+        if: always()
+        run: |
+          ANN_RECALL=$(grep -oP 'search \(ANN\) avg recall@\d+:\s+\K[0-9.]+' verify_output.txt || echo "N/A")
+          if [ "$ANN_RECALL" != "N/A" ] && python3 -c "exit(0 if float('$ANN_RECALL') >= 0.9 else 1)" 2>/dev/null; then
+            STATUS="✅ PASS"
+          else
+            STATUS="❌ FAIL"
+          fi
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "## Verification Results"
+            echo ""
+            echo "| Date | Commit | Run | ANN Recall | Status |"
+            echo "|---|---|---|---|---|"
+            echo "| $(date -u '+%Y-%m-%d %H:%M UTC') | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) | [#$GITHUB_RUN_NUMBER]($RUN_URL) | $ANN_RECALL | $STATUS |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout gh-pages
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Update verification history
+        if: always()
+        run: |
+          mkdir -p gh-pages/data
+          python3 - <<'EOF'
+          import json, os, re
+
+          history_path = "gh-pages/data/verification.json"
+          history = []
+          if os.path.exists(history_path):
+              with open(history_path) as f:
+                  history = json.load(f)
+
+          ann_recall = None
+          try:
+              text = open("verify_output.txt").read()
+              m = re.search(r'search \(ANN\) avg recall@\d+:\s+([0-9.]+)', text)
+              if m:
+                  ann_recall = float(m.group(1))
+          except FileNotFoundError:
+              pass
+
+          run_entry = {
+              "date": os.environ.get("GITHUB_RUN_STARTED_AT", __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")),
+              "commit": os.environ["GITHUB_SHA"][:7],
+              "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
+              "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "ann_recall": ann_recall,
+              "passed": ann_recall is not None and ann_recall >= 0.9,
+          }
+
+          history.append(run_entry)
+          history = history[-100:]  # keep last 100 runs
+
+          with open(history_path, "w") as f:
+              json.dump(history, f, indent=2)
+          print(f"History now has {len(history)} entries.")
+          EOF
+
+      - name: Push to gh-pages
+        if: always()
+        run: |
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/verification.json
+          git diff --cached --quiet || git commit -m "verify: run #$GITHUB_RUN_NUMBER (${GITHUB_SHA::7})"
+          git push
