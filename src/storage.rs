@@ -229,12 +229,7 @@ impl Storage {
     /// Atomically apply a delete WAL record: tombstone and remove doc location (if it exists),
     /// and advance applied_seq.
     /// The doc location is read inside the transaction, making the full operation atomic.
-    pub fn apply_delete(
-        &self,
-        id: &CollectionId,
-        doc_id: &str,
-        seq: u64,
-    ) -> Result<()> {
+    pub fn apply_delete(&self, id: &CollectionId, doc_id: &str, seq: u64) -> Result<()> {
         let col = id.as_str();
         let dk = doc_key(col, doc_id);
         let wtxn = self.db.begin_write()?;
