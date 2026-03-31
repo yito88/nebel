@@ -169,7 +169,7 @@ impl Db {
         let recovery_segs = inner.wal.lock().unwrap().recovery_segments();
         for (wal_id, path) in recovery_segs {
             let records = Wal::read_segment(&path)?;
-            Self::apply_and_persist(&records, &inner, &self.storage, id)?;
+            Self::apply_and_persist(&records, &inner)?;
             inner.wal.lock().unwrap().remove_segment(wal_id)?;
         }
 
@@ -195,23 +195,14 @@ impl Db {
         Ok(CollectionHandle::from_arc(inner))
     }
 
-    /// Apply records (skipping already-applied ones by seq) and persist applied_seq.
-    fn apply_and_persist(
-        records: &[WalRecord],
-        inner: &CollectionInner,
-        storage: &Storage,
-        id: &CollectionId,
-    ) -> Result<()> {
+    /// Apply records (skipping already-applied ones by seq).
+    fn apply_and_persist(records: &[WalRecord], inner: &CollectionInner) -> Result<()> {
         let mut state = inner.apply_state.lock().unwrap();
-        let before = state.applied_seq;
         for record in records {
             if record.seq <= state.applied_seq {
                 continue;
             }
             apply_entry(inner, &mut state, record)?;
-        }
-        if state.applied_seq > before {
-            storage.put_applied_seq(id, state.applied_seq)?;
         }
         Ok(())
     }

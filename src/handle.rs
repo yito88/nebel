@@ -429,9 +429,6 @@ impl CollectionHandle {
             apply_entry(inner, &mut state, record)?;
         }
         if !pending.is_empty() {
-            inner
-                .storage
-                .put_applied_seq(&inner.id, state.applied_seq)?;
             let visible = state.applied_seq + 1;
             inner.publish_snapshot(&state);
             drop(state);
@@ -529,8 +526,6 @@ fn apply_worker_loop(
                 break;
             }
         }
-
-        let _ = inner.storage.put_applied_seq(&inner.id, state.applied_seq);
 
         let applied = state.applied_seq;
         inner.publish_snapshot(&state);
@@ -647,9 +642,7 @@ pub(crate) fn apply_entry(
             vector,
             metadata,
         } => {
-            if let Some(loc) = storage.get_doc_location(id, doc_id)? {
-                storage.set_tombstone(id, loc.seg_id, loc.internal_id)?;
-            }
+            let old_loc = storage.get_doc_location(id, doc_id)?;
             if state.writable_seg.read().unwrap().num_vectors()
                 >= schema.segment_params.segment_capacity
             {
@@ -661,8 +654,9 @@ pub(crate) fn apply_entry(
             };
             let seg_id = state.manifest.writable_segment;
             let num_vectors = state.writable_seg.read().unwrap().num_vectors();
-            storage.write_vector_entries(
+            storage.apply_upsert(
                 id,
+                old_loc.as_ref(),
                 &SegmentMeta {
                     seg_id,
                     num_vectors,
@@ -673,18 +667,16 @@ pub(crate) fn apply_entry(
                     internal_id,
                     metadata: metadata.as_ref(),
                 }],
+                record.seq,
             )?;
         }
         WalOp::Delete { doc_id } => {
-            if let Some(loc) = storage.get_doc_location(id, doc_id)? {
-                storage.set_tombstone(id, loc.seg_id, loc.internal_id)?;
-                storage.remove_doc_location(id, doc_id)?;
-            }
+            let loc = storage.get_doc_location(id, doc_id)?;
+            storage.apply_delete(id, doc_id, loc.as_ref(), record.seq)?;
         }
         WalOp::UpdateMetadata { doc_id, metadata } => {
-            if let Some(loc) = storage.get_doc_location(id, doc_id)? {
-                storage.put_metadata(id, loc.seg_id, loc.internal_id, metadata)?;
-            }
+            let loc = storage.get_doc_location(id, doc_id)?;
+            storage.apply_update_metadata(id, loc.as_ref(), metadata, record.seq)?;
         }
     }
 
@@ -707,16 +699,6 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
     let sealed = state.writable_seg.read().unwrap().persist_as_sealed()?;
     let sealed_arc = Arc::new(sealed);
 
-    storage.put_segment(
-        &inner.id,
-        &SegmentMeta {
-            seg_id: old_id,
-            num_vectors,
-            state: SegmentState::Sealed,
-        },
-    )?;
-    storage.put_segment(&inner.id, &SegmentMeta::new(new_id))?;
-
     let new_ws = WritableSegment::create(
         new_id,
         new_dir,
@@ -729,7 +711,17 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
     state.manifest.writable_segment = new_id;
     state.manifest.next_seg_id = new_id.next();
     state.writable_seg = Arc::new(RwLock::new(new_ws));
-    storage.put_manifest(&inner.id, &state.manifest)?;
+
+    storage.seal_segment(
+        &inner.id,
+        &SegmentMeta {
+            seg_id: old_id,
+            num_vectors,
+            state: SegmentState::Sealed,
+        },
+        &SegmentMeta::new(new_id),
+        &state.manifest,
+    )?;
 
     Ok(())
 }
