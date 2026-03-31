@@ -1,1 +1,10 @@
-[]
+[
+  {
+    "date": "2026-03-31T05:28:02Z",
+    "commit": "32476d5",
+    "run_number": 1,
+    "run_url": "https://github.com/yito88/nebel/actions/runs/23781672797",
+    "ann_recall": 0.973,
+    "passed": true
+  }
+]
