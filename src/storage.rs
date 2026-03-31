@@ -1,5 +1,5 @@
 use anyhow::Result;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::types::{
     CollectionId, CollectionSchema, DocLocation, Manifest, SegId, SegmentMeta, VectorEntry,
@@ -150,17 +150,6 @@ impl Storage {
         }
     }
 
-    /// Look up the storage location for a document.
-    pub fn get_doc_location(&self, id: &CollectionId, doc_id: &str) -> Result<Option<DocLocation>> {
-        let key = doc_key(id.as_str(), doc_id);
-        let rtxn = self.db.begin_read()?;
-        let table = rtxn.open_table(DOC_MAP)?;
-        match table.get(key.as_str())? {
-            Some(v) => Ok(Some(serde_json::from_str(v.value())?)),
-            None => Ok(None),
-        }
-    }
-
     /// Return `true` if the slot is tombstoned.
     pub fn is_tombstoned(
         &self,
@@ -176,10 +165,11 @@ impl Storage {
 
     /// Atomically apply an upsert WAL record: tombstone the old location (if any),
     /// write new segment metadata, doc/reverse/vector-metadata entries, and advance applied_seq.
+    /// The old doc location is read inside the transaction, making the full operation atomic.
     pub fn apply_upsert(
         &self,
         id: &CollectionId,
-        old_loc: Option<&DocLocation>,
+        doc_id: &str,
         seg_meta: &SegmentMeta,
         entries: &[VectorEntry<'_>],
         seq: u64,
@@ -187,6 +177,7 @@ impl Storage {
         let col = id.as_str();
         let sk = seg_key(col, seg_meta.seg_id);
         let seg_json = serde_json::to_string(seg_meta)?;
+        let old_dk = doc_key(col, doc_id);
         let prepared: Vec<_> = entries
             .iter()
             .map(|e| {
@@ -207,19 +198,23 @@ impl Storage {
 
         let wtxn = self.db.begin_write()?;
         {
-            if let Some(loc) = old_loc {
+            let mut doc_table = wtxn.open_table(DOC_MAP)?;
+            let old_loc: Option<DocLocation> = match doc_table.get(old_dk.as_str())? {
+                Some(v) => Some(serde_json::from_str(v.value())?),
+                None => None,
+            };
+            if let Some(loc) = &old_loc {
                 let tk = meta_key(col, loc.seg_id, loc.internal_id);
                 let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
                 tomb_table.insert(tk.as_str(), true)?;
             }
             let mut seg_table = wtxn.open_table(SEGMENTS)?;
             seg_table.insert(sk.as_str(), seg_json.as_str())?;
-            let mut doc_table = wtxn.open_table(DOC_MAP)?;
             let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
             let mut meta_table = wtxn.open_table(METADATA)?;
-            for (dk, loc_json, mk, doc_id, meta_json) in &prepared {
+            for (dk, loc_json, mk, entry_doc_id, meta_json) in &prepared {
                 doc_table.insert(dk.as_str(), loc_json.as_str())?;
-                rev_table.insert(mk.as_str(), *doc_id)?;
+                rev_table.insert(mk.as_str(), *entry_doc_id)?;
                 if let Some(mj) = meta_json {
                     meta_table.insert(mk.as_str(), mj.as_str())?;
                 }
@@ -233,22 +228,26 @@ impl Storage {
 
     /// Atomically apply a delete WAL record: tombstone and remove doc location (if it exists),
     /// and advance applied_seq.
+    /// The doc location is read inside the transaction, making the full operation atomic.
     pub fn apply_delete(
         &self,
         id: &CollectionId,
         doc_id: &str,
-        loc: Option<&DocLocation>,
         seq: u64,
     ) -> Result<()> {
         let col = id.as_str();
+        let dk = doc_key(col, doc_id);
         let wtxn = self.db.begin_write()?;
         {
-            if let Some(loc) = loc {
+            let mut doc_table = wtxn.open_table(DOC_MAP)?;
+            let old_loc: Option<DocLocation> = match doc_table.get(dk.as_str())? {
+                Some(v) => Some(serde_json::from_str(v.value())?),
+                None => None,
+            };
+            if let Some(loc) = &old_loc {
                 let tk = meta_key(col, loc.seg_id, loc.internal_id);
                 let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
                 tomb_table.insert(tk.as_str(), true)?;
-                let dk = doc_key(col, doc_id);
-                let mut doc_table = wtxn.open_table(DOC_MAP)?;
                 doc_table.remove(dk.as_str())?;
             }
             let mut seq_table = wtxn.open_table(APPLIED_SEQ)?;
@@ -260,17 +259,24 @@ impl Storage {
 
     /// Atomically apply an update-metadata WAL record: write the new metadata (if the doc exists)
     /// and advance applied_seq.
+    /// The doc location is read inside the transaction, making the full operation atomic.
     pub fn apply_update_metadata(
         &self,
         id: &CollectionId,
-        loc: Option<&DocLocation>,
+        doc_id: &str,
         meta: &serde_json::Value,
         seq: u64,
     ) -> Result<()> {
         let col = id.as_str();
+        let dk = doc_key(col, doc_id);
         let wtxn = self.db.begin_write()?;
         {
-            if let Some(loc) = loc {
+            let doc_table = wtxn.open_table(DOC_MAP)?;
+            let old_loc: Option<DocLocation> = match doc_table.get(dk.as_str())? {
+                Some(v) => Some(serde_json::from_str(v.value())?),
+                None => None,
+            };
+            if let Some(loc) = &old_loc {
                 let mk = meta_key(col, loc.seg_id, loc.internal_id);
                 let json = serde_json::to_string(meta)?;
                 let mut meta_table = wtxn.open_table(METADATA)?;

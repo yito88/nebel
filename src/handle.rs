@@ -642,7 +642,6 @@ pub(crate) fn apply_entry(
             vector,
             metadata,
         } => {
-            let old_loc = storage.get_doc_location(id, doc_id)?;
             if state.writable_seg.read().unwrap().num_vectors()
                 >= schema.segment_params.segment_capacity
             {
@@ -656,7 +655,7 @@ pub(crate) fn apply_entry(
             let num_vectors = state.writable_seg.read().unwrap().num_vectors();
             storage.apply_upsert(
                 id,
-                old_loc.as_ref(),
+                doc_id.as_str(),
                 &SegmentMeta {
                     seg_id,
                     num_vectors,
@@ -671,12 +670,10 @@ pub(crate) fn apply_entry(
             )?;
         }
         WalOp::Delete { doc_id } => {
-            let loc = storage.get_doc_location(id, doc_id)?;
-            storage.apply_delete(id, doc_id, loc.as_ref(), record.seq)?;
+            storage.apply_delete(id, doc_id, record.seq)?;
         }
         WalOp::UpdateMetadata { doc_id, metadata } => {
-            let loc = storage.get_doc_location(id, doc_id)?;
-            storage.apply_update_metadata(id, loc.as_ref(), metadata, record.seq)?;
+            storage.apply_update_metadata(id, doc_id, metadata, record.seq)?;
         }
     }
 
