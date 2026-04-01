@@ -9,10 +9,10 @@ use clap::Parser;
 use rand::Rng;
 use rand::rngs::StdRng;
 use rand::{SeedableRng, seq::SliceRandom};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nebel::{
     Db,
@@ -267,15 +267,10 @@ fn main() -> Result<()> {
     if cli.mode == BenchMode::Mix && cli.query_file.is_none() {
         bail!("--query-file is required for mix mode");
     }
-    if cli.mode == BenchMode::Mix
-        && cli.write_pattern == WritePattern::Update
-        && cli.preload == 0
-    {
+    if cli.mode == BenchMode::Mix && cli.write_pattern == WritePattern::Update && cli.preload == 0 {
         bail!("--write-pattern update requires --preload N > 0 in mix mode");
     }
-    if cli.mode == BenchMode::Mix
-        && !(cli.read_write_ratio > 0.0 && cli.read_write_ratio < 1.0)
-    {
+    if cli.mode == BenchMode::Mix && !(cli.read_write_ratio > 0.0 && cli.read_write_ratio < 1.0) {
         bail!("--read-write-ratio must be in (0.0, 1.0)");
     }
 
@@ -793,9 +788,8 @@ fn main() -> Result<()> {
 
             let bench_ops = &op_is_read[cli.warmup_ops..];
             let bench_start = Instant::now();
-            let results: Vec<(bool, f64)>; // (is_read, latency_ms)
 
-            if cli.concurrency <= 1 {
+            let results: Vec<(bool, f64)> = if cli.concurrency <= 1 {
                 let mut res = Vec::with_capacity(cli.num_ops);
                 for (i, &is_read) in bench_ops.iter().enumerate() {
                     if is_read {
@@ -806,10 +800,9 @@ fn main() -> Result<()> {
                     } else {
                         let vec_idx = i % base_len;
                         let doc_id = match cli.write_pattern {
-                            WritePattern::Append => format!(
-                                "mix_{}",
-                                write_counter.fetch_add(1, Ordering::Relaxed)
-                            ),
+                            WritePattern::Append => {
+                                format!("mix_{}", write_counter.fetch_add(1, Ordering::Relaxed))
+                            }
                             WritePattern::Update => {
                                 format!("doc_{}", i % num_preloaded.max(1))
                             }
@@ -822,7 +815,7 @@ fn main() -> Result<()> {
                         res.push((false, start.elapsed().as_secs_f64() * 1000.0));
                     }
                 }
-                results = res;
+                res
             } else {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(cli.concurrency)
@@ -830,7 +823,7 @@ fn main() -> Result<()> {
                 let write_pattern = cli.write_pattern.clone();
                 let wait_visible = cli.wait_visible;
                 let wc = Arc::clone(&write_counter);
-                results = pool.install(|| {
+                pool.install(|| {
                     bench_ops
                         .par_iter()
                         .enumerate()
@@ -843,10 +836,9 @@ fn main() -> Result<()> {
                             } else {
                                 let vec_idx = i % base_len;
                                 let doc_id = match write_pattern {
-                                    WritePattern::Append => format!(
-                                        "mix_{}",
-                                        wc.fetch_add(1, Ordering::Relaxed)
-                                    ),
+                                    WritePattern::Append => {
+                                        format!("mix_{}", wc.fetch_add(1, Ordering::Relaxed))
+                                    }
                                     WritePattern::Update => {
                                         format!("doc_{}", i % num_preloaded.max(1))
                                     }
@@ -861,8 +853,8 @@ fn main() -> Result<()> {
                             }
                         })
                         .collect()
-                });
-            }
+                })
+            };
 
             let wall_secs = bench_start.elapsed().as_secs_f64();
             let throughput_ops = cli.num_ops as f64 / wall_secs;
