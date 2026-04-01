@@ -213,9 +213,7 @@ fn main() -> Result<()> {
     if cli.mode == BenchMode::Search && cli.query_file.is_none() {
         bail!("--query-file is required for search mode");
     }
-    if cli.mode == BenchMode::Write
-        && cli.write_pattern == WritePattern::Update
-        && cli.preload == 0
+    if cli.mode == BenchMode::Write && cli.write_pattern == WritePattern::Update && cli.preload == 0
     {
         bail!("--write-pattern update requires --preload N > 0");
     }
@@ -424,8 +422,7 @@ fn main() -> Result<()> {
                         .into_par_iter()
                         .map(|i| {
                             let start = Instant::now();
-                            let hits =
-                                col.search(bench_queries[i], cli.k, false, false).unwrap();
+                            let hits = col.search(bench_queries[i], cli.k, false, false).unwrap();
                             let latency = start.elapsed().as_secs_f64() * 1000.0;
                             let recall = exact_results.as_ref().map(|er| {
                                 recall_at_k(&er.query_results[i], &hits_to_ids(&hits), cli.k)
@@ -548,9 +545,7 @@ fn main() -> Result<()> {
             // Write benchmark
             println!(
                 "Running write benchmark ({} writes, pattern={:?}, concurrency={})...",
-                cli.num_writes,
-                cli.write_pattern,
-                cli.concurrency,
+                cli.num_writes, cli.write_pattern, cli.concurrency,
             );
 
             let bench_start = Instant::now();
@@ -589,8 +584,7 @@ fn main() -> Result<()> {
                                 WritePattern::Update => format!("doc_{}", i % num_preloaded),
                             };
                             let start = Instant::now();
-                            let token =
-                                col.upsert(&doc_id, &base_vectors[vec_idx], None).unwrap();
+                            let token = col.upsert(&doc_id, &base_vectors[vec_idx], None).unwrap();
                             if wait_visible {
                                 col.wait_visible(token).unwrap();
                             }
