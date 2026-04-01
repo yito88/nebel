@@ -6,8 +6,11 @@ use std::{
 
 use anyhow::{Result, bail};
 use clap::Parser;
+use rand::Rng;
 use rand::rngs::StdRng;
 use rand::{SeedableRng, seq::SliceRandom};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +29,7 @@ use nebel::{
 enum BenchMode {
     Search,
     Write,
+    Mix,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -138,6 +142,19 @@ struct Cli {
     /// Wait for each write to become search-visible before proceeding (write mode only)
     #[arg(long, default_value_t = false)]
     wait_visible: bool,
+
+    // --- mix-mode options ---
+    /// Fraction of operations that are reads, e.g. 0.8 = 80% reads / 20% writes (mix mode)
+    #[arg(long, default_value_t = 0.8)]
+    read_write_ratio: f64,
+
+    /// Total number of operations in mix benchmark
+    #[arg(long, default_value_t = 1000)]
+    num_ops: usize,
+
+    /// Warmup operations before mix measurement
+    #[arg(long, default_value_t = 0)]
+    warmup_ops: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +213,36 @@ struct WriteSummary {
     params: SegmentParams,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MixSummary {
+    dataset_name: String,
+    metric: Metric,
+    num_preloaded: usize,
+    num_ops: usize,
+    warmup_ops: usize,
+    read_write_ratio: f64,
+    write_pattern: WritePattern,
+    k: usize,
+    concurrency: usize,
+    wait_visible: bool,
+
+    total_read_ops: usize,
+    total_write_ops: usize,
+    throughput_ops: f64,
+
+    read_avg_latency_ms: f64,
+    read_p50_latency_ms: f64,
+    read_p95_latency_ms: f64,
+    read_p99_latency_ms: f64,
+
+    write_avg_latency_ms: f64,
+    write_p50_latency_ms: f64,
+    write_p95_latency_ms: f64,
+    write_p99_latency_ms: f64,
+
+    params: SegmentParams,
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -216,6 +263,20 @@ fn main() -> Result<()> {
     if cli.mode == BenchMode::Write && cli.write_pattern == WritePattern::Update && cli.preload == 0
     {
         bail!("--write-pattern update requires --preload N > 0");
+    }
+    if cli.mode == BenchMode::Mix && cli.query_file.is_none() {
+        bail!("--query-file is required for mix mode");
+    }
+    if cli.mode == BenchMode::Mix
+        && cli.write_pattern == WritePattern::Update
+        && cli.preload == 0
+    {
+        bail!("--write-pattern update requires --preload N > 0 in mix mode");
+    }
+    if cli.mode == BenchMode::Mix
+        && !(cli.read_write_ratio > 0.0 && cli.read_write_ratio < 1.0)
+    {
+        bail!("--read-write-ratio must be in (0.0, 1.0)");
     }
 
     // 1. Load base vectors
@@ -637,6 +698,253 @@ fn main() -> Result<()> {
             println!("P50 latency:      {:.3} ms", summary.p50_latency_ms);
             println!("P95 latency:      {:.3} ms", summary.p95_latency_ms);
             println!("P99 latency:      {:.3} ms", summary.p99_latency_ms);
+            println!("---");
+            println!(
+                "HNSW params:      m={} ef_c={} ef_s={} cap={}",
+                summary.params.m,
+                summary.params.ef_construction,
+                summary.params.ef_search,
+                summary.params.segment_capacity
+            );
+
+            // Save summary if requested
+            if let Some(ref path) = cli.save_summary {
+                println!("\nSaving summary to {}...", path);
+                if let Some(parent) = Path::new(path).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, serde_json::to_string_pretty(&summary)?)?;
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Mix mode
+        // -----------------------------------------------------------------------
+        BenchMode::Mix => {
+            // Preload N vectors before benchmarking
+            let num_preloaded = if !reused && cli.preload > 0 {
+                println!("Preloading {} vectors...", cli.preload);
+                let preload_start = Instant::now();
+                let preload_count = cli.preload.min(base_vectors.len());
+                let preload_vecs = &base_vectors[..preload_count];
+                let tmp_preload = db_dir.path().join("preload_vectors.raw");
+                write_raw_f32(&tmp_preload, preload_vecs)?;
+                let n = col.ingest_file(&tmp_preload)?;
+                println!(
+                    "  Preloaded {} vectors in {:.2}s",
+                    n,
+                    preload_start.elapsed().as_secs_f64()
+                );
+                n
+            } else if reused {
+                cli.preload
+            } else {
+                0
+            };
+
+            // Load query vectors
+            let query_file = cli.query_file.as_deref().unwrap();
+            println!("Loading query vectors from {}...", query_file);
+            let (qdim, all_queries) = load_vectors(query_file)?;
+            if qdim != dim {
+                bail!("dimension mismatch: base={} query={}", dim, qdim);
+            }
+            println!("  {} query vectors available", all_queries.len());
+
+            let base_len = base_vectors.len();
+            let query_len = all_queries.len();
+            let read_write_ratio = cli.read_write_ratio;
+
+            // Pre-compute operation assignments deterministically (true = read, false = write)
+            let total_ops = cli.warmup_ops + cli.num_ops;
+            let op_is_read: Vec<bool> = {
+                let mut rng = StdRng::seed_from_u64(cli.seed);
+                (0..total_ops)
+                    .map(|_| rng.random_bool(read_write_ratio))
+                    .collect()
+            };
+
+            // Shared write counter to assign unique append doc IDs across threads
+            let write_counter = Arc::new(AtomicUsize::new(num_preloaded));
+
+            // Warmup
+            println!("Running {} warmup operations...", cli.warmup_ops);
+            for (i, &is_read) in op_is_read[..cli.warmup_ops].iter().enumerate() {
+                if is_read {
+                    let q = &all_queries[i % query_len];
+                    let _ = col.search(q, cli.k, false, false)?;
+                } else {
+                    let vec_idx = i % base_len;
+                    let doc_id = match cli.write_pattern {
+                        WritePattern::Append => {
+                            format!("warmup_{}", write_counter.fetch_add(1, Ordering::Relaxed))
+                        }
+                        WritePattern::Update => format!("doc_{}", i % num_preloaded.max(1)),
+                    };
+                    col.upsert(&doc_id, &base_vectors[vec_idx], None)?;
+                }
+            }
+
+            // Benchmark
+            println!(
+                "Running mix benchmark ({} ops, read_write_ratio={:.2}, write_pattern={:?}, concurrency={})...",
+                cli.num_ops, read_write_ratio, cli.write_pattern, cli.concurrency,
+            );
+
+            let bench_ops = &op_is_read[cli.warmup_ops..];
+            let bench_start = Instant::now();
+            let results: Vec<(bool, f64)>; // (is_read, latency_ms)
+
+            if cli.concurrency <= 1 {
+                let mut res = Vec::with_capacity(cli.num_ops);
+                for (i, &is_read) in bench_ops.iter().enumerate() {
+                    if is_read {
+                        let q = &all_queries[i % query_len];
+                        let start = Instant::now();
+                        let _ = col.search(q, cli.k, false, false)?;
+                        res.push((true, start.elapsed().as_secs_f64() * 1000.0));
+                    } else {
+                        let vec_idx = i % base_len;
+                        let doc_id = match cli.write_pattern {
+                            WritePattern::Append => format!(
+                                "mix_{}",
+                                write_counter.fetch_add(1, Ordering::Relaxed)
+                            ),
+                            WritePattern::Update => {
+                                format!("doc_{}", i % num_preloaded.max(1))
+                            }
+                        };
+                        let start = Instant::now();
+                        let token = col.upsert(&doc_id, &base_vectors[vec_idx], None)?;
+                        if cli.wait_visible {
+                            col.wait_visible(token)?;
+                        }
+                        res.push((false, start.elapsed().as_secs_f64() * 1000.0));
+                    }
+                }
+                results = res;
+            } else {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(cli.concurrency)
+                    .build()?;
+                let write_pattern = cli.write_pattern.clone();
+                let wait_visible = cli.wait_visible;
+                let wc = Arc::clone(&write_counter);
+                results = pool.install(|| {
+                    bench_ops
+                        .par_iter()
+                        .enumerate()
+                        .map(|(i, &is_read)| {
+                            if is_read {
+                                let q = &all_queries[i % query_len];
+                                let start = Instant::now();
+                                let _ = col.search(q, cli.k, false, false).unwrap();
+                                (true, start.elapsed().as_secs_f64() * 1000.0)
+                            } else {
+                                let vec_idx = i % base_len;
+                                let doc_id = match write_pattern {
+                                    WritePattern::Append => format!(
+                                        "mix_{}",
+                                        wc.fetch_add(1, Ordering::Relaxed)
+                                    ),
+                                    WritePattern::Update => {
+                                        format!("doc_{}", i % num_preloaded.max(1))
+                                    }
+                                };
+                                let start = Instant::now();
+                                let token =
+                                    col.upsert(&doc_id, &base_vectors[vec_idx], None).unwrap();
+                                if wait_visible {
+                                    col.wait_visible(token).unwrap();
+                                }
+                                (false, start.elapsed().as_secs_f64() * 1000.0)
+                            }
+                        })
+                        .collect()
+                });
+            }
+
+            let wall_secs = bench_start.elapsed().as_secs_f64();
+            let throughput_ops = cli.num_ops as f64 / wall_secs;
+
+            // Split latencies by op type
+            let mut read_lats: Vec<f64> = results
+                .iter()
+                .filter(|(is_read, _)| *is_read)
+                .map(|(_, lat)| *lat)
+                .collect();
+            let mut write_lats: Vec<f64> = results
+                .iter()
+                .filter(|(is_read, _)| !is_read)
+                .map(|(_, lat)| *lat)
+                .collect();
+
+            read_lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            write_lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+            let read_avg = if read_lats.is_empty() {
+                0.0
+            } else {
+                read_lats.iter().sum::<f64>() / read_lats.len() as f64
+            };
+            let write_avg = if write_lats.is_empty() {
+                0.0
+            } else {
+                write_lats.iter().sum::<f64>() / write_lats.len() as f64
+            };
+
+            let summary = MixSummary {
+                dataset_name: cli.dataset_name.clone(),
+                metric: cli.metric.clone(),
+                num_preloaded,
+                num_ops: cli.num_ops,
+                warmup_ops: cli.warmup_ops,
+                read_write_ratio,
+                write_pattern: cli.write_pattern.clone(),
+                k: cli.k,
+                concurrency: cli.concurrency,
+                wait_visible: cli.wait_visible,
+                total_read_ops: read_lats.len(),
+                total_write_ops: write_lats.len(),
+                throughput_ops,
+                read_avg_latency_ms: read_avg,
+                read_p50_latency_ms: percentile(&read_lats, 50.0),
+                read_p95_latency_ms: percentile(&read_lats, 95.0),
+                read_p99_latency_ms: percentile(&read_lats, 99.0),
+                write_avg_latency_ms: write_avg,
+                write_p50_latency_ms: percentile(&write_lats, 50.0),
+                write_p95_latency_ms: percentile(&write_lats, 95.0),
+                write_p99_latency_ms: percentile(&write_lats, 99.0),
+                params,
+            };
+
+            // Print summary
+            println!("\n===== Mix Benchmark Summary =====");
+            println!("Dataset:          {}", summary.dataset_name);
+            println!("Metric:           {:?}", summary.metric);
+            println!("Preloaded:        {}", summary.num_preloaded);
+            println!("Ops:              {}", summary.num_ops);
+            println!("Warmup ops:       {}", summary.warmup_ops);
+            println!("Read/write ratio: {:.2}", summary.read_write_ratio);
+            println!("Write pattern:    {:?}", summary.write_pattern);
+            println!("Concurrency:      {}", summary.concurrency);
+            println!("Wait visible:     {}", summary.wait_visible);
+            println!("---");
+            println!(
+                "Total ops:        {} reads, {} writes",
+                summary.total_read_ops, summary.total_write_ops
+            );
+            println!("Throughput:       {:.1} ops/sec", summary.throughput_ops);
+            println!("---");
+            println!("Read  avg:        {:.3} ms", summary.read_avg_latency_ms);
+            println!("Read  P50:        {:.3} ms", summary.read_p50_latency_ms);
+            println!("Read  P95:        {:.3} ms", summary.read_p95_latency_ms);
+            println!("Read  P99:        {:.3} ms", summary.read_p99_latency_ms);
+            println!("---");
+            println!("Write avg:        {:.3} ms", summary.write_avg_latency_ms);
+            println!("Write P50:        {:.3} ms", summary.write_p50_latency_ms);
+            println!("Write P95:        {:.3} ms", summary.write_p95_latency_ms);
+            println!("Write P99:        {:.3} ms", summary.write_p99_latency_ms);
             println!("---");
             println!(
                 "HNSW params:      m={} ef_c={} ef_s={} cap={}",
