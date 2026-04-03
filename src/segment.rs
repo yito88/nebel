@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use hnsw_rs::prelude::*;
 
-use crate::types::{Metric, SegId, SegmentParams};
+use crate::types::{InternalId, Metric, SegId, SegmentParams};
 
 const MAX_ELEMENTS: usize = 1_000_000;
 const MAX_LAYER: usize = 16;
@@ -211,7 +211,7 @@ impl WritableSegment {
     }
 
     /// Append a vector to the segment and return its internal_id.
-    pub fn insert(&mut self, vector: &[f32], dimension: usize) -> Result<u32> {
+    pub fn insert(&mut self, vector: &[f32], dimension: usize) -> Result<InternalId> {
         let internal_id = self.meta.num_vectors;
         let offset = (internal_id * dimension * 4) as u64;
         self.vector_file.seek(SeekFrom::Start(offset))?;
@@ -219,14 +219,18 @@ impl WritableSegment {
         self.vector_file.flush()?;
         self.index.insert((vector, internal_id));
         self.meta.num_vectors += 1;
-        Ok(internal_id as u32)
+        Ok(InternalId::from_u32(internal_id as u32))
     }
 
     /// Append a batch of vectors, write them to the file in one pass, and
     /// insert them into the index with `parallel_insert`.
     ///
     /// Returns the assigned internal_ids in the same order as `vectors`.
-    pub fn insert_batch(&mut self, vectors: &[Vec<f32>], dimension: usize) -> Result<Vec<u32>> {
+    pub fn insert_batch(
+        &mut self,
+        vectors: &[Vec<f32>],
+        dimension: usize,
+    ) -> Result<Vec<InternalId>> {
         if vectors.is_empty() {
             return Ok(vec![]);
         }
@@ -246,26 +250,26 @@ impl WritableSegment {
         self.index.parallel_insert(&data);
 
         let ids = (first_id..first_id + vectors.len())
-            .map(|i| i as u32)
+            .map(|i| InternalId::from_u32(i as u32))
             .collect();
         self.meta.num_vectors += vectors.len();
         Ok(ids)
     }
 
     /// Nearest-neighbour search. Returns (internal_id, distance) pairs.
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(InternalId, f32)>> {
         let ef = self.ef_search.max(k);
         let neighbours = self.index.search(query, k, ef);
         Ok(neighbours
             .into_iter()
-            .map(|n| (n.d_id as u32, n.distance))
+            .map(|n| (InternalId::from_u32(n.d_id as u32), n.distance))
             .collect())
     }
 
     /// Read a raw vector by internal_id.
-    pub fn read_vector(&self, internal_id: u32, dimension: usize) -> Result<Vec<f32>> {
+    pub fn read_vector(&self, internal_id: InternalId, dimension: usize) -> Result<Vec<f32>> {
         let record_size = dimension * 4;
-        let offset = internal_id as u64 * record_size as u64;
+        let offset = internal_id.as_usize() as u64 * record_size as u64;
         let mut buf = vec![0u8; record_size];
         self.vector_file.read_exact_at(&mut buf, offset)?;
         Ok(bytes_to_f32(&buf))
@@ -349,19 +353,19 @@ impl SealedSegment {
     }
 
     /// Nearest-neighbour search. Returns (internal_id, distance) pairs.
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(InternalId, f32)>> {
         let ef = self.ef_search.max(k);
         let neighbours = self.index.search(query, k, ef);
         Ok(neighbours
             .into_iter()
-            .map(|n| (n.d_id as u32, n.distance))
+            .map(|n| (InternalId::from_u32(n.d_id as u32), n.distance))
             .collect())
     }
 
     /// Read a raw vector by internal_id from the on-disk vectors.seg file.
-    pub fn read_vector(&self, internal_id: u32, dimension: usize) -> Result<Vec<f32>> {
+    pub fn read_vector(&self, internal_id: InternalId, dimension: usize) -> Result<Vec<f32>> {
         let record_size = dimension * 4;
-        let offset = internal_id as u64 * record_size as u64;
+        let offset = internal_id.as_usize() as u64 * record_size as u64;
         let mut buf = vec![0u8; record_size];
         let path = self.meta.dir.join("vectors.seg");
         let file = fs::File::open(&path)?;

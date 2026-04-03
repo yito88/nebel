@@ -2,7 +2,8 @@ use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::types::{
-    CollectionId, CollectionSchema, DocLocation, Manifest, SegId, SegmentMeta, VectorEntry,
+    CollectionId, CollectionSchema, DocLocation, InternalId, Manifest, SegId, SegmentMeta,
+    VectorEntry,
 };
 
 // table definitions
@@ -41,7 +42,7 @@ fn doc_key(collection: &str, doc_id: &str) -> String {
     format!("{}\0{}", collection, doc_id)
 }
 
-fn meta_key(collection: &str, seg_id: SegId, internal_id: u32) -> String {
+fn meta_key(collection: &str, seg_id: SegId, internal_id: InternalId) -> String {
     format!("{}\0{}\0{}", collection, seg_id, internal_id)
 }
 
@@ -150,17 +151,55 @@ impl Storage {
         }
     }
 
-    /// Return `true` if the slot is tombstoned.
-    pub fn is_tombstoned(
+    /// Resolve a batch of candidates in a single read transaction.
+    /// For each `(seg_id, internal_id)`, checks the tombstone, looks up the doc_id,
+    /// and optionally fetches metadata.
+    /// Returns one `Option<ResolvedCandidate>` per input — `None` if tombstoned or missing.
+    pub fn resolve_candidates(
         &self,
         id: &CollectionId,
-        seg_id: SegId,
-        internal_id: u32,
-    ) -> Result<bool> {
-        let key = meta_key(id.as_str(), seg_id, internal_id);
+        candidates: &[(SegId, InternalId)],
+        include_metadata: bool,
+    ) -> Result<Vec<Option<ResolvedCandidate>>> {
+        let col = id.as_str();
         let rtxn = self.db.begin_read()?;
-        let table = rtxn.open_table(TOMBSTONES)?;
-        Ok(table.get(key.as_str())?.map(|v| v.value()).unwrap_or(false))
+        let tomb_table = rtxn.open_table(TOMBSTONES)?;
+        let rev_table = rtxn.open_table(REVERSE_DOC)?;
+        let meta_table = if include_metadata {
+            Some(rtxn.open_table(METADATA)?)
+        } else {
+            None
+        };
+
+        let mut results = Vec::with_capacity(candidates.len());
+        for &(seg_id, internal_id) in candidates {
+            let key = meta_key(col, seg_id, internal_id);
+            if tomb_table
+                .get(key.as_str())?
+                .map(|v| v.value())
+                .unwrap_or(false)
+            {
+                results.push(None);
+                continue;
+            }
+            let doc_id = match rev_table.get(key.as_str())? {
+                Some(v) => v.value().to_string(),
+                None => {
+                    results.push(None);
+                    continue;
+                }
+            };
+            let metadata = if let Some(ref mt) = meta_table {
+                match mt.get(key.as_str())? {
+                    Some(v) => Some(serde_json::from_str(v.value())?),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            results.push(Some(ResolvedCandidate { doc_id, metadata }));
+        }
+        Ok(results)
     }
 
     /// Atomically apply an upsert WAL record: tombstone the old location (if any),
@@ -284,20 +323,34 @@ impl Storage {
         Ok(())
     }
 
-    /// Retrieve user-defined metadata for a vector slot.
-    pub fn get_metadata(
-        &self,
-        id: &CollectionId,
-        seg_id: SegId,
-        internal_id: u32,
-    ) -> Result<Option<serde_json::Value>> {
-        let key = meta_key(id.as_str(), seg_id, internal_id);
+    /// Load all tombstoned `(seg_id, internal_id)` pairs for a collection in
+    /// a single read transaction. Used by brute-force search to avoid per-vector
+    /// transaction overhead.
+    pub fn load_tombstone_set(&self, id: &CollectionId) -> Result<TombstoneSet> {
+        let col = id.as_str();
+        let prefix = format!("{}\0", col);
         let rtxn = self.db.begin_read()?;
-        let table = rtxn.open_table(METADATA)?;
-        match table.get(key.as_str())? {
-            Some(v) => Ok(Some(serde_json::from_str(v.value())?)),
-            None => Ok(None),
+        let table = rtxn.open_table(TOMBSTONES)?;
+        let mut set = TombstoneSet::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            let key = k.value();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            if !v.value() {
+                continue;
+            }
+            // key format: "{collection}\0{seg_id}\0{internal_id}"
+            let rest = &key[prefix.len()..];
+            if let Some((seg_str, id_str)) = rest.split_once('\0')
+                && let (Ok(seg_id), Ok(internal_id)) =
+                    (seg_str.parse::<u32>(), id_str.parse::<u32>())
+            {
+                set.insert((SegId::from_u32(seg_id), InternalId::from_u32(internal_id)));
+            }
         }
+        Ok(set)
     }
 
     /// Write segment metadata, doc locations, reverse-doc mappings, and
@@ -358,20 +411,14 @@ impl Storage {
         let table = rtxn.open_table(APPLIED_SEQ)?;
         Ok(table.get(id.as_str())?.map(|v| v.value()))
     }
-
-    /// Look up the `doc_id` for a given `(seg_id, internal_id)`.
-    pub fn get_reverse_doc(
-        &self,
-        id: &CollectionId,
-        seg_id: SegId,
-        internal_id: u32,
-    ) -> Result<Option<String>> {
-        let key = meta_key(id.as_str(), seg_id, internal_id);
-        let rtxn = self.db.begin_read()?;
-        let table = rtxn.open_table(REVERSE_DOC)?;
-        match table.get(key.as_str())? {
-            Some(v) => Ok(Some(v.value().to_string())),
-            None => Ok(None),
-        }
-    }
 }
+
+/// Result of resolving a single candidate in [`Storage::resolve_candidates`].
+pub struct ResolvedCandidate {
+    pub doc_id: String,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Set of tombstoned `(seg_id, internal_id)` pairs for a collection,
+/// loaded in a single read transaction by [`Storage::load_tombstone_set`].
+pub type TombstoneSet = std::collections::HashSet<(SegId, InternalId)>;

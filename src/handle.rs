@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use rayon::prelude::*;
 use serde_json::Value;
 
@@ -20,8 +20,8 @@ use crate::{
     snapshot::{CollectionSnapshot, SegmentSnapshot},
     storage::Storage,
     types::{
-        CollectionId, CollectionSchema, Manifest, SearchHit, SegId, SegmentMeta, SegmentState,
-        VectorEntry, WriteToken,
+        CollectionId, CollectionSchema, InternalId, Manifest, SearchHit, SegId, SegmentMeta,
+        SegmentState, VectorEntry, WriteToken,
     },
     wal::{ApplyCursor, Wal, WalId, WalOp, WalRecord},
 };
@@ -792,38 +792,32 @@ fn search_snapshot(
                 .unwrap_or_default()
         },
     );
-    let mut candidates: Vec<(SegId, u32, f32)> = sealed_cands;
+    let mut candidates: Vec<(SegId, InternalId, f32)> = sealed_cands;
     candidates.extend(ws_cands);
     candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(CmpOrdering::Equal));
 
+    // Resolve tombstones, doc_ids, and metadata in a single read transaction.
+    let keys: Vec<(SegId, InternalId)> = candidates.iter().map(|&(s, i, _)| (s, i)).collect();
+    let resolved = storage.resolve_candidates(id, &keys, include_metadata)?;
+
     let mut hits = Vec::new();
-    for (seg_id, internal_id, distance) in candidates {
+    for ((seg_id, internal_id, distance), resolved) in candidates.iter().zip(resolved.into_iter()) {
         if hits.len() >= k {
             break;
         }
-        if storage.is_tombstoned(id, seg_id, internal_id)? {
-            continue;
-        }
-        let doc_id = storage
-            .get_reverse_doc(id, seg_id, internal_id)?
-            .ok_or_else(|| anyhow!("reverse mapping not found"))?;
-        let metadata = if include_metadata {
-            storage.get_metadata(id, seg_id, internal_id)?
-        } else {
-            None
-        };
+        let Some(r) = resolved else { continue };
         let vector = if include_vector {
             let from_sealed = sealed
                 .iter()
-                .find(|s| s.seg_id() == seg_id)
-                .map(|s| s.read_vector(internal_id, dimension))
+                .find(|s| s.seg_id() == *seg_id)
+                .map(|s| s.read_vector(*internal_id, dimension))
                 .transpose()?;
             if from_sealed.is_some() {
                 from_sealed
             } else if let Some(w) = writable {
                 let ws = w.read().unwrap();
-                if ws.seg_id() == seg_id {
-                    Some(ws.read_vector(internal_id, dimension)?)
+                if ws.seg_id() == *seg_id {
+                    Some(ws.read_vector(*internal_id, dimension)?)
                 } else {
                     None
                 }
@@ -834,9 +828,9 @@ fn search_snapshot(
             None
         };
         hits.push(SearchHit {
-            doc_id,
-            score: distance,
-            metadata,
+            doc_id: r.doc_id,
+            score: *distance,
+            metadata: r.metadata,
             vector,
         });
     }
@@ -861,10 +855,13 @@ fn search_exact_snapshot(
     let id = &inner.id;
     let metric = &snap.schema.metric;
 
+    // Load all tombstones in one read transaction instead of per-vector lookups.
+    let tombstones = storage.load_tombstone_set(id)?;
+
     struct HeapEntry {
         distance: f32,
         seg_id: SegId,
-        internal_id: u32,
+        internal_id: InternalId,
     }
 
     let sealed: Vec<&Arc<SealedSegment>> = snap
@@ -887,8 +884,9 @@ fn search_exact_snapshot(
                 .flat_map(|seg| {
                     let sid = seg.seg_id();
                     (0..seg.num_vectors() as u32)
+                        .map(InternalId::from_u32)
                         .filter_map(|internal_id| {
-                            if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
+                            if tombstones.contains(&(sid, internal_id)) {
                                 return None;
                             }
                             let vector = seg.read_vector(internal_id, dimension).ok()?;
@@ -910,8 +908,9 @@ fn search_exact_snapshot(
                     let sid = ws.seg_id();
                     let n = ws.num_vectors() as u32;
                     let entries: Vec<HeapEntry> = (0..n)
+                        .map(InternalId::from_u32)
                         .filter_map(|internal_id| {
-                            if storage.is_tombstoned(id, sid, internal_id).unwrap_or(false) {
+                            if tombstones.contains(&(sid, internal_id)) {
                                 return None;
                             }
                             let vector = ws.read_vector(internal_id, dimension).ok()?;
@@ -939,13 +938,15 @@ fn search_exact_snapshot(
     });
     let top_k: Vec<HeapEntry> = candidates.into_iter().take(k).collect();
 
+    // Resolve doc_ids in a single read transaction.
+    let keys: Vec<(SegId, InternalId)> = top_k.iter().map(|e| (e.seg_id, e.internal_id)).collect();
+    let resolved = storage.resolve_candidates(id, &keys, false)?;
+
     let mut hits = Vec::with_capacity(top_k.len());
-    for entry in top_k {
-        let doc_id = storage
-            .get_reverse_doc(id, entry.seg_id, entry.internal_id)?
-            .ok_or_else(|| anyhow!("reverse mapping not found"))?;
+    for (entry, r) in top_k.iter().zip(resolved.into_iter()) {
+        let Some(r) = r else { continue };
         hits.push(SearchHit {
-            doc_id,
+            doc_id: r.doc_id,
             score: entry.distance,
             metadata: None,
             vector: None,
