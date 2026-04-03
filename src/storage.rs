@@ -326,6 +326,7 @@ impl Storage {
     /// Load all tombstoned `(seg_id, internal_id)` pairs for a collection in
     /// a single read transaction. Used by brute-force search to avoid per-vector
     /// transaction overhead.
+    #[cfg(feature = "testing")]
     pub fn load_tombstone_set(&self, id: &CollectionId) -> Result<TombstoneSet> {
         let col = id.as_str();
         let prefix = format!("{}\0", col);
@@ -421,4 +422,5 @@ pub struct ResolvedCandidate {
 
 /// Set of tombstoned `(seg_id, internal_id)` pairs for a collection,
 /// loaded in a single read transaction by [`Storage::load_tombstone_set`].
+#[cfg(feature = "testing")]
 pub type TombstoneSet = std::collections::HashSet<(SegId, InternalId)>;

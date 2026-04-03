@@ -1,5 +1,7 @@
+#[cfg(feature = "testing")]
 pub mod dataset;
 pub mod db;
+#[cfg(feature = "testing")]
 pub mod eval;
 pub mod handle;
 mod segment;

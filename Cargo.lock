@@ -479,6 +479,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hnsw_rs",
+ "nebel",
  "rand",
  "rayon",
  "redb",

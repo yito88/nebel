@@ -16,13 +16,13 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -33,7 +33,7 @@ jobs:
 
       - name: Cache SIFT dataset
         id: cache-sift
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: data/raw/sift
           key: sift-v1
@@ -125,13 +125,13 @@ jobs:
           done
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-${{ github.run_id }}
           path: results/
 
       - name: Checkout gh-pages
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: gh-pages
           path: gh-pages

@@ -15,8 +15,10 @@ use anyhow::{Result, bail};
 use rayon::prelude::*;
 use serde_json::Value;
 
+#[cfg(feature = "testing")]
+use crate::segment::compute_distance;
 use crate::{
-    segment::{SealedSegment, WritableSegment, compute_distance},
+    segment::{SealedSegment, WritableSegment},
     snapshot::{CollectionSnapshot, SegmentSnapshot},
     storage::Storage,
     types::{
@@ -295,6 +297,7 @@ impl CollectionHandle {
         )
     }
 
+    #[cfg(feature = "testing")]
     pub fn search_exact(&self, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
         let snap = { Arc::clone(&*self.inner.snapshot.read().unwrap()) };
         search_exact_snapshot(&self.inner, &snap, query, k)
@@ -837,6 +840,7 @@ fn search_snapshot(
     Ok(hits)
 }
 
+#[cfg(feature = "testing")]
 fn search_exact_snapshot(
     inner: &CollectionInner,
     snap: &CollectionSnapshot,
