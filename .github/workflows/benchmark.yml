@@ -43,64 +43,65 @@ jobs:
         run: bash scripts/download_sift.sh
 
       - name: Build bench binary
-        run: cargo build --release --bin bench
+        run: cargo build --release --bin bench --features testing
 
-      - name: Benchmark concurrency=1 (ingest + query)
+      - name: Create shared data dir and results dir
         run: |
           mkdir -p results
           BENCH_DATA_DIR=$(mktemp -d /tmp/bench-db-XXXXXX)
           echo "BENCH_DATA_DIR=$BENCH_DATA_DIR" >> "$GITHUB_ENV"
-          ./target/release/bench \
-            --base-file  data/raw/sift/sift_base.fvecs \
-            --query-file data/raw/sift/sift_query.fvecs \
-            --dataset-name sift \
-            --data-dir "$BENCH_DATA_DIR" \
-            --concurrency 1 \
-            --save-summary results/bench_c1.json
 
-      - name: Benchmark concurrency=2
+      - name: Benchmark search-only (SIFT L2)
         run: |
           ./target/release/bench \
-            --base-file  data/raw/sift/sift_base.fvecs \
-            --query-file data/raw/sift/sift_query.fvecs \
-            --dataset-name sift \
-            --data-dir "$BENCH_DATA_DIR" \
-            --concurrency 2 \
-            --no-recall \
-            --save-summary results/bench_c2.json
-
-      - name: Benchmark concurrency=4
-        run: |
-          ./target/release/bench \
+            --mode search \
             --base-file  data/raw/sift/sift_base.fvecs \
             --query-file data/raw/sift/sift_query.fvecs \
             --dataset-name sift \
             --data-dir "$BENCH_DATA_DIR" \
             --concurrency 4 \
-            --no-recall \
-            --save-summary results/bench_c4.json
+            --num-queries 5000 \
+            --warmup-queries 500 \
+            --save-summary results/bench_search.json
 
-      - name: Benchmark concurrency=8
+      - name: Benchmark write-only durable (SIFT L2)
         run: |
           ./target/release/bench \
+            --mode write \
+            --base-file data/raw/sift/sift_base.fvecs \
+            --dataset-name sift \
+            --data-dir "$BENCH_DATA_DIR" \
+            --concurrency 1 \
+            --num-writes 5000 \
+            --warmup-writes 500 \
+            --save-summary results/bench_write_durable.json
+
+      - name: Benchmark write-only wait_visible (SIFT L2)
+        run: |
+          ./target/release/bench \
+            --mode write \
+            --base-file data/raw/sift/sift_base.fvecs \
+            --dataset-name sift \
+            --data-dir "$BENCH_DATA_DIR" \
+            --concurrency 1 \
+            --num-writes 5000 \
+            --warmup-writes 500 \
+            --wait-visible \
+            --save-summary results/bench_write_visible.json
+
+      - name: Benchmark mix 80/20 (SIFT L2)
+        run: |
+          ./target/release/bench \
+            --mode mix \
             --base-file  data/raw/sift/sift_base.fvecs \
             --query-file data/raw/sift/sift_query.fvecs \
             --dataset-name sift \
             --data-dir "$BENCH_DATA_DIR" \
-            --concurrency 8 \
-            --no-recall \
-            --save-summary results/bench_c8.json
-
-      - name: Benchmark concurrency=16
-        run: |
-          ./target/release/bench \
-            --base-file  data/raw/sift/sift_base.fvecs \
-            --query-file data/raw/sift/sift_query.fvecs \
-            --dataset-name sift \
-            --data-dir "$BENCH_DATA_DIR" \
-            --concurrency 16 \
-            --no-recall \
-            --save-summary results/bench_c16.json
+            --concurrency 4 \
+            --num-ops 5000 \
+            --warmup-ops 500 \
+            --read-write-ratio 0.8 \
+            --save-summary results/bench_mix_80_20.json
 
       - name: Print summary
         run: |
@@ -112,17 +113,43 @@ jobs:
             echo "|---|---|---|"
             echo "| $(date -u '+%Y-%m-%d %H:%M UTC') | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) | [#$GITHUB_RUN_NUMBER]($RUN_URL) |"
             echo ""
-            echo "| concurrency | QPS | avg_ms | p50_ms | p95_ms | p99_ms | recall |"
-            echo "|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for f in results/bench_c*.json; do
-            python3 - "$f" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'EOF'
           import json, sys
-          d = json.load(open(sys.argv[1]))
+
+          workloads = [
+              ("search-only",        "results/bench_search.json"),
+              ("write-only durable", "results/bench_write_durable.json"),
+              ("write-only visible", "results/bench_write_visible.json"),
+              ("mix 80/20",          "results/bench_mix_80_20.json"),
+          ]
+
+          # --- search ---
+          print("### Search-only")
+          print("| QPS | avg_ms | p50_ms | p95_ms | p99_ms | recall |")
+          print("|---|---|---|---|---|---|")
+          d = json.load(open("results/bench_search.json"))
           recall = f"{d['avg_recall_at_k']:.4f}" if d.get('avg_recall_at_k') is not None else "-"
-          print(f"| {d['concurrency']} | {d['throughput_qps']:.1f} | {d['avg_latency_ms']:.2f} | {d['p50_latency_ms']:.2f} | {d['p95_latency_ms']:.2f} | {d['p99_latency_ms']:.2f} | {recall} |")
+          print(f"| {d['throughput_qps']:.1f} | {d['avg_latency_ms']:.2f} | {d['p50_latency_ms']:.2f} | {d['p95_latency_ms']:.2f} | {d['p99_latency_ms']:.2f} | {recall} |")
+          print("")
+
+          # --- writes ---
+          print("### Write-only")
+          print("| mode | ops/s | avg_ms | p50_ms | p95_ms | p99_ms |")
+          print("|---|---|---|---|---|---|")
+          for label, path in [("durable", "results/bench_write_durable.json"), ("wait_visible", "results/bench_write_visible.json")]:
+              d = json.load(open(path))
+              print(f"| {label} | {d['throughput_ops']:.1f} | {d['avg_latency_ms']:.2f} | {d['p50_latency_ms']:.2f} | {d['p95_latency_ms']:.2f} | {d['p99_latency_ms']:.2f} |")
+          print("")
+
+          # --- mix ---
+          print("### Mix 80/20")
+          print("| ops/s | read_avg_ms | write_avg_ms | read_ops | write_ops |")
+          print("|---|---|---|---|---|")
+          d = json.load(open("results/bench_mix_80_20.json"))
+          print(f"| {d['throughput_ops']:.1f} | {d['read_avg_latency_ms']:.2f} | {d['write_avg_latency_ms']:.2f} | {d['total_read_ops']} | {d['total_write_ops']} |")
           EOF
-          done
 
       - name: Upload results
         uses: actions/upload-artifact@v6
@@ -140,7 +167,7 @@ jobs:
         run: |
           mkdir -p gh-pages/data
           python3 - <<'EOF'
-          import json, os, glob
+          import json, os, datetime
 
           history_path = "gh-pages/data/benchmark.json"
           history = []
@@ -148,25 +175,56 @@ jobs:
               with open(history_path) as f:
                   history = json.load(f)
 
+          def load(path):
+              try:
+                  return json.load(open(path))
+              except FileNotFoundError:
+                  return None
+
+          d_search  = load("results/bench_search.json")
+          d_durable = load("results/bench_write_durable.json")
+          d_visible = load("results/bench_write_visible.json")
+          d_mix     = load("results/bench_mix_80_20.json")
+
           run_entry = {
-              "date": os.environ["GITHUB_RUN_STARTED_AT"] if "GITHUB_RUN_STARTED_AT" in os.environ else __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "date": os.environ.get("GITHUB_RUN_STARTED_AT", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")),
               "commit": os.environ["GITHUB_SHA"][:7],
               "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
               "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
-              "results": [],
+              "workloads": {},
           }
 
-          for path in sorted(glob.glob("results/bench_c*.json")):
-              d = json.load(open(path))
-              run_entry["results"].append({
-                  "concurrency": d["concurrency"],
-                  "throughput_qps": d["throughput_qps"],
-                  "avg_latency_ms": d["avg_latency_ms"],
-                  "p50_latency_ms": d["p50_latency_ms"],
-                  "p95_latency_ms": d["p95_latency_ms"],
-                  "p99_latency_ms": d["p99_latency_ms"],
-                  "avg_recall_at_k": d.get("avg_recall_at_k"),
-              })
+          if d_search:
+              run_entry["workloads"]["search_only"] = {
+                  "concurrency": d_search["concurrency"],
+                  "throughput_qps": d_search["throughput_qps"],
+                  "avg_latency_ms": d_search["avg_latency_ms"],
+                  "p50_latency_ms": d_search["p50_latency_ms"],
+                  "p95_latency_ms": d_search["p95_latency_ms"],
+                  "p99_latency_ms": d_search["p99_latency_ms"],
+                  "avg_recall_at_k": d_search.get("avg_recall_at_k"),
+              }
+
+          for key, d in [("write_durable", d_durable), ("write_visible", d_visible)]:
+              if d:
+                  run_entry["workloads"][key] = {
+                      "concurrency": d["concurrency"],
+                      "throughput_ops": d["throughput_ops"],
+                      "avg_latency_ms": d["avg_latency_ms"],
+                      "p50_latency_ms": d["p50_latency_ms"],
+                      "p95_latency_ms": d["p95_latency_ms"],
+                      "p99_latency_ms": d["p99_latency_ms"],
+                  }
+
+          if d_mix:
+              run_entry["workloads"]["mix_80_20"] = {
+                  "concurrency": d_mix["concurrency"],
+                  "throughput_ops": d_mix["throughput_ops"],
+                  "read_avg_latency_ms": d_mix["read_avg_latency_ms"],
+                  "write_avg_latency_ms": d_mix["write_avg_latency_ms"],
+                  "total_read_ops": d_mix["total_read_ops"],
+                  "total_write_ops": d_mix["total_write_ops"],
+              }
 
           history.append(run_entry)
           history = history[-100:]  # keep last 100 runs
