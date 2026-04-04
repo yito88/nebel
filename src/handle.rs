@@ -196,17 +196,17 @@ impl CollectionInner {
 }
 
 // ---------------------------------------------------------------------------
-// CompactionApplyWorkerGuard
+// CompactionWorkerGuard
 // ---------------------------------------------------------------------------
 
 /// Joins the background compaction coordinator when the last `CollectionHandle` drops.
-struct CompactionApplyWorkerGuard {
+struct CompactionWorkerGuard {
     shutdown: Arc<AtomicBool>,
     notify: PendingNotify,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
-impl Drop for CompactionApplyWorkerGuard {
+impl Drop for CompactionWorkerGuard {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         {
@@ -231,7 +231,7 @@ pub struct CollectionHandle {
     /// released deterministically before `Storage` is freed.
     _guard: Arc<ApplyWorkerGuard>,
     /// Dropped before `inner` — joins the compaction coordinator thread.
-    _compaction_guard: Arc<CompactionApplyWorkerGuard>,
+    _compaction_guard: Arc<CompactionWorkerGuard>,
     pub(crate) inner: Arc<CollectionInner>,
 }
 
@@ -259,7 +259,7 @@ impl CollectionHandle {
         let compact_handle = thread::spawn(move || {
             crate::compaction::compaction_worker_loop(weak2, compact_notify2, compact_shutdown2)
         });
-        let compaction_guard = Arc::new(CompactionApplyWorkerGuard {
+        let compaction_guard = Arc::new(CompactionWorkerGuard {
             shutdown: compact_shutdown,
             notify: compact_notify,
             handle: Mutex::new(Some(compact_handle)),
