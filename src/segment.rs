@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use hnsw_rs::prelude::*;
 
-use crate::types::{InternalId, Metric, SegId, SegmentMeta, SegmentParams, SegmentState};
+use crate::types::{InternalId, Level, Metric, SegId, SegmentMeta, SegmentParams, SegmentState};
 
 const MAX_ELEMENTS: usize = 1_000_000;
 const MAX_LAYER: usize = 16;
@@ -114,8 +114,8 @@ struct SegMeta {
     seg_id: SegId,
     num_vectors: usize,
     dir: PathBuf,
-    /// Compaction level. 0 = L0 (freshly sealed). Only meaningful for sealed segments.
-    level: u8,
+    /// Compaction level. Only meaningful for sealed segments.
+    level: Level,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +151,7 @@ impl WritableSegment {
                 seg_id,
                 num_vectors: 0,
                 dir,
-                level: 0,
+                level: Level::ZERO,
             },
             index,
             ef_search: params.ef_search,
@@ -178,7 +178,7 @@ impl WritableSegment {
                 seg_id,
                 num_vectors,
                 dir,
-                level: 0,
+                level: Level::ZERO,
             },
             index,
             ef_search: params.ef_search,
@@ -199,7 +199,7 @@ impl WritableSegment {
     /// Non-consuming seal: persist the index to disk and return a new `SealedSegment`
     /// while keeping this `WritableSegment` intact for ongoing searches.
     /// `level` is the compaction level to assign to the resulting sealed segment.
-    pub(crate) fn persist_as_sealed(&self, level: u8) -> Result<SealedSegment> {
+    pub(crate) fn persist_as_sealed(&self, level: Level) -> Result<SealedSegment> {
         let metric = self.index.metric();
         self.index.file_dump(&self.meta.dir, INDEX_BASENAME)?;
         let (index, index_io) = load_index(&self.meta.dir, &metric)?;
@@ -351,7 +351,7 @@ impl SealedSegment {
         num_vectors: usize,
         metric: &Metric,
         ef_search: usize,
-        level: u8,
+        level: Level,
         tombstone_count: usize,
     ) -> Result<Self> {
         let (index, index_io) = load_index(&dir, metric)?;

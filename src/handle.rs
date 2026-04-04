@@ -22,7 +22,7 @@ use crate::{
     snapshot::{CollectionSnapshot, SegmentSnapshot},
     storage::Storage,
     types::{
-        CollectionId, CollectionSchema, InternalId, Manifest, SearchHit, SegId,
+        CollectionId, CollectionSchema, InternalId, Level, Manifest, SearchHit, SegId,
         SegmentMeta, SegmentState, VectorEntry, WriteToken,
     },
     wal::{ApplyCursor, Wal, WalId, WalOp, WalRecord},
@@ -423,7 +423,7 @@ impl CollectionHandle {
                     num_vectors,
                     state: SegmentState::Writable,
                     tombstone_count: 0,
-                    level: 0,
+                    level: Level::ZERO,
                 },
                 &entries,
             )?;
@@ -724,7 +724,7 @@ pub(crate) fn apply_entry(
                     num_vectors,
                     state: SegmentState::Writable,
                     tombstone_count: 0,
-                    level: 0,
+                    level: Level::ZERO,
                 },
                 &[VectorEntry {
                     doc_id: doc_id.as_str(),
@@ -759,7 +759,7 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
 
     let num_vectors = state.writable_seg.read().unwrap().num_vectors();
     // Newly sealed segments are always L0.
-    let sealed = state.writable_seg.read().unwrap().persist_as_sealed(0)?;
+    let sealed = state.writable_seg.read().unwrap().persist_as_sealed(Level::ZERO)?;
     let sealed_arc = Arc::new(sealed);
 
     let new_ws = WritableSegment::create(
@@ -782,7 +782,7 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
             num_vectors,
             state: SegmentState::Sealed,
             tombstone_count: 0,
-            level: 0,
+            level: Level::ZERO,
         },
         &SegmentMeta::new(new_id),
         &state.manifest,

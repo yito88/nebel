@@ -12,8 +12,9 @@ use anyhow::Result;
 use crate::{
     handle::{CollectionInner, PendingNotify},
     segment::{SealedSegment, WritableSegment},
+    snapshot::SegmentSnapshot,
     storage::CompactionEntry,
-    types::{InternalId, Manifest, SegId, SegmentMeta, SegmentState},
+    types::{InternalId, Level, Manifest, SegId, SegmentMeta, SegmentState},
 };
 
 // How long the compaction coordinator sleeps between checks when idle.
@@ -29,7 +30,7 @@ pub(crate) struct SegmentInfo {
     pub seg_id: SegId,
     pub num_vectors: usize,
     pub tombstone_count: usize,
-    pub level: u8,
+    pub level: Level,
 }
 
 impl SegmentInfo {
@@ -50,11 +51,6 @@ impl SegmentInfo {
 // Trigger evaluation
 // ---------------------------------------------------------------------------
 
-/// Level capacity multipliers: level `l` holds up to `capacity * 2^l` vectors.
-fn level_capacity(base_capacity: usize, level: usize) -> usize {
-    base_capacity * (1 << level)
-}
-
 /// Returns the set of levels that are eligible for compaction.
 ///
 /// For levels 0..top-1: triggers when `segment_count >= threshold` OR
@@ -65,17 +61,17 @@ pub(crate) fn evaluate_triggers(
     num_levels: usize,
     level_count_thresholds: &[usize],
     tombstone_threshold: f64,
-) -> Vec<usize> {
-    let top = num_levels.saturating_sub(1);
+) -> Vec<Level> {
     let mut eligible = Vec::new();
 
-    for level in 0..num_levels {
-        let at_level: Vec<&SegmentInfo> = infos.iter().filter(|s| s.level as usize == level).collect();
+    for i in 0..num_levels {
+        let level = Level::new(i as u8);
+        let at_level: Vec<&SegmentInfo> = infos.iter().filter(|s| s.level == level).collect();
         if at_level.is_empty() {
             continue;
         }
-        let threshold = level_count_thresholds.get(level).copied().unwrap_or(usize::MAX);
-        let count_trigger = level < top && at_level.len() >= threshold;
+        let threshold = level_count_thresholds.get(i).copied().unwrap_or(usize::MAX);
+        let count_trigger = !level.is_top(num_levels) && at_level.len() >= threshold;
         let tombstone_trigger = at_level.iter().any(|s| s.tombstone_ratio() > tombstone_threshold);
 
         if count_trigger || tombstone_trigger {
@@ -93,23 +89,16 @@ pub(crate) fn evaluate_triggers(
 ///
 /// Returns an empty Vec if not enough segments can be gathered to justify a merge.
 pub(crate) fn select_candidates(
-    level: usize,
+    level: Level,
     infos: &[SegmentInfo],
     base_capacity: usize,
     num_levels: usize,
     packing_fill_factor: f64,
 ) -> Vec<SegId> {
-    let top = num_levels.saturating_sub(1);
-    // For the top level, "next level" = same level (tombstone cleanup).
-    let target_capacity = if level < top {
-        level_capacity(base_capacity, level + 1)
-    } else {
-        level_capacity(base_capacity, level)
-    };
-    let target_live = (target_capacity as f64 * packing_fill_factor) as usize;
+    let target_live = (level.output(num_levels).capacity(base_capacity) as f64 * packing_fill_factor) as usize;
 
     let mut at_level: Vec<&SegmentInfo> =
-        infos.iter().filter(|s| s.level as usize == level).collect();
+        infos.iter().filter(|s| s.level == level).collect();
 
     // Sort: tombstone_ratio desc, seg_id asc (older first as tie-breaker).
     at_level.sort_by(|a, b| {
@@ -160,7 +149,7 @@ pub(crate) fn run_merge(
     inner: &CollectionInner,
     input_segs: Vec<Arc<SealedSegment>>,
     new_seg_id: SegId,
-    output_level: u8,
+    output_level: Level,
 ) -> Result<(SealedSegment, SegmentMeta, Vec<CompactionEntry>)> {
     let id = &inner.id;
     let storage = &*inner.storage;
@@ -249,65 +238,61 @@ fn apply_compaction_result(
 
 fn run_level_compaction(
     inner: Arc<CollectionInner>,
-    level: usize,
+    level: Level,
     level_busy: Arc<Vec<AtomicBool>>,
 ) {
     let schema = Arc::clone(&inner.schema);
     let storage = Arc::clone(&inner.storage);
     let id = inner.id.clone();
     let num_levels = schema.compaction_params.num_levels;
-    let top = num_levels.saturating_sub(1);
 
-    // Snapshot current sealed segment info under lock.
-    let (seg_infos, input_seg_arcs, new_seg_id) = {
-        let mut state = inner.apply_state.lock().unwrap();
-
-        // Build SegmentInfo list from in-memory segment metadata.
-        let mut infos: Vec<SegmentInfo> = Vec::new();
-        for ss in &state.sealed_segs {
-            let m = ss.meta();
-            infos.push(SegmentInfo {
+    // Build SegmentInfo from the published snapshot (read lock only).
+    let infos: Vec<SegmentInfo> = {
+        let snap = Arc::clone(&*inner.snapshot.read().unwrap());
+        snap.segs
+            .iter()
+            .filter_map(|s| match s {
+                SegmentSnapshot::Sealed(ss) => Some(ss.meta()),
+                _ => None,
+            })
+            .map(|m| SegmentInfo {
                 seg_id: m.seg_id,
                 num_vectors: m.num_vectors,
                 tombstone_count: m.tombstone_count,
                 level: m.level,
-            });
-        }
+            })
+            .collect()
+    };
 
-        let candidates = select_candidates(
-            level,
-            &infos,
-            schema.segment_params.segment_capacity,
-            num_levels,
-            schema.compaction_params.packing_fill_factor,
-        );
-        if candidates.is_empty() {
-            drop(state);
-            level_busy[level].store(false, Ordering::Release);
-            return;
-        }
+    let candidates = select_candidates(
+        level,
+        &infos,
+        schema.segment_params.segment_capacity,
+        num_levels,
+        schema.compaction_params.packing_fill_factor,
+    );
+    if candidates.is_empty() {
+        level_busy[level.as_usize()].store(false, Ordering::Release);
+        return;
+    }
 
+    // Claim input segment Arcs and allocate a new seg_id under the apply_state lock.
+    let (input_seg_arcs, new_seg_id) = {
         let candidate_set: std::collections::HashSet<SegId> =
             candidates.iter().copied().collect();
+        let mut state = inner.apply_state.lock().unwrap();
         let input_arcs: Vec<Arc<SealedSegment>> = state
             .sealed_segs
             .iter()
             .filter(|s| candidate_set.contains(&s.seg_id()))
             .map(Arc::clone)
             .collect();
-
         let new_id = state.manifest.next_seg_id;
         state.manifest.next_seg_id = new_id.next();
-
-        (infos, input_arcs, new_id)
+        (input_arcs, new_id)
     };
 
-    // Determine output level.
-    let output_level = if level < top {
-        (level + 1).min(top) as u8
-    } else {
-        level as u8
-    };
+    let output_level = level.output(num_levels);
 
     // Run the merge (no lock held).
     let removed_seg_ids: Vec<SegId> = input_seg_arcs.iter().map(|s| s.seg_id()).collect();
@@ -316,8 +301,8 @@ fn run_level_compaction(
     let (new_sealed, new_seg_meta, compaction_entries) = match merge_result {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[compaction] merge failed at level {}: {}", level, e);
-            level_busy[level].store(false, Ordering::Release);
+            eprintln!("[compaction] merge failed at {}: {}", level, e);
+            level_busy[level.as_usize()].store(false, Ordering::Release);
             return;
         }
     };
@@ -350,16 +335,15 @@ fn run_level_compaction(
         &compaction_entries,
         &removed_seg_ids,
     ) {
-        eprintln!("[compaction] commit_compaction failed at level {}: {}", level, e);
-        level_busy[level].store(false, Ordering::Release);
+        eprintln!("[compaction] commit_compaction failed at {}: {}", level, e);
+        level_busy[level.as_usize()].store(false, Ordering::Release);
         return;
     }
 
     // Update in-memory state.
     apply_compaction_result(&inner, new_sealed, &new_seg_meta, &removed_seg_ids, new_manifest);
 
-    let _ = seg_infos; // consumed above
-    level_busy[level].store(false, Ordering::Release);
+    level_busy[level.as_usize()].store(false, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -396,20 +380,20 @@ pub(crate) fn compaction_worker_loop(
         let num_levels = schema.compaction_params.num_levels;
         let level_busy = Arc::clone(&inner.level_busy);
 
-        // Snapshot segment infos under lock.
+        // Snapshot segment infos from the published snapshot (read lock only).
         let infos: Vec<SegmentInfo> = {
-            let state = inner.apply_state.lock().unwrap();
-            state
-                .sealed_segs
+            let snap = Arc::clone(&*inner.snapshot.read().unwrap());
+            snap.segs
                 .iter()
-                .map(|ss| {
-                    let m = ss.meta();
-                    SegmentInfo {
-                        seg_id: m.seg_id,
-                        num_vectors: m.num_vectors,
-                        tombstone_count: m.tombstone_count,
-                        level: m.level,
-                    }
+                .filter_map(|s| match s {
+                    SegmentSnapshot::Sealed(ss) => Some(ss.meta()),
+                    _ => None,
+                })
+                .map(|m| SegmentInfo {
+                    seg_id: m.seg_id,
+                    num_vectors: m.num_vectors,
+                    tombstone_count: m.tombstone_count,
+                    level: m.level,
                 })
                 .collect()
         };
@@ -424,11 +408,12 @@ pub(crate) fn compaction_worker_loop(
 
         // For each eligible level not already compacting, spawn a thread.
         for level in eligible {
-            if level >= level_busy.len() {
+            let idx = level.as_usize();
+            if idx >= level_busy.len() {
                 continue;
             }
             // Try to claim the level.
-            if level_busy[level]
+            if level_busy[idx]
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
