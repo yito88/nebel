@@ -43,7 +43,7 @@ jobs:
         run: bash scripts/download_sift.sh
 
       - name: Build verify binary
-        run: cargo build --release --bin verify
+        run: cargo build --release --bin verify --features testing
 
       - name: Run verification
         run: |
