@@ -22,8 +22,8 @@ use crate::{
     snapshot::{CollectionSnapshot, SegmentSnapshot},
     storage::Storage,
     types::{
-        CollectionId, CollectionSchema, InternalId, Manifest, SearchHit, SegId, SegmentMeta,
-        SegmentState, VectorEntry, WriteToken,
+        CollectionId, CollectionSchema, InternalId, Manifest, SearchHit, SegId,
+        SegmentMeta, SegmentState, VectorEntry, WriteToken,
     },
     wal::{ApplyCursor, Wal, WalId, WalOp, WalRecord},
 };
@@ -94,9 +94,14 @@ pub(crate) struct CollectionInner {
     pub(crate) apply_state: Mutex<ApplyState>,
     pub(crate) snapshot: RwLock<Arc<CollectionSnapshot>>,
     pub(crate) wal: Mutex<Wal>,
-    /// Shared with the worker thread — worker waits on this without holding
+    /// Shared with the apply worker thread — worker waits on this without holding
     /// an Arc<CollectionInner>, so the database can be freed promptly on drop.
     pub(crate) notify: PendingNotify,
+    /// Shared with the compaction worker — notified after each seal.
+    pub(crate) compaction_notify: PendingNotify,
+    /// Per-level in-progress flags. Prevents concurrent merges at the same level.
+    /// Length == `schema.compaction_params.num_levels`.
+    pub(crate) level_busy: Arc<Vec<AtomicBool>>,
     pub(crate) next_seq: AtomicU64,
     /// Highest seq that has been fsync'd to WAL. Updated by writers after sync_all.
     /// The apply worker only processes records up to this value.
@@ -130,6 +135,12 @@ impl CollectionInner {
             schema: Arc::clone(&schema),
             segs: initial_segs,
         });
+        let num_levels = schema.compaction_params.num_levels;
+        let level_busy = Arc::new(
+            (0..num_levels)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
         Ok(Arc::new(Self {
             id,
             schema,
@@ -144,6 +155,8 @@ impl CollectionInner {
             snapshot: RwLock::new(initial_snap),
             wal: Mutex::new(wal),
             notify: Arc::new((Mutex::new(false), Condvar::new())),
+            compaction_notify: Arc::new((Mutex::new(false), Condvar::new())),
+            level_busy,
             // Start at applied_seq + 1 so first WAL record gets seq > applied_seq.
             next_seq: AtomicU64::new(applied_seq + 1),
             // durable_seq starts at applied_seq: after recovery WAL is empty, so the
@@ -183,20 +196,48 @@ impl CollectionInner {
 }
 
 // ---------------------------------------------------------------------------
+// CompactionWorkerGuard
+// ---------------------------------------------------------------------------
+
+/// Joins the background compaction coordinator when the last `CollectionHandle` drops.
+struct CompactionWorkerGuard {
+    shutdown: Arc<AtomicBool>,
+    notify: PendingNotify,
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for CompactionWorkerGuard {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        {
+            let mut pending = self.notify.0.lock().unwrap();
+            *pending = true;
+        }
+        self.notify.1.notify_one();
+        if let Some(h) = self.handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CollectionHandle
 // ---------------------------------------------------------------------------
 
 /// Cheaply cloneable handle to a collection. Spawns a background apply worker on creation.
 #[derive(Clone)]
 pub struct CollectionHandle {
-    /// Dropped before `inner` — joins the worker thread so the redb lock is
+    /// Dropped before `inner` — joins the apply worker thread so the redb lock is
     /// released deterministically before `Storage` is freed.
     _guard: Arc<WorkerGuard>,
+    /// Dropped before `inner` — joins the compaction coordinator thread.
+    _compaction_guard: Arc<CompactionWorkerGuard>,
     pub(crate) inner: Arc<CollectionInner>,
 }
 
 impl CollectionHandle {
     pub(crate) fn from_arc(inner: Arc<CollectionInner>) -> Self {
+        // Spawn apply worker.
         let notify = Arc::clone(&inner.notify);
         let shutdown = Arc::new(AtomicBool::new(false));
         let weak = Arc::downgrade(&inner);
@@ -208,8 +249,25 @@ impl CollectionHandle {
             notify,
             handle: Mutex::new(Some(handle)),
         });
+
+        // Spawn compaction coordinator.
+        let compact_notify = Arc::clone(&inner.compaction_notify);
+        let compact_shutdown = Arc::new(AtomicBool::new(false));
+        let weak2 = Arc::downgrade(&inner);
+        let compact_shutdown2 = Arc::clone(&compact_shutdown);
+        let compact_notify2 = Arc::clone(&compact_notify);
+        let compact_handle = thread::spawn(move || {
+            crate::compaction::compaction_worker_loop(weak2, compact_notify2, compact_shutdown2)
+        });
+        let compaction_guard = Arc::new(CompactionWorkerGuard {
+            shutdown: compact_shutdown,
+            notify: compact_notify,
+            handle: Mutex::new(Some(compact_handle)),
+        });
+
         Self {
             _guard: guard,
+            _compaction_guard: compaction_guard,
             inner,
         }
     }
@@ -364,6 +422,8 @@ impl CollectionHandle {
                     seg_id,
                     num_vectors,
                     state: SegmentState::Writable,
+                    tombstone_count: 0,
+                    level: 0,
                 },
                 &entries,
             )?;
@@ -663,6 +723,8 @@ pub(crate) fn apply_entry(
                     seg_id,
                     num_vectors,
                     state: SegmentState::Writable,
+                    tombstone_count: 0,
+                    level: 0,
                 },
                 &[VectorEntry {
                     doc_id: doc_id.as_str(),
@@ -696,7 +758,8 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
     let new_dir = inner.seg_dir(new_id);
 
     let num_vectors = state.writable_seg.read().unwrap().num_vectors();
-    let sealed = state.writable_seg.read().unwrap().persist_as_sealed()?;
+    // Newly sealed segments are always L0.
+    let sealed = state.writable_seg.read().unwrap().persist_as_sealed(0)?;
     let sealed_arc = Arc::new(sealed);
 
     let new_ws = WritableSegment::create(
@@ -718,10 +781,15 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
             seg_id: old_id,
             num_vectors,
             state: SegmentState::Sealed,
+            tombstone_count: 0,
+            level: 0,
         },
         &SegmentMeta::new(new_id),
         &state.manifest,
     )?;
+
+    // Notify the compaction worker that a new sealed segment is available.
+    notify_worker(&inner.compaction_notify);
 
     Ok(())
 }

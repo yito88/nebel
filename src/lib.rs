@@ -1,5 +1,6 @@
 #[cfg(feature = "testing")]
 pub mod dataset;
+mod compaction;
 pub mod db;
 #[cfg(feature = "testing")]
 pub mod eval;

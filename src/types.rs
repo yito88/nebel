@@ -2,6 +2,42 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// CompactionParams
+// ---------------------------------------------------------------------------
+
+const DEFAULT_NUM_LEVELS: usize = 4;
+const DEFAULT_COUNT_THRESHOLDS: [usize; 4] = [4, 8, 16, 32];
+const DEFAULT_TOMBSTONE_THRESHOLD: f64 = 0.2;
+const DEFAULT_PACKING_FILL_FACTOR: f64 = 0.8;
+
+/// Policy parameters for the tiered compaction worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionParams {
+    /// Number of compaction levels (L0 = ingest level, top level = highest).
+    pub num_levels: usize,
+    /// Minimum sealed segment count per level before the count-trigger fires.
+    /// `level_count_thresholds[i]` is the threshold for level `i`.
+    /// Length must equal `num_levels`.
+    pub level_count_thresholds: Vec<usize>,
+    /// Tombstone ratio above which a level becomes eligible for compaction.
+    pub tombstone_threshold: f64,
+    /// Target fill factor: accumulate input segments until
+    /// `live_vectors >= next_level_capacity * packing_fill_factor`.
+    pub packing_fill_factor: f64,
+}
+
+impl Default for CompactionParams {
+    fn default() -> Self {
+        Self {
+            num_levels: DEFAULT_NUM_LEVELS,
+            level_count_thresholds: DEFAULT_COUNT_THRESHOLDS.to_vec(),
+            tombstone_threshold: DEFAULT_TOMBSTONE_THRESHOLD,
+            packing_fill_factor: DEFAULT_PACKING_FILL_FACTOR,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SegId(u32);
 
@@ -124,6 +160,8 @@ pub struct CollectionSchema {
     pub dimension: usize,
     pub metric: Metric,
     pub segment_params: SegmentParams,
+    #[serde(default)]
+    pub compaction_params: CompactionParams,
 }
 
 impl CollectionSchema {
@@ -134,6 +172,7 @@ impl CollectionSchema {
             dimension,
             metric,
             segment_params: SegmentParams::default(),
+            compaction_params: CompactionParams::default(),
         }
     }
 }
@@ -156,6 +195,14 @@ pub struct SegmentMeta {
     pub seg_id: SegId,
     pub num_vectors: usize,
     pub state: SegmentState,
+    /// Number of tombstoned entries in this segment.
+    /// Incremented atomically with each tombstone write; avoids table scans.
+    #[serde(default)]
+    pub tombstone_count: usize,
+    /// Compaction level: 0 = L0 (freshly sealed), incremented on each promotion.
+    /// The top level compacts within itself.
+    #[serde(default)]
+    pub level: u8,
 }
 
 impl SegmentMeta {
@@ -164,6 +211,8 @@ impl SegmentMeta {
             seg_id,
             num_vectors: 0,
             state: SegmentState::Writable,
+            tombstone_count: 0,
+            level: 0,
         }
     }
 }

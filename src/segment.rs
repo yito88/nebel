@@ -114,6 +114,8 @@ struct SegMeta {
     seg_id: SegId,
     num_vectors: usize,
     dir: PathBuf,
+    /// Compaction level. 0 = L0 (freshly sealed). Only meaningful for sealed segments.
+    level: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +151,7 @@ impl WritableSegment {
                 seg_id,
                 num_vectors: 0,
                 dir,
+                level: 0,
             },
             index,
             ef_search: params.ef_search,
@@ -175,6 +178,7 @@ impl WritableSegment {
                 seg_id,
                 num_vectors,
                 dir,
+                level: 0,
             },
             index,
             ef_search: params.ef_search,
@@ -194,7 +198,8 @@ impl WritableSegment {
 
     /// Non-consuming seal: persist the index to disk and return a new `SealedSegment`
     /// while keeping this `WritableSegment` intact for ongoing searches.
-    pub(crate) fn persist_as_sealed(&self) -> Result<SealedSegment> {
+    /// `level` is the compaction level to assign to the resulting sealed segment.
+    pub(crate) fn persist_as_sealed(&self, level: u8) -> Result<SealedSegment> {
         let metric = self.index.metric();
         self.index.file_dump(&self.meta.dir, INDEX_BASENAME)?;
         let (index, index_io) = load_index(&self.meta.dir, &metric)?;
@@ -203,6 +208,7 @@ impl WritableSegment {
                 seg_id: self.meta.seg_id,
                 num_vectors: self.meta.num_vectors,
                 dir: self.meta.dir.clone(),
+                level,
             },
             index,
             ef_search: self.ef_search,
@@ -331,6 +337,10 @@ impl SealedSegment {
         self.meta.num_vectors
     }
 
+    pub fn level(&self) -> u8 {
+        self.meta.level
+    }
+
     /// Open an existing sealed segment by loading the persisted index.
     pub fn open(
         seg_id: SegId,
@@ -338,6 +348,7 @@ impl SealedSegment {
         num_vectors: usize,
         metric: &Metric,
         ef_search: usize,
+        level: u8,
     ) -> Result<Self> {
         let (index, index_io) = load_index(&dir, metric)?;
         Ok(Self {
@@ -345,6 +356,7 @@ impl SealedSegment {
                 seg_id,
                 num_vectors,
                 dir,
+                level,
             },
             index,
             ef_search,
