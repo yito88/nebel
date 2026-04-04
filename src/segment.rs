@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use hnsw_rs::prelude::*;
 
-use crate::types::{InternalId, Metric, SegId, SegmentParams};
+use crate::types::{InternalId, Metric, SegId, SegmentMeta, SegmentParams, SegmentState};
 
 const MAX_ELEMENTS: usize = 1_000_000;
 const MAX_LAYER: usize = 16;
@@ -204,12 +204,14 @@ impl WritableSegment {
         self.index.file_dump(&self.meta.dir, INDEX_BASENAME)?;
         let (index, index_io) = load_index(&self.meta.dir, &metric)?;
         Ok(SealedSegment {
-            meta: SegMeta {
+            meta: SegmentMeta {
                 seg_id: self.meta.seg_id,
                 num_vectors: self.meta.num_vectors,
-                dir: self.meta.dir.clone(),
+                state: SegmentState::Sealed,
+                tombstone_count: 0,
                 level,
             },
+            dir: self.meta.dir.clone(),
             index,
             ef_search: self.ef_search,
             index_io,
@@ -321,7 +323,8 @@ impl WritableSegment {
 
 /// A read-only segment whose HNSW index has been persisted to disk and memory-mapped.
 pub struct SealedSegment {
-    meta: SegMeta,
+    meta: SegmentMeta,
+    dir: PathBuf,
     index: HnswIndex,
     ef_search: usize,
     #[allow(dead_code)]
@@ -337,8 +340,8 @@ impl SealedSegment {
         self.meta.num_vectors
     }
 
-    pub fn level(&self) -> u8 {
-        self.meta.level
+    pub fn meta(&self) -> &SegmentMeta {
+        &self.meta
     }
 
     /// Open an existing sealed segment by loading the persisted index.
@@ -349,15 +352,18 @@ impl SealedSegment {
         metric: &Metric,
         ef_search: usize,
         level: u8,
+        tombstone_count: usize,
     ) -> Result<Self> {
         let (index, index_io) = load_index(&dir, metric)?;
         Ok(Self {
-            meta: SegMeta {
+            meta: SegmentMeta {
                 seg_id,
                 num_vectors,
-                dir,
+                state: SegmentState::Sealed,
+                tombstone_count,
                 level,
             },
+            dir,
             index,
             ef_search,
             index_io,
@@ -379,7 +385,7 @@ impl SealedSegment {
         let record_size = dimension * 4;
         let offset = internal_id.as_usize() as u64 * record_size as u64;
         let mut buf = vec![0u8; record_size];
-        let path = self.meta.dir.join("vectors.seg");
+        let path = self.dir.join("vectors.seg");
         let file = fs::File::open(&path)?;
         file.read_exact_at(&mut buf, offset)?;
         Ok(bytes_to_f32(&buf))

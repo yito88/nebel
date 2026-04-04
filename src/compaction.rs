@@ -262,20 +262,15 @@ fn run_level_compaction(
     let (seg_infos, input_seg_arcs, new_seg_id) = {
         let mut state = inner.apply_state.lock().unwrap();
 
-        // Build SegmentInfo list by reading tombstone counts from storage.
+        // Build SegmentInfo list from in-memory segment metadata.
         let mut infos: Vec<SegmentInfo> = Vec::new();
         for ss in &state.sealed_segs {
-            let tc = storage
-                .get_segment(&id, ss.seg_id())
-                .ok()
-                .flatten()
-                .map(|m| m.tombstone_count)
-                .unwrap_or(0);
+            let m = ss.meta();
             infos.push(SegmentInfo {
-                seg_id: ss.seg_id(),
-                num_vectors: ss.num_vectors(),
-                tombstone_count: tc,
-                level: ss.level(),
+                seg_id: m.seg_id,
+                num_vectors: m.num_vectors,
+                tombstone_count: m.tombstone_count,
+                level: m.level,
             });
         }
 
@@ -398,8 +393,6 @@ pub(crate) fn compaction_worker_loop(
         *notify.0.lock().unwrap() = false;
 
         let schema = Arc::clone(&inner.schema);
-        let storage = Arc::clone(&inner.storage);
-        let id = inner.id.clone();
         let num_levels = schema.compaction_params.num_levels;
         let level_busy = Arc::clone(&inner.level_busy);
 
@@ -410,17 +403,12 @@ pub(crate) fn compaction_worker_loop(
                 .sealed_segs
                 .iter()
                 .map(|ss| {
-                    let tc = storage
-                        .get_segment(&id, ss.seg_id())
-                        .ok()
-                        .flatten()
-                        .map(|m| m.tombstone_count)
-                        .unwrap_or(0);
+                    let m = ss.meta();
                     SegmentInfo {
-                        seg_id: ss.seg_id(),
-                        num_vectors: ss.num_vectors(),
-                        tombstone_count: tc,
-                        level: ss.level(),
+                        seg_id: m.seg_id,
+                        num_vectors: m.num_vectors,
+                        tombstone_count: m.tombstone_count,
+                        level: m.level,
                     }
                 })
                 .collect()
