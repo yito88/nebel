@@ -43,19 +43,19 @@ const APPLY_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) type PendingNotify = Arc<(Mutex<bool>, Condvar)>;
 
 // ---------------------------------------------------------------------------
-// WorkerGuard
+// ApplyWorkerGuard
 // ---------------------------------------------------------------------------
 
 /// Joins the background apply worker when the last `CollectionHandle` drops.
 /// Declared before `inner` in `CollectionHandle` so Rust's field-drop order
 /// guarantees the thread exits before `CollectionInner` (and `Storage`) is freed.
-struct WorkerGuard {
+struct ApplyWorkerGuard {
     shutdown: Arc<AtomicBool>,
     notify: PendingNotify,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
-impl Drop for WorkerGuard {
+impl Drop for ApplyWorkerGuard {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         {
@@ -196,17 +196,17 @@ impl CollectionInner {
 }
 
 // ---------------------------------------------------------------------------
-// CompactionWorkerGuard
+// CompactionApplyWorkerGuard
 // ---------------------------------------------------------------------------
 
 /// Joins the background compaction coordinator when the last `CollectionHandle` drops.
-struct CompactionWorkerGuard {
+struct CompactionApplyWorkerGuard {
     shutdown: Arc<AtomicBool>,
     notify: PendingNotify,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
-impl Drop for CompactionWorkerGuard {
+impl Drop for CompactionApplyWorkerGuard {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         {
@@ -229,9 +229,9 @@ impl Drop for CompactionWorkerGuard {
 pub struct CollectionHandle {
     /// Dropped before `inner` — joins the apply worker thread so the redb lock is
     /// released deterministically before `Storage` is freed.
-    _guard: Arc<WorkerGuard>,
+    _guard: Arc<ApplyWorkerGuard>,
     /// Dropped before `inner` — joins the compaction coordinator thread.
-    _compaction_guard: Arc<CompactionWorkerGuard>,
+    _compaction_guard: Arc<CompactionApplyWorkerGuard>,
     pub(crate) inner: Arc<CollectionInner>,
 }
 
@@ -244,7 +244,7 @@ impl CollectionHandle {
         let shutdown2 = Arc::clone(&shutdown);
         let notify2 = Arc::clone(&notify);
         let handle = thread::spawn(move || apply_worker_loop(weak, notify2, shutdown2));
-        let guard = Arc::new(WorkerGuard {
+        let guard = Arc::new(ApplyWorkerGuard {
             shutdown,
             notify,
             handle: Mutex::new(Some(handle)),
@@ -259,7 +259,7 @@ impl CollectionHandle {
         let compact_handle = thread::spawn(move || {
             crate::compaction::compaction_worker_loop(weak2, compact_notify2, compact_shutdown2)
         });
-        let compaction_guard = Arc::new(CompactionWorkerGuard {
+        let compaction_guard = Arc::new(CompactionApplyWorkerGuard {
             shutdown: compact_shutdown,
             notify: compact_notify,
             handle: Mutex::new(Some(compact_handle)),
