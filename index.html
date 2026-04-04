@@ -50,17 +50,25 @@
   <div id="benchmark" class="tab active">
     <div class="charts">
       <div class="card">
-        <h3>Throughput (QPS) over time</h3>
-        <canvas id="qpsChart"></canvas>
+        <h3>Throughput over time</h3>
+        <canvas id="throughputChart"></canvas>
       </div>
       <div class="card">
         <h3>p95 Latency (ms) over time</h3>
         <canvas id="p95Chart"></canvas>
       </div>
     </div>
+    <div class="card" style="margin-bottom: 1.5rem">
+      <h3>Recent Runs — Search-only</h3>
+      <div id="benchTableSearch"></div>
+    </div>
+    <div class="card" style="margin-bottom: 1.5rem">
+      <h3>Recent Runs — Write-only</h3>
+      <div id="benchTableWrite"></div>
+    </div>
     <div class="card">
-      <h3>Recent Runs</h3>
-      <div id="benchTable"></div>
+      <h3>Recent Runs — Mix 80/20</h3>
+      <div id="benchTableMix"></div>
     </div>
   </div>
 
@@ -86,12 +94,22 @@
     }
 
     const COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#39c5cf'];
-    const CONCURRENCIES = [1, 2, 4, 8, 16];
+
+    const WORKLOADS = [
+      { key: 'search_only',    label: 'search-only',     throughputField: 'throughput_qps',  throughputLabel: 'QPS' },
+      { key: 'write_durable',  label: 'write durable',   throughputField: 'throughput_ops',  throughputLabel: 'ops/s' },
+      { key: 'write_visible',  label: 'write visible',   throughputField: 'throughput_ops',  throughputLabel: 'ops/s' },
+      { key: 'mix_80_20',      label: 'mix 80/20',       throughputField: 'throughput_ops',  throughputLabel: 'ops/s' },
+    ];
 
     function fmtDate(iso) {
       const d = new Date(iso);
       return d.toISOString().slice(0, 16).replace('T', ' ');
     }
+
+    function fmt1(v) { return v != null ? v.toFixed(1) : '-'; }
+    function fmt2(v) { return v != null ? v.toFixed(2) : '-'; }
+    function fmt4(v) { return v != null ? v.toFixed(4) : '-'; }
 
     async function loadJSON(path) {
       try {
@@ -104,39 +122,35 @@
     async function initBenchmark() {
       const history = await loadJSON('data/benchmark.json');
       if (!history.length) {
-        document.getElementById('benchTable').innerHTML = '<p class="empty">No benchmark data yet.</p>';
+        ['benchTableSearch', 'benchTableWrite', 'benchTableMix'].forEach(id => {
+          document.getElementById(id).innerHTML = '<p class="empty">No benchmark data yet.</p>';
+        });
         return;
       }
 
       const recent = history.slice(-30);
       const labels = recent.map(r => fmtDate(r.date));
 
-      // QPS chart — one line per concurrency
-      const qpsDatasets = CONCURRENCIES.map((c, i) => ({
-        label: `c=${c}`,
-        data: recent.map(r => {
-          const res = r.results.find(x => x.concurrency === c);
-          return res ? res.throughput_qps : null;
-        }),
+      // Throughput chart — one line per workload
+      const throughputDatasets = WORKLOADS.map((w, i) => ({
+        label: w.label,
+        data: recent.map(r => r.workloads?.[w.key]?.[w.throughputField] ?? null),
         borderColor: COLORS[i],
         backgroundColor: COLORS[i] + '22',
         tension: 0.3,
         spanGaps: true,
       }));
 
-      new Chart(document.getElementById('qpsChart'), {
+      new Chart(document.getElementById('throughputChart'), {
         type: 'line',
-        data: { labels, datasets: qpsDatasets },
-        options: chartOpts('QPS'),
+        data: { labels, datasets: throughputDatasets },
+        options: chartOpts('QPS / ops/s'),
       });
 
-      // p95 chart
-      const p95Datasets = CONCURRENCIES.map((c, i) => ({
-        label: `c=${c}`,
-        data: recent.map(r => {
-          const res = r.results.find(x => x.concurrency === c);
-          return res ? res.p95_latency_ms : null;
-        }),
+      // p95 latency chart — one line per workload
+      const p95Datasets = WORKLOADS.map((w, i) => ({
+        label: w.label,
+        data: recent.map(r => r.workloads?.[w.key]?.p95_latency_ms ?? null),
         borderColor: COLORS[i],
         backgroundColor: COLORS[i] + '22',
         tension: 0.3,
@@ -149,29 +163,59 @@
         options: chartOpts('ms'),
       });
 
-      // Table — most recent 20 runs, reversed
-      const rows = history.slice(-20).reverse().map(r => {
-        const byC = Object.fromEntries(r.results.map(x => [x.concurrency, x]));
-        const c1 = byC[1] || {};
+      const runLink = r => `<a href="${r.run_url}" target="_blank">#${r.run_number}</a>`;
+      const commitLink = r => `<a href="https://github.com/yito88/nebel/commit/${r.commit}" target="_blank">${r.commit}</a>`;
+      const recentRows = history.slice(-20).reverse();
+
+      // Search-only table
+      const searchRows = recentRows.map(r => {
+        const w = r.workloads?.search_only || {};
         return `<tr>
-          <td>${fmtDate(r.date)}</td>
-          <td><a href="${r.run_url}" target="_blank">#${r.run_number}</a></td>
-          <td><a href="https://github.com/yito88/nebel/commit/${r.commit}" target="_blank">${r.commit}</a></td>
-          <td>${c1.throughput_qps != null ? c1.throughput_qps.toFixed(1) : '-'}</td>
-          <td>${c1.avg_latency_ms != null ? c1.avg_latency_ms.toFixed(2) : '-'}</td>
-          <td>${c1.p95_latency_ms != null ? c1.p95_latency_ms.toFixed(2) : '-'}</td>
-          <td>${c1.avg_recall_at_k != null ? c1.avg_recall_at_k.toFixed(4) : '-'}</td>
+          <td>${fmtDate(r.date)}</td><td>${runLink(r)}</td><td>${commitLink(r)}</td>
+          <td>${fmt1(w.throughput_qps)}</td><td>${fmt2(w.avg_latency_ms)}</td>
+          <td>${fmt2(w.p95_latency_ms)}</td><td>${fmt2(w.p99_latency_ms)}</td>
+          <td>${fmt4(w.avg_recall_at_k)}</td>
         </tr>`;
       }).join('');
+      document.getElementById('benchTableSearch').innerHTML = `
+        <table><thead><tr>
+          <th>Date</th><th>Run</th><th>Commit</th>
+          <th>QPS</th><th>avg_ms</th><th>p95_ms</th><th>p99_ms</th><th>Recall</th>
+        </tr></thead><tbody>${searchRows}</tbody></table>`;
 
-      document.getElementById('benchTable').innerHTML = `
-        <table>
-          <thead><tr>
-            <th>Date</th><th>Run</th><th>Commit</th>
-            <th>QPS (c=1)</th><th>avg_ms</th><th>p95_ms</th><th>Recall</th>
-          </tr></thead>
-          <tbody>${rows}</tbody>
-        </table>`;
+      // Write-only table (durable + visible side by side)
+      const writeRows = recentRows.map(r => {
+        const d = r.workloads?.write_durable || {};
+        const v = r.workloads?.write_visible || {};
+        return `<tr>
+          <td>${fmtDate(r.date)}</td><td>${runLink(r)}</td><td>${commitLink(r)}</td>
+          <td>${fmt1(d.throughput_ops)}</td><td>${fmt2(d.avg_latency_ms)}</td><td>${fmt2(d.p95_latency_ms)}</td>
+          <td>${fmt1(v.throughput_ops)}</td><td>${fmt2(v.avg_latency_ms)}</td><td>${fmt2(v.p95_latency_ms)}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('benchTableWrite').innerHTML = `
+        <table><thead><tr>
+          <th>Date</th><th>Run</th><th>Commit</th>
+          <th>durable ops/s</th><th>durable avg_ms</th><th>durable p95_ms</th>
+          <th>visible ops/s</th><th>visible avg_ms</th><th>visible p95_ms</th>
+        </tr></thead><tbody>${writeRows}</tbody></table>`;
+
+      // Mix table
+      const mixRows = recentRows.map(r => {
+        const w = r.workloads?.mix_80_20 || {};
+        return `<tr>
+          <td>${fmtDate(r.date)}</td><td>${runLink(r)}</td><td>${commitLink(r)}</td>
+          <td>${fmt1(w.throughput_ops)}</td><td>${fmt2(w.read_avg_latency_ms)}</td>
+          <td>${fmt2(w.write_avg_latency_ms)}</td>
+          <td>${w.total_read_ops ?? '-'}</td><td>${w.total_write_ops ?? '-'}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('benchTableMix').innerHTML = `
+        <table><thead><tr>
+          <th>Date</th><th>Run</th><th>Commit</th>
+          <th>ops/s</th><th>read avg_ms</th><th>write avg_ms</th>
+          <th>read ops</th><th>write ops</th>
+        </tr></thead><tbody>${mixRows}</tbody></table>`;
     }
 
     async function initVerification() {
