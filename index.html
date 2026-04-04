@@ -174,13 +174,12 @@
           <td>${fmtDate(r.date)}</td><td>${runLink(r)}</td><td>${commitLink(r)}</td>
           <td>${fmt1(w.throughput_qps)}</td><td>${fmt2(w.avg_latency_ms)}</td>
           <td>${fmt2(w.p95_latency_ms)}</td><td>${fmt2(w.p99_latency_ms)}</td>
-          <td>${fmt4(w.avg_recall_at_k)}</td>
         </tr>`;
       }).join('');
       document.getElementById('benchTableSearch').innerHTML = `
         <table><thead><tr>
           <th>Date</th><th>Run</th><th>Commit</th>
-          <th>QPS</th><th>avg_ms</th><th>p95_ms</th><th>p99_ms</th><th>Recall</th>
+          <th>QPS</th><th>avg_ms</th><th>p95_ms</th><th>p99_ms</th>
         </tr></thead><tbody>${searchRows}</tbody></table>`;
 
       // Write-only table (durable + visible side by side)
