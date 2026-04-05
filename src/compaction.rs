@@ -171,24 +171,32 @@ pub(crate) fn run_merge(
     let record_size = dimension * 4;
     for (seg_id, num_vectors) in &input_segs {
         let live = storage.load_segment_live_entries(id, *seg_id, *num_vectors)?;
+
+        // Read all vectors for this segment in one I/O call.
+        let mut buf = vec![0u8; num_vectors * record_size];
         let vec_path = inner.seg_dir(*seg_id).join("vectors.seg");
-        let vec_file = std::fs::File::open(&vec_path)?;
+        std::fs::File::open(&vec_path)?.read_exact_at(&mut buf, 0)?;
+
+        // Collect live vectors and their metadata in a single pass.
+        let mut live_meta: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+        let mut vectors: Vec<Vec<f32>> = Vec::new();
         for (i, entry_opt) in live.into_iter().enumerate() {
             let Some((doc_id, metadata)) = entry_opt else {
                 continue;
             };
-            let mut buf = vec![0u8; record_size];
-            vec_file.read_exact_at(&mut buf, i as u64 * record_size as u64)?;
-            let vector: Vec<f32> = buf
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let new_internal_id = ws.insert(&vector, dimension)?;
-            compaction_entries.push(CompactionEntry {
-                doc_id,
-                new_internal_id,
-                metadata,
-            });
+            let start = i * record_size;
+            vectors.push(
+                buf[start..start + record_size]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            );
+            live_meta.push((doc_id, metadata));
+        }
+
+        let new_ids = ws.insert_batch(&vectors, dimension)?;
+        for ((doc_id, metadata), new_internal_id) in live_meta.into_iter().zip(new_ids) {
+            compaction_entries.push(CompactionEntry { doc_id, new_internal_id, metadata });
         }
     }
 
