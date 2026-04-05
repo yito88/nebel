@@ -20,6 +20,7 @@ use crate::{
 
 // How long the compaction coordinator sleeps between checks when idle.
 const COMPACTION_INTERVAL: Duration = Duration::from_millis(500);
+const INGEST_BATCH_SIZE: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // SegmentInfo
@@ -169,34 +170,36 @@ pub(crate) fn run_merge(
     let mut compaction_entries: Vec<CompactionEntry> = Vec::new();
 
     let record_size = dimension * 4;
+    let mut buf = vec![0u8; INGEST_BATCH_SIZE * record_size];
     for (seg_id, num_vectors) in &input_segs {
-        let live = storage.load_segment_live_entries(id, *seg_id, *num_vectors)?;
-
-        // Read all vectors for this segment in one I/O call.
-        let mut buf = vec![0u8; num_vectors * record_size];
+        let mut live = storage.load_segment_live_entries(id, *seg_id, *num_vectors)?;
         let vec_path = inner.seg_dir(*seg_id).join("vectors.seg");
-        std::fs::File::open(&vec_path)?.read_exact_at(&mut buf, 0)?;
+        let vec_file = std::fs::File::open(&vec_path)?;
 
-        // Collect live vectors and their metadata in a single pass.
-        let mut live_meta: Vec<(String, Option<serde_json::Value>)> = Vec::new();
-        let mut vectors: Vec<Vec<f32>> = Vec::new();
-        for (i, entry_opt) in live.into_iter().enumerate() {
-            let Some((doc_id, metadata)) = entry_opt else {
-                continue;
-            };
-            let start = i * record_size;
-            vectors.push(
-                buf[start..start + record_size]
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-            );
-            live_meta.push((doc_id, metadata));
-        }
+        for (chunk_idx, chunk) in live.chunks_mut(INGEST_BATCH_SIZE).enumerate() {
+            let byte_offset = (chunk_idx * INGEST_BATCH_SIZE * record_size) as u64;
+            vec_file.read_exact_at(&mut buf[..chunk.len() * record_size], byte_offset)?;
 
-        let new_ids = ws.insert_batch(&vectors, dimension)?;
-        for ((doc_id, metadata), new_internal_id) in live_meta.into_iter().zip(new_ids) {
-            compaction_entries.push(CompactionEntry { doc_id, new_internal_id, metadata });
+            let mut live_meta: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+            let mut vectors: Vec<Vec<f32>> = Vec::new();
+            for (i, entry_opt) in chunk.iter_mut().enumerate() {
+                let Some((doc_id, metadata)) = entry_opt.take() else {
+                    continue;
+                };
+                let start = i * record_size;
+                vectors.push(
+                    buf[start..start + record_size]
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                );
+                live_meta.push((doc_id, metadata));
+            }
+
+            let new_ids = ws.insert_batch(&vectors, dimension)?;
+            for ((doc_id, metadata), new_internal_id) in live_meta.into_iter().zip(new_ids) {
+                compaction_entries.push(CompactionEntry { doc_id, new_internal_id, metadata });
+            }
         }
     }
 
