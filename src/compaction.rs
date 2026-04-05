@@ -95,7 +95,7 @@ pub(crate) fn select_candidates(
     base_capacity: usize,
     num_levels: usize,
     packing_fill_factor: f64,
-) -> Vec<SegId> {
+) -> std::collections::HashSet<SegId> {
     let target_live = (level.output(num_levels).capacity(base_capacity) as f64 * packing_fill_factor) as usize;
 
     let mut at_level: Vec<&SegmentInfo> =
@@ -110,10 +110,10 @@ pub(crate) fn select_candidates(
     });
 
     // Accumulate until we have enough live vectors for the target.
-    let mut selected: Vec<SegId> = Vec::new();
+    let mut selected: std::collections::HashSet<SegId> = std::collections::HashSet::new();
     let mut live_sum = 0usize;
     for seg in &at_level {
-        selected.push(seg.seg_id);
+        selected.insert(seg.seg_id);
         live_sum += seg.live_vectors();
         if live_sum >= target_live {
             break;
@@ -123,12 +123,12 @@ pub(crate) fn select_candidates(
     // Require at least 2 segments to avoid trivial single-segment "merges" unless
     // the single segment has a high tombstone ratio (worth cleaning up anyway).
     if selected.len() < 2 {
-        let single_high_tombstone = selected.first().and_then(|id| {
+        let single_high_tombstone = selected.iter().next().and_then(|id| {
             infos.iter().find(|s| s.seg_id == *id)
         }).map(|s| s.tombstone_ratio() > 0.0).unwrap_or(false);
 
         if !single_high_tombstone {
-            return Vec::new();
+            return std::collections::HashSet::new();
         }
     }
 
@@ -284,11 +284,9 @@ fn run_level_compaction(
     }
 
     // Build input (seg_id, num_vectors) pairs from infos — no locking needed.
-    let candidate_set: std::collections::HashSet<SegId> =
-        candidates.iter().copied().collect();
     let input_segs: Vec<(SegId, usize)> = infos
         .iter()
-        .filter(|info| candidate_set.contains(&info.seg_id))
+        .filter(|info| candidates.contains(&info.seg_id))
         .map(|info| (info.seg_id, info.num_vectors))
         .collect();
 
