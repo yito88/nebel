@@ -471,6 +471,7 @@ impl CollectionHandle {
         self.drain_wal()?;
         let mut state = inner.apply_state.lock().unwrap();
         seal_and_new_segment(inner, &mut state, true)?;
+        inner.publish_snapshot(&state);
         Ok(state.manifest.writable_segment)
     }
 

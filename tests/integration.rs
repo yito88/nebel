@@ -394,7 +394,9 @@ fn compaction_merges_l0_segments() {
     // leaving seg0 sealed and seg1 as the writable segment with 5 vectors.
     let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
     for i in 1..10u32 {
-        last = col.upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None).unwrap();
+        last = col
+            .upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None)
+            .unwrap();
     }
     col.wait_visible(last).unwrap();
     // Seal seg1 — now two L0 segments exist, which triggers the compaction worker.
@@ -419,7 +421,9 @@ fn compaction_removes_tombstones() {
     // Insert 10 vectors (seg0 auto-seals after d4).
     let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
     for i in 1..10u32 {
-        last = col.upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None).unwrap();
+        last = col
+            .upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None)
+            .unwrap();
     }
     col.wait_visible(last).unwrap();
 
@@ -443,8 +447,39 @@ fn compaction_removes_tombstones() {
     }
     for i in 5..10u32 {
         let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1).unwrap();
-        assert_eq!(hits[0].doc_id, format!("d{i}"), "d{i} should survive compaction");
+        assert_eq!(
+            hits[0].doc_id,
+            format!("d{i}"),
+            "d{i} should survive compaction"
+        );
     }
+}
+
+/// Compacted-away segment directories must be deleted from disk after the commit.
+#[test]
+fn compaction_deletes_old_segment_dirs() {
+    let (db, dir) = make_db();
+    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+
+    // Insert 10 vectors: seg_000 auto-seals after d4, seg_001 holds d5–d9.
+    let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
+    for i in 1..10u32 {
+        last = col
+            .upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None)
+            .unwrap();
+    }
+    col.wait_visible(last).unwrap();
+
+    // Seal seg_001 — two L0 segments now exist, triggering compaction.
+    // The compaction worker will allocate seg_003 as the merged output
+    // (seg_002 is the new writable segment created by add_writable_segment).
+    col.add_writable_segment().unwrap();
+    wait_for_compaction();
+
+    let base = dir.path().join("c");
+    assert!(!base.join("seg_000").exists(), "seg_000 should be deleted after compaction");
+    assert!(!base.join("seg_001").exists(), "seg_001 should be deleted after compaction");
+    assert!(base.join("seg_003").exists(), "merged seg_003 should exist after compaction");
 }
 
 /// Metadata stored alongside vectors must be intact after compaction.
