@@ -38,5 +38,13 @@
     "run_url": "https://github.com/yito88/nebel/actions/runs/23971754515",
     "ann_recall": null,
     "passed": false
+  },
+  {
+    "date": "2026-04-05T05:31:20Z",
+    "commit": "e4fef4e",
+    "run_number": 6,
+    "run_url": "https://github.com/yito88/nebel/actions/runs/23994939298",
+    "ann_recall": 0.965,
+    "passed": true
   }
 ]
