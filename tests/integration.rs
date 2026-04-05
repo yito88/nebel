@@ -183,15 +183,13 @@ fn load_collection_restores_data() {
 #[test]
 fn multi_segment_search() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 3, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 3, Metric::L2);
+    schema.segment_params.segment_capacity = 2;
+    let col = db.create_collection(schema).unwrap();
 
     col.upsert("a", &[1.0, 0.0, 0.0], None).unwrap();
     col.upsert("b", &[0.0, 1.0, 0.0], None).unwrap();
-
-    col.add_writable_segment().unwrap();
-
+    // "c" triggers auto-seal of seg0 (capacity=2) before inserting.
     col.upsert("c", &[0.0, 0.0, 1.0], None).unwrap();
     let t = col.upsert("d", &[0.9, 0.1, 0.0], None).unwrap();
     col.wait_visible(t).unwrap();
@@ -205,13 +203,12 @@ fn multi_segment_search() {
 #[test]
 fn multi_segment_tombstone() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 2, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 2, Metric::L2);
+    schema.segment_params.segment_capacity = 1;
+    let col = db.create_collection(schema).unwrap();
 
     col.upsert("x", &[1.0, 0.0], None).unwrap();
-
-    col.add_writable_segment().unwrap();
+    // "y" triggers auto-seal of seg0 (capacity=1) before inserting.
     col.upsert("y", &[0.9, 0.1], None).unwrap();
     let t = col.delete("x").unwrap();
     col.wait_visible(t).unwrap();
@@ -271,15 +268,13 @@ fn search_exact_respects_tombstones() {
 #[test]
 fn search_exact_multi_segment() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 3, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 3, Metric::L2);
+    schema.segment_params.segment_capacity = 2;
+    let col = db.create_collection(schema).unwrap();
 
     col.upsert("a", &[1.0, 0.0, 0.0], None).unwrap();
     col.upsert("b", &[0.0, 1.0, 0.0], None).unwrap();
-
-    col.add_writable_segment().unwrap();
-
+    // "c" triggers auto-seal of seg0 (capacity=2) before inserting.
     col.upsert("c", &[0.0, 0.0, 1.0], None).unwrap();
     let t = col.upsert("d", &[0.9, 0.1, 0.0], None).unwrap();
     col.wait_visible(t).unwrap();
@@ -297,12 +292,11 @@ fn load_collection_multi_segment() {
 
     {
         let db = Db::open(dir.path()).unwrap();
-        let col = db
-            .create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
-            .unwrap();
+        let mut schema = CollectionSchema::new(id.clone(), 3, Metric::L2);
+        schema.segment_params.segment_capacity = 1;
+        let col = db.create_collection(schema).unwrap();
         col.upsert("a", &[1.0, 0.0, 0.0], None).unwrap();
-
-        col.add_writable_segment().unwrap();
+        // "b" triggers auto-seal of seg0 (capacity=1) before inserting.
         let t = col.upsert("b", &[0.0, 1.0, 0.0], None).unwrap();
         col.wait_visible(t).unwrap();
     }
