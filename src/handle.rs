@@ -22,8 +22,8 @@ use crate::{
     snapshot::{CollectionSnapshot, SegmentSnapshot},
     storage::Storage,
     types::{
-        CollectionId, CollectionSchema, InternalId, Level, Manifest, SearchHit, SegId,
-        SegmentMeta, SegmentState, VectorEntry, WriteToken,
+        CollectionId, CollectionSchema, InternalId, Level, Manifest, SearchHit, SegId, SegmentMeta,
+        SegmentState, VectorEntry, WriteToken,
     },
     wal::{ApplyCursor, Wal, WalId, WalOp, WalRecord},
 };
@@ -399,7 +399,7 @@ impl CollectionHandle {
             if state.writable_seg.read().unwrap().num_vectors()
                 >= inner.schema.segment_params.segment_capacity
             {
-                seal_and_new_segment(inner, &mut state)?;
+                seal_and_new_segment(inner, &mut state, false)?;
             }
             let internal_ids = {
                 let mut ws = state.writable_seg.write().unwrap();
@@ -429,6 +429,9 @@ impl CollectionHandle {
             )?;
             count += vectors.len();
         }
+
+        // Notify compaction once after all segments have been sealed.
+        notify_worker(&inner.compaction_notify);
 
         // Publish snapshot so searches immediately see the ingested data.
         {
@@ -467,7 +470,7 @@ impl CollectionHandle {
         // is populated before we seal it.
         self.drain_wal()?;
         let mut state = inner.apply_state.lock().unwrap();
-        seal_and_new_segment(inner, &mut state)?;
+        seal_and_new_segment(inner, &mut state, true)?;
         Ok(state.manifest.writable_segment)
     }
 
@@ -708,7 +711,7 @@ pub(crate) fn apply_entry(
             if state.writable_seg.read().unwrap().num_vectors()
                 >= schema.segment_params.segment_capacity
             {
-                seal_and_new_segment(inner, state)?;
+                seal_and_new_segment(inner, state, true)?;
             }
             let internal_id = {
                 let mut ws = state.writable_seg.write().unwrap();
@@ -751,7 +754,11 @@ pub(crate) fn apply_entry(
 // ---------------------------------------------------------------------------
 
 /// Seal the current writable segment and create a fresh one, updating `state` and storage.
-pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplyState) -> Result<()> {
+pub(crate) fn seal_and_new_segment(
+    inner: &CollectionInner,
+    state: &mut ApplyState,
+    notify_compaction: bool,
+) -> Result<()> {
     let storage = &*inner.storage;
     let old_id = state.manifest.writable_segment;
     let new_id = state.manifest.next_seg_id;
@@ -759,7 +766,11 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
 
     let num_vectors = state.writable_seg.read().unwrap().num_vectors();
     // Newly sealed segments are always L0.
-    let sealed = state.writable_seg.read().unwrap().persist_as_sealed(Level::ZERO)?;
+    let sealed = state
+        .writable_seg
+        .read()
+        .unwrap()
+        .persist_as_sealed(Level::ZERO)?;
     let sealed_arc = Arc::new(sealed);
 
     let new_ws = WritableSegment::create(
@@ -789,7 +800,9 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
     )?;
 
     // Notify the compaction worker that a new sealed segment is available.
-    notify_worker(&inner.compaction_notify);
+    if notify_compaction {
+        notify_worker(&inner.compaction_notify);
+    }
 
     Ok(())
 }
