@@ -6,6 +6,8 @@ use crate::types::{
     VectorEntry,
 };
 
+type LiveEntries = Vec<Option<(String, Option<serde_json::Value>)>>;
+
 // table definitions
 
 /// collection_name -> CollectionSchema (JSON)
@@ -447,7 +449,7 @@ impl Storage {
         id: &CollectionId,
         seg_id: SegId,
         num_vectors: usize,
-    ) -> Result<Vec<Option<(String, Option<serde_json::Value>)>>> {
+    ) -> Result<LiveEntries> {
         let col = id.as_str();
         let rtxn = self.db.begin_read()?;
         let tomb_table = rtxn.open_table(TOMBSTONES)?;
@@ -578,12 +580,11 @@ impl Storage {
                     continue;
                 }
                 let rest = &key[prefix_base.len()..];
-                if let Some((seg_str, _)) = rest.split_once('\0') {
-                    if let Ok(n) = seg_str.parse::<u32>() {
-                        if removed_set.contains(&SegId::from_u32(n)) {
-                            to_delete.push(key.to_string());
-                        }
-                    }
+                if let Some((seg_str, _)) = rest.split_once('\0')
+                    && let Ok(n) = seg_str.parse::<u32>()
+                    && removed_set.contains(&SegId::from_u32(n))
+                {
+                    to_delete.push(key.to_string());
                 }
             }
             for k in &to_delete {

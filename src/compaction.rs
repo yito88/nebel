@@ -20,7 +20,7 @@ use crate::{
 
 // How long the compaction coordinator sleeps between checks when idle.
 const COMPACTION_INTERVAL: Duration = Duration::from_millis(500);
-const INGEST_BATCH_SIZE: usize = 2048;
+const CHUNK_VEC_NUM: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // SegmentInfo
@@ -170,14 +170,14 @@ pub(crate) fn run_merge(
     let mut compaction_entries: Vec<CompactionEntry> = Vec::new();
 
     let record_size = dimension * 4;
-    let mut buf = vec![0u8; INGEST_BATCH_SIZE * record_size];
+    let mut buf = vec![0u8; CHUNK_VEC_NUM * record_size];
     for (seg_id, num_vectors) in &input_segs {
         let mut live = storage.load_segment_live_entries(id, *seg_id, *num_vectors)?;
         let vec_path = inner.seg_dir(*seg_id).join("vectors.seg");
         let vec_file = std::fs::File::open(&vec_path)?;
 
-        for (chunk_idx, chunk) in live.chunks_mut(INGEST_BATCH_SIZE).enumerate() {
-            let byte_offset = (chunk_idx * INGEST_BATCH_SIZE * record_size) as u64;
+        for (chunk_idx, chunk) in live.chunks_mut(CHUNK_VEC_NUM).enumerate() {
+            let byte_offset = (chunk_idx * CHUNK_VEC_NUM * record_size) as u64;
             vec_file.read_exact_at(&mut buf[..chunk.len() * record_size], byte_offset)?;
 
             let mut live_meta: Vec<(String, Option<serde_json::Value>)> = Vec::new();
