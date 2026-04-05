@@ -158,15 +158,6 @@ pub(crate) fn run_merge(
     let dimension = schema.dimension;
     let new_dir = inner.seg_dir(new_seg_id);
 
-    // For each input segment, snapshot live entries from storage.
-    // This gives us (doc_id, metadata) per internal_id (None = tombstoned).
-    let mut all_entries: Vec<(SegId, Vec<Option<(String, Option<serde_json::Value>)>>)> =
-        Vec::new();
-    for (seg_id, num_vectors) in &input_segs {
-        let entries = storage.load_segment_live_entries(id, *seg_id, *num_vectors)?;
-        all_entries.push((*seg_id, entries));
-    }
-
     // Create a new writable segment to accumulate live vectors.
     let mut ws = WritableSegment::create(
         new_seg_id,
@@ -178,10 +169,11 @@ pub(crate) fn run_merge(
     let mut compaction_entries: Vec<CompactionEntry> = Vec::new();
 
     let record_size = dimension * 4;
-    for (seg_id, live) in &all_entries {
+    for (seg_id, num_vectors) in &input_segs {
+        let live = storage.load_segment_live_entries(id, *seg_id, *num_vectors)?;
         let vec_path = inner.seg_dir(*seg_id).join("vectors.seg");
         let vec_file = std::fs::File::open(&vec_path)?;
-        for (i, entry_opt) in live.iter().enumerate() {
+        for (i, entry_opt) in live.into_iter().enumerate() {
             let Some((doc_id, metadata)) = entry_opt else {
                 continue;
             };
@@ -193,9 +185,9 @@ pub(crate) fn run_merge(
                 .collect();
             let new_internal_id = ws.insert(&vector, dimension)?;
             compaction_entries.push(CompactionEntry {
-                doc_id: doc_id.clone(),
+                doc_id,
                 new_internal_id,
-                metadata: metadata.clone(),
+                metadata,
             });
         }
     }
