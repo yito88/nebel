@@ -214,30 +214,6 @@ pub(crate) fn run_merge(
     Ok((new_sealed, new_seg_meta, compaction_entries))
 }
 
-// ---------------------------------------------------------------------------
-// Post-merge state update
-// ---------------------------------------------------------------------------
-
-/// After `commit_compaction` succeeds, update `apply_state` under lock and
-/// publish the new snapshot.
-fn apply_compaction_result(
-    inner: &Arc<CollectionInner>,
-    new_sealed: SealedSegment,
-    new_seg_meta: &SegmentMeta,
-    removed_seg_ids: &[SegId],
-    new_manifest: Manifest,
-) {
-    let new_arc = Arc::new(new_sealed);
-    let mut state = inner.apply_state.lock().unwrap();
-    state
-        .sealed_segs
-        .retain(|s| !removed_seg_ids.contains(&s.seg_id()));
-    state.sealed_segs.push(Arc::clone(&new_arc));
-    state.manifest = new_manifest;
-    inner.publish_snapshot(&state);
-    drop(state);
-    let _ = new_seg_meta; // already committed to storage
-}
 
 // ---------------------------------------------------------------------------
 // Per-level merge task
@@ -313,41 +289,42 @@ fn run_level_compaction(
         }
     };
 
-    // Build new manifest (remove old segs, add new).
-    let new_manifest = {
-        let state = inner.apply_state.lock().unwrap();
-        let removed_set: std::collections::HashSet<SegId> =
-            removed_seg_ids.iter().copied().collect();
+    // Build manifest, commit to storage, and update in-memory state under one lock
+    // so that concurrent WAL applies cannot modify the manifest between these steps.
+    let commit_result = {
+        let mut state = inner.apply_state.lock().unwrap();
         let mut active = state
             .manifest
             .active_segments
             .iter()
             .copied()
-            .filter(|id| !removed_set.contains(id))
+            .filter(|id| !removed_seg_ids.contains(id))
             .collect::<Vec<_>>();
         active.push(new_seg_id);
-        Manifest {
+        let new_manifest = Manifest {
             active_segments: active,
             writable_segment: state.manifest.writable_segment,
             next_seg_id: state.manifest.next_seg_id,
+        };
+        let result = storage.commit_compaction(
+            &id,
+            &new_seg_meta,
+            &new_manifest,
+            &compaction_entries,
+            &removed_seg_ids,
+        );
+        if result.is_ok() {
+            let new_arc = Arc::new(new_sealed);
+            state.sealed_segs.retain(|s| !removed_seg_ids.contains(&s.seg_id()));
+            state.sealed_segs.push(Arc::clone(&new_arc));
+            state.manifest = new_manifest;
+            inner.publish_snapshot(&state);
         }
+        result
     };
-
-    // Commit atomically to storage.
-    if let Err(e) = storage.commit_compaction(
-        &id,
-        &new_seg_meta,
-        &new_manifest,
-        &compaction_entries,
-        &removed_seg_ids,
-    ) {
+    if let Err(e) = commit_result {
         eprintln!("[compaction] commit_compaction failed at {}: {}", level, e);
-        level_busy[level.as_usize()].store(false, Ordering::Release);
-        return;
     }
-
-    // Update in-memory state.
-    apply_compaction_result(&inner, new_sealed, &new_seg_meta, &removed_seg_ids, new_manifest);
 
     level_busy[level.as_usize()].store(false, Ordering::Release);
 }
