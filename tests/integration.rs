@@ -390,21 +390,19 @@ fn compaction_merges_l0_segments() {
     let (db, _dir) = make_db();
     let col = db.create_collection(make_compaction_schema("c")).unwrap();
 
-    // Insert 10 vectors. The 6th insert auto-seals the first segment (capacity=5),
-    // leaving seg0 sealed and seg1 as the writable segment with 5 vectors.
+    // Insert 11 vectors. The 6th insert auto-seals seg0 (capacity=5); the 11th
+    // auto-seals seg1, leaving two sealed L0 segments and triggering compaction.
     let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
-    for i in 1..10u32 {
+    for i in 1..11u32 {
         last = col
             .upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None)
             .unwrap();
     }
     col.wait_visible(last).unwrap();
-    // Seal seg1 — now two L0 segments exist, which triggers the compaction worker.
-    col.add_writable_segment().unwrap();
     wait_for_compaction();
 
-    // All 10 vectors must still be findable after the L0→L1 merge.
-    for i in 0..10u32 {
+    // All 11 vectors must still be findable after the L0→L1 merge.
+    for i in 0..11u32 {
         let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1).unwrap();
         assert_eq!(hits.len(), 1, "d{i} not found after compaction");
         assert_eq!(hits[0].doc_id, format!("d{i}"));
@@ -418,7 +416,7 @@ fn compaction_removes_tombstones() {
     let (db, _dir) = make_db();
     let col = db.create_collection(make_compaction_schema("c")).unwrap();
 
-    // Insert 10 vectors (seg0 auto-seals after d4).
+    // Insert 10 vectors (seg0 auto-seals after d4), then delete d0–d4.
     let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
     for i in 1..10u32 {
         last = col
@@ -426,16 +424,16 @@ fn compaction_removes_tombstones() {
             .unwrap();
     }
     col.wait_visible(last).unwrap();
-
-    // Delete d0–d4 (all in the already-sealed seg0) before triggering compaction.
     for i in 0..5u32 {
         last = col.delete(&format!("d{i}")).unwrap();
     }
     col.wait_visible(last).unwrap();
 
-    // Seal seg1 — tombstones for d0–d4 are already in storage at this point,
-    // so the compaction worker will skip them during the merge.
-    col.add_writable_segment().unwrap();
+    // Insert d10 — this auto-seals seg1 (now at capacity), leaving two sealed
+    // L0 segments and triggering the compaction worker. Tombstones for d0–d4
+    // are already committed, so the merge will skip them.
+    last = col.upsert("d10", &[10.0, 0.0, 0.0], None).unwrap();
+    col.wait_visible(last).unwrap();
     wait_for_compaction();
 
     for i in 0..5u32 {
@@ -461,19 +459,17 @@ fn compaction_deletes_old_segment_dirs() {
     let (db, dir) = make_db();
     let col = db.create_collection(make_compaction_schema("c")).unwrap();
 
-    // Insert 10 vectors: seg_000 auto-seals after d4, seg_001 holds d5–d9.
+    // Insert 11 vectors: seg_000 auto-seals after d4, seg_001 auto-seals after
+    // d9 when d10 arrives, leaving two sealed L0 segments that trigger compaction.
+    // The compaction worker allocates seg_003 as the merged output
+    // (seg_002 is the writable segment holding d10).
     let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
-    for i in 1..10u32 {
+    for i in 1..11u32 {
         last = col
             .upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None)
             .unwrap();
     }
     col.wait_visible(last).unwrap();
-
-    // Seal seg_001 — two L0 segments now exist, triggering compaction.
-    // The compaction worker will allocate seg_003 as the merged output
-    // (seg_002 is the new writable segment created by add_writable_segment).
-    col.add_writable_segment().unwrap();
     wait_for_compaction();
 
     let base = dir.path().join("c");
@@ -488,10 +484,11 @@ fn compaction_preserves_metadata() {
     let (db, _dir) = make_db();
     let col = db.create_collection(make_compaction_schema("c")).unwrap();
 
+    // Insert 11 vectors with metadata. The 11th auto-seals seg1, triggering compaction.
     let mut last = col
         .upsert("d0", &[0.0, 0.0, 0.0], Some(serde_json::json!({"n": 0})))
         .unwrap();
-    for i in 1..10u32 {
+    for i in 1..11u32 {
         last = col
             .upsert(
                 &format!("d{i}"),
@@ -501,7 +498,6 @@ fn compaction_preserves_metadata() {
             .unwrap();
     }
     col.wait_visible(last).unwrap();
-    col.add_writable_segment().unwrap();
     wait_for_compaction();
 
     for i in 0..10u32 {

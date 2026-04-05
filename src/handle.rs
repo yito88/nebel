@@ -399,7 +399,7 @@ impl CollectionHandle {
             if state.writable_seg.read().unwrap().num_vectors()
                 >= inner.schema.segment_params.segment_capacity
             {
-                seal_and_new_segment(inner, &mut state, false)?;
+                seal_and_new_segment(inner, &mut state)?;
             }
             let internal_ids = {
                 let mut ws = state.writable_seg.write().unwrap();
@@ -430,14 +430,13 @@ impl CollectionHandle {
             count += vectors.len();
         }
 
-        // Notify compaction once after all segments have been sealed.
-        notify_worker(&inner.compaction_notify);
-
-        // Publish snapshot so searches immediately see the ingested data.
+        // Publish snapshot so searches immediately see the ingested data, then
+        // notify compaction so it sees the up-to-date snapshot.
         {
             let state = inner.apply_state.lock().unwrap();
             inner.publish_snapshot(&state);
         }
+        notify_worker(&inner.compaction_notify);
 
         Ok(count)
     }
@@ -470,9 +469,11 @@ impl CollectionHandle {
         // is populated before we seal it.
         self.drain_wal()?;
         let mut state = inner.apply_state.lock().unwrap();
-        seal_and_new_segment(inner, &mut state, true)?;
+        seal_and_new_segment(inner, &mut state)?;
         inner.publish_snapshot(&state);
-        Ok(state.manifest.writable_segment)
+        drop(state);
+        notify_worker(&inner.compaction_notify);
+        Ok(inner.apply_state.lock().unwrap().manifest.writable_segment)
     }
 
     pub fn set_wal_rotation_bytes(&self, n: u64) {
@@ -584,6 +585,7 @@ fn apply_worker_loop(
 
         // Apply records.
         let mut state = inner.apply_state.lock().unwrap();
+        let seg_id_before = state.manifest.next_seg_id;
         for record in &pending {
             // Idempotency guard: skip if somehow already applied.
             if record.seq <= state.applied_seq {
@@ -595,11 +597,15 @@ fn apply_worker_loop(
         }
 
         let applied = state.applied_seq;
+        let sealed = state.manifest.next_seg_id != seg_id_before;
         inner.publish_snapshot(&state);
         drop(state);
 
         inner.visible_seq.fetch_max(applied + 1, Ordering::Release);
         inner.visible.1.notify_all();
+        if sealed {
+            notify_worker(&inner.compaction_notify);
+        }
 
         // Advance cursor; keep physical position from new_cursor, update logical seq.
         *cursor = ApplyCursor {
@@ -712,7 +718,7 @@ pub(crate) fn apply_entry(
             if state.writable_seg.read().unwrap().num_vectors()
                 >= schema.segment_params.segment_capacity
             {
-                seal_and_new_segment(inner, state, true)?;
+                seal_and_new_segment(inner, state)?;
             }
             let internal_id = {
                 let mut ws = state.writable_seg.write().unwrap();
@@ -755,11 +761,7 @@ pub(crate) fn apply_entry(
 // ---------------------------------------------------------------------------
 
 /// Seal the current writable segment and create a fresh one, updating `state` and storage.
-pub(crate) fn seal_and_new_segment(
-    inner: &CollectionInner,
-    state: &mut ApplyState,
-    notify_compaction: bool,
-) -> Result<()> {
+pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplyState) -> Result<()> {
     let storage = &*inner.storage;
     let old_id = state.manifest.writable_segment;
     let new_id = state.manifest.next_seg_id;
@@ -799,11 +801,6 @@ pub(crate) fn seal_and_new_segment(
         &SegmentMeta::new(new_id),
         &state.manifest,
     )?;
-
-    // Notify the compaction worker that a new sealed segment is available.
-    if notify_compaction {
-        notify_worker(&inner.compaction_notify);
-    }
 
     Ok(())
 }
