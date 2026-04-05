@@ -247,22 +247,22 @@ fn run_level_compaction(
     let num_levels = schema.compaction_params.num_levels;
 
     // Build SegmentInfo from the published snapshot (read lock only).
-    let infos: Vec<SegmentInfo> = {
-        let snap = Arc::clone(&*inner.snapshot.read().unwrap());
-        snap.segs
-            .iter()
-            .filter_map(|s| match s {
-                SegmentSnapshot::Sealed(ss) => Some(ss.meta()),
-                _ => None,
-            })
-            .map(|m| SegmentInfo {
-                seg_id: m.seg_id,
-                num_vectors: m.num_vectors,
-                tombstone_count: m.tombstone_count,
-                level: m.level,
-            })
-            .collect()
-    };
+    // Keep `snap` alive so we can clone input Arcs from it without re-locking.
+    let snap = Arc::clone(&*inner.snapshot.read().unwrap());
+    let infos: Vec<SegmentInfo> = snap
+        .segs
+        .iter()
+        .filter_map(|s| match s {
+            SegmentSnapshot::Sealed(ss) => Some(ss.meta()),
+            _ => None,
+        })
+        .map(|m| SegmentInfo {
+            seg_id: m.seg_id,
+            num_vectors: m.num_vectors,
+            tombstone_count: m.tombstone_count,
+            level: m.level,
+        })
+        .collect();
 
     let candidates = select_candidates(
         level,
@@ -276,20 +276,27 @@ fn run_level_compaction(
         return;
     }
 
-    // Claim input segment Arcs and allocate a new seg_id under the apply_state lock.
-    let (input_seg_arcs, new_seg_id) = {
-        let candidate_set: std::collections::HashSet<SegId> =
-            candidates.iter().copied().collect();
+    // Claim input segment Arcs from the snapshot (no lock needed).
+    let candidate_set: std::collections::HashSet<SegId> =
+        candidates.iter().copied().collect();
+    let input_seg_arcs: Vec<Arc<SealedSegment>> = snap
+        .segs
+        .iter()
+        .filter_map(|s| match s {
+            SegmentSnapshot::Sealed(ss) if candidate_set.contains(&ss.seg_id()) => {
+                Some(Arc::clone(ss))
+            }
+            _ => None,
+        })
+        .collect();
+    drop(snap);
+
+    // Allocate a new seg_id under the apply_state lock.
+    let new_seg_id = {
         let mut state = inner.apply_state.lock().unwrap();
-        let input_arcs: Vec<Arc<SealedSegment>> = state
-            .sealed_segs
-            .iter()
-            .filter(|s| candidate_set.contains(&s.seg_id()))
-            .map(Arc::clone)
-            .collect();
         let new_id = state.manifest.next_seg_id;
         state.manifest.next_seg_id = new_id.next();
-        (input_arcs, new_id)
+        new_id
     };
 
     let output_level = level.output(num_levels);
