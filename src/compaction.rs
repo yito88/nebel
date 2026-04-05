@@ -333,7 +333,10 @@ fn run_level_compaction(
             for seg_id in &removed_seg_ids {
                 let seg_dir = inner.seg_dir(*seg_id);
                 if let Err(e) = std::fs::remove_dir_all(&seg_dir) {
-                    eprintln!("[compaction] failed to delete segment dir {:?}: {}", seg_dir, e);
+                    eprintln!(
+                        "[compaction] failed to delete segment dir {:?}: {}",
+                        seg_dir, e
+                    );
                 }
             }
         }

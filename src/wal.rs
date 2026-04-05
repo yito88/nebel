@@ -259,7 +259,6 @@ impl Wal {
             .collect()
     }
 
-
     /// Read all valid records from a single segment file.
     pub(crate) fn read_segment(path: &Path) -> Result<Vec<WalRecord>> {
         read_segment_records(path)
