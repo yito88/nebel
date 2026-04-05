@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{io::Write, thread, time::Duration};
 
 use nebel::{
     Db,
@@ -362,4 +362,120 @@ fn wal_segment_rotation() {
 
     // Multiple segments should now exist.
     assert!(col.wal_segment_count() > 1);
+}
+
+// ---------------------------------------------------------------------------
+// Compaction tests
+// ---------------------------------------------------------------------------
+
+/// Build a schema with a small segment capacity and aggressive L0 threshold
+/// so compaction fires after inserting a handful of vectors.
+fn make_compaction_schema(name: &str) -> CollectionSchema {
+    let mut s = CollectionSchema::new(col(name), 3, Metric::L2);
+    s.segment_params.segment_capacity = 5;
+    s.compaction_params.num_levels = 2;
+    s.compaction_params.level_count_thresholds = vec![2, 4];
+    s
+}
+
+/// Wait long enough for the background compaction thread to finish.
+fn wait_for_compaction() {
+    thread::sleep(Duration::from_millis(2000));
+}
+
+/// After two L0 segments are sealed, the compaction worker should merge them
+/// into one L1 segment. All vectors must remain searchable.
+#[test]
+fn compaction_merges_l0_segments() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+
+    // Insert 10 vectors. The 6th insert auto-seals the first segment (capacity=5),
+    // leaving seg0 sealed and seg1 as the writable segment with 5 vectors.
+    let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
+    for i in 1..10u32 {
+        last = col.upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None).unwrap();
+    }
+    col.wait_visible(last).unwrap();
+    // Seal seg1 — now two L0 segments exist, which triggers the compaction worker.
+    col.add_writable_segment().unwrap();
+    wait_for_compaction();
+
+    // All 10 vectors must still be findable after the L0→L1 merge.
+    for i in 0..10u32 {
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1, "d{i} not found after compaction");
+        assert_eq!(hits[0].doc_id, format!("d{i}"));
+    }
+}
+
+/// Tombstones committed before the compaction snapshot is taken must be
+/// honoured: the compacted segment should not contain the deleted vectors.
+#[test]
+fn compaction_removes_tombstones() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+
+    // Insert 10 vectors (seg0 auto-seals after d4).
+    let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
+    for i in 1..10u32 {
+        last = col.upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None).unwrap();
+    }
+    col.wait_visible(last).unwrap();
+
+    // Delete d0–d4 (all in the already-sealed seg0) before triggering compaction.
+    for i in 0..5u32 {
+        last = col.delete(&format!("d{i}")).unwrap();
+    }
+    col.wait_visible(last).unwrap();
+
+    // Seal seg1 — tombstones for d0–d4 are already in storage at this point,
+    // so the compaction worker will skip them during the merge.
+    col.add_writable_segment().unwrap();
+    wait_for_compaction();
+
+    for i in 0..5u32 {
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 5).unwrap();
+        assert!(
+            !hits.iter().any(|h| h.doc_id == format!("d{i}")),
+            "d{i} should have been removed by compaction"
+        );
+    }
+    for i in 5..10u32 {
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits[0].doc_id, format!("d{i}"), "d{i} should survive compaction");
+    }
+}
+
+/// Metadata stored alongside vectors must be intact after compaction.
+#[test]
+fn compaction_preserves_metadata() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+
+    let mut last = col
+        .upsert("d0", &[0.0, 0.0, 0.0], Some(serde_json::json!({"n": 0})))
+        .unwrap();
+    for i in 1..10u32 {
+        last = col
+            .upsert(
+                &format!("d{i}"),
+                &[i as f32, 0.0, 0.0],
+                Some(serde_json::json!({"n": i})),
+            )
+            .unwrap();
+    }
+    col.wait_visible(last).unwrap();
+    col.add_writable_segment().unwrap();
+    wait_for_compaction();
+
+    for i in 0..10u32 {
+        let hits = col.search(&[i as f32, 0.0, 0.0], 1, true, false).unwrap();
+        assert_eq!(hits[0].doc_id, format!("d{i}"));
+        assert_eq!(
+            hits[0].metadata.as_ref().unwrap()["n"],
+            i,
+            "metadata for d{i} corrupted after compaction"
+        );
+    }
 }

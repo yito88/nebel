@@ -5,7 +5,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
 };
 
 use anyhow::Result;
@@ -18,8 +17,6 @@ use crate::{
     types::{Level, Manifest, SegId, SegmentMeta, SegmentState},
 };
 
-// How long the compaction coordinator sleeps between checks when idle.
-const COMPACTION_INTERVAL: Duration = Duration::from_millis(500);
 const CHUNK_VEC_NUM: usize = 2048;
 
 // ---------------------------------------------------------------------------
@@ -342,12 +339,12 @@ pub(crate) fn compaction_worker_loop(
     shutdown: Arc<AtomicBool>,
 ) {
     loop {
-        // Wait for a notification or timeout.
+        // Block until notified (or shutdown).
         {
             let guard = notify.0.lock().unwrap();
-            let _ = notify.1.wait_timeout_while(guard, COMPACTION_INTERVAL, |hw| {
+            drop(notify.1.wait_while(guard, |hw| {
                 !*hw && !shutdown.load(Ordering::Acquire)
-            });
+            }));
         }
 
         if shutdown.load(Ordering::Acquire) {
