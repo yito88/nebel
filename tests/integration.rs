@@ -467,9 +467,18 @@ fn compaction_deletes_old_segment_dirs() {
     wait_for_compaction();
 
     let base = dir.path().join("c");
-    assert!(!base.join("seg_000").exists(), "seg_000 should be deleted after compaction");
-    assert!(!base.join("seg_001").exists(), "seg_001 should be deleted after compaction");
-    assert!(base.join("seg_003").exists(), "merged seg_003 should exist after compaction");
+    assert!(
+        !base.join("seg_000").exists(),
+        "seg_000 should be deleted after compaction"
+    );
+    assert!(
+        !base.join("seg_001").exists(),
+        "seg_001 should be deleted after compaction"
+    );
+    assert!(
+        base.join("seg_003").exists(),
+        "merged seg_003 should exist after compaction"
+    );
 }
 
 /// Metadata stored alongside vectors must be intact after compaction.

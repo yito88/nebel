@@ -190,9 +190,7 @@ impl CollectionInner {
             .join(format!("seg_{:03}", seg_id.as_u32()))
     }
 
-    pub(crate) fn wal_dir(&self) -> PathBuf {
-        self.base_dir.join(self.id.as_str()).join("wal")
-    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +463,6 @@ impl CollectionHandle {
     pub fn wal_segment_count(&self) -> usize {
         self.inner.wal.lock().unwrap().segments.len()
     }
-
 }
 
 // ---------------------------------------------------------------------------
