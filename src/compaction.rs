@@ -71,7 +71,9 @@ pub(crate) fn evaluate_triggers(
         }
         let threshold = level_count_thresholds.get(i).copied().unwrap_or(usize::MAX);
         let count_trigger = !level.is_top(num_levels) && at_level.len() >= threshold;
-        let tombstone_trigger = at_level.iter().any(|s| s.tombstone_ratio() > tombstone_threshold);
+        let tombstone_trigger = at_level
+            .iter()
+            .any(|s| s.tombstone_ratio() > tombstone_threshold);
 
         if count_trigger || tombstone_trigger {
             eligible.push(level);
@@ -94,10 +96,10 @@ pub(crate) fn select_candidates(
     num_levels: usize,
     packing_fill_factor: f64,
 ) -> std::collections::HashSet<SegId> {
-    let target_live = (level.output(num_levels).capacity(base_capacity) as f64 * packing_fill_factor) as usize;
+    let target_live =
+        (level.output(num_levels).capacity(base_capacity) as f64 * packing_fill_factor) as usize;
 
-    let mut at_level: Vec<&SegmentInfo> =
-        infos.iter().filter(|s| s.level == level).collect();
+    let mut at_level: Vec<&SegmentInfo> = infos.iter().filter(|s| s.level == level).collect();
 
     // Sort: tombstone_ratio desc, seg_id asc (older first as tie-breaker).
     at_level.sort_by(|a, b| {
@@ -121,9 +123,12 @@ pub(crate) fn select_candidates(
     // Require at least 2 segments to avoid trivial single-segment "merges" unless
     // the single segment has a high tombstone ratio (worth cleaning up anyway).
     if selected.len() < 2 {
-        let single_high_tombstone = selected.iter().next().and_then(|id| {
-            infos.iter().find(|s| s.seg_id == *id)
-        }).map(|s| s.tombstone_ratio() > 0.0).unwrap_or(false);
+        let single_high_tombstone = selected
+            .iter()
+            .next()
+            .and_then(|id| infos.iter().find(|s| s.seg_id == *id))
+            .map(|s| s.tombstone_ratio() > 0.0)
+            .unwrap_or(false);
 
         if !single_high_tombstone {
             return std::collections::HashSet::new();
@@ -157,12 +162,8 @@ pub(crate) fn run_merge(
     let new_dir = inner.seg_dir(new_seg_id);
 
     // Create a new writable segment to accumulate live vectors.
-    let mut ws = WritableSegment::create(
-        new_seg_id,
-        new_dir,
-        &schema.metric,
-        &schema.segment_params,
-    )?;
+    let mut ws =
+        WritableSegment::create(new_seg_id, new_dir, &schema.metric, &schema.segment_params)?;
 
     let mut compaction_entries: Vec<CompactionEntry> = Vec::new();
 
@@ -195,7 +196,11 @@ pub(crate) fn run_merge(
 
             let new_ids = ws.insert_batch(&vectors, dimension)?;
             for ((doc_id, metadata), new_internal_id) in live_meta.into_iter().zip(new_ids) {
-                compaction_entries.push(CompactionEntry { doc_id, new_internal_id, metadata });
+                compaction_entries.push(CompactionEntry {
+                    doc_id,
+                    new_internal_id,
+                    metadata,
+                });
             }
         }
     }
@@ -213,7 +218,6 @@ pub(crate) fn run_merge(
 
     Ok((new_sealed, new_seg_meta, compaction_entries))
 }
-
 
 // ---------------------------------------------------------------------------
 // Per-level merge task
@@ -315,15 +319,27 @@ fn run_level_compaction(
         );
         if result.is_ok() {
             let new_arc = Arc::new(new_sealed);
-            state.sealed_segs.retain(|s| !removed_seg_ids.contains(&s.seg_id()));
+            state
+                .sealed_segs
+                .retain(|s| !removed_seg_ids.contains(&s.seg_id()));
             state.sealed_segs.push(Arc::clone(&new_arc));
             state.manifest = new_manifest;
             inner.publish_snapshot(&state);
         }
         result
     };
-    if let Err(e) = commit_result {
-        eprintln!("[compaction] commit_compaction failed at {}: {}", level, e);
+    match commit_result {
+        Ok(()) => {
+            for seg_id in &removed_seg_ids {
+                let seg_dir = inner.seg_dir(*seg_id);
+                if let Err(e) = std::fs::remove_dir_all(&seg_dir) {
+                    eprintln!("[compaction] failed to delete segment dir {:?}: {}", seg_dir, e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[compaction] commit_compaction failed at {}: {}", level, e);
+        }
     }
 
     level_busy[level.as_usize()].store(false, Ordering::Release);
@@ -342,9 +358,11 @@ pub(crate) fn compaction_worker_loop(
         // Block until notified (or shutdown).
         {
             let guard = notify.0.lock().unwrap();
-            drop(notify.1.wait_while(guard, |hw| {
-                !*hw && !shutdown.load(Ordering::Acquire)
-            }));
+            drop(
+                notify
+                    .1
+                    .wait_while(guard, |hw| !*hw && !shutdown.load(Ordering::Acquire)),
+            );
         }
 
         if shutdown.load(Ordering::Acquire) {
