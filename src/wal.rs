@@ -259,26 +259,6 @@ impl Wal {
             .collect()
     }
 
-    /// Read all valid records from all segments in the WAL directory, in wal_id order.
-    pub(crate) fn read_all_from_dir(wal_dir: &Path) -> Result<Vec<WalRecord>> {
-        if !wal_dir.exists() {
-            return Ok(vec![]);
-        }
-        let mut id_paths: Vec<(WalId, PathBuf)> = fs::read_dir(wal_dir)?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                WalId::parse(&name).map(|id| (id, e.path()))
-            })
-            .collect();
-        id_paths.sort_by_key(|(id, _)| *id);
-        let mut records = Vec::new();
-        for (_, path) in &id_paths {
-            records.extend(read_segment_records(path)?);
-        }
-        Ok(records)
-    }
-
     /// Read all valid records from a single segment file.
     pub(crate) fn read_segment(path: &Path) -> Result<Vec<WalRecord>> {
         read_segment_records(path)

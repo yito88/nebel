@@ -155,6 +155,7 @@ fn main() -> Result<()> {
                     dimension: dim,
                     metric: cli.metric.clone(),
                     segment_params: params.clone(),
+                    compaction_params: Default::default(),
                 };
                 (db.create_collection(schema)?, false)
             }
@@ -169,6 +170,7 @@ fn main() -> Result<()> {
             dimension: dim,
             metric: cli.metric.clone(),
             segment_params: params.clone(),
+            compaction_params: Default::default(),
         };
         let col = db.create_collection(schema)?;
         (DbDir::Temp(tmp), col, false)

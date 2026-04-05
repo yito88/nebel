@@ -131,6 +131,8 @@ impl Db {
                         meta.num_vectors,
                         &schema.metric,
                         schema.segment_params.ef_search,
+                        meta.level,
+                        meta.tombstone_count,
                     )?;
                     sealed_segs.push(Arc::new(ss));
                 }

@@ -6,6 +6,8 @@ use crate::types::{
     VectorEntry,
 };
 
+type LiveEntries = Vec<Option<(String, Option<serde_json::Value>)>>;
+
 // table definitions
 
 /// collection_name -> CollectionSchema (JSON)
@@ -242,12 +244,24 @@ impl Storage {
                 Some(v) => Some(serde_json::from_str(v.value())?),
                 None => None,
             };
+            let mut seg_table = wtxn.open_table(SEGMENTS)?;
             if let Some(loc) = &old_loc {
                 let tk = meta_key(col, loc.seg_id, loc.internal_id);
                 let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
                 tomb_table.insert(tk.as_str(), true)?;
+                // Increment tombstone_count on the affected segment.
+                let old_sk = seg_key(col, loc.seg_id);
+                let updated_meta = if let Some(v) = seg_table.get(old_sk.as_str())? {
+                    let mut meta: SegmentMeta = serde_json::from_str(v.value())?;
+                    meta.tombstone_count += 1;
+                    Some(serde_json::to_string(&meta)?)
+                } else {
+                    None
+                };
+                if let Some(updated) = updated_meta {
+                    seg_table.insert(old_sk.as_str(), updated.as_str())?;
+                }
             }
-            let mut seg_table = wtxn.open_table(SEGMENTS)?;
             seg_table.insert(sk.as_str(), seg_json.as_str())?;
             let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
             let mut meta_table = wtxn.open_table(METADATA)?;
@@ -283,6 +297,19 @@ impl Storage {
                 let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
                 tomb_table.insert(tk.as_str(), true)?;
                 doc_table.remove(dk.as_str())?;
+                // Increment tombstone_count on the affected segment.
+                let old_sk = seg_key(col, loc.seg_id);
+                let mut seg_table = wtxn.open_table(SEGMENTS)?;
+                let updated_meta = if let Some(v) = seg_table.get(old_sk.as_str())? {
+                    let mut meta: SegmentMeta = serde_json::from_str(v.value())?;
+                    meta.tombstone_count += 1;
+                    Some(serde_json::to_string(&meta)?)
+                } else {
+                    None
+                };
+                if let Some(updated) = updated_meta {
+                    seg_table.insert(old_sk.as_str(), updated.as_str())?;
+                }
             }
             let mut seq_table = wtxn.open_table(APPLIED_SEQ)?;
             seq_table.insert(col, seq)?;
@@ -412,11 +439,174 @@ impl Storage {
         let table = rtxn.open_table(APPLIED_SEQ)?;
         Ok(table.get(id.as_str())?.map(|v| v.value()))
     }
+
+    /// Read doc_id and metadata for every internal_id in a segment in a single transaction.
+    ///
+    /// Returns one entry per internal_id (index = internal_id).
+    /// The entry is `None` when the slot is tombstoned or has no reverse-doc mapping.
+    pub fn load_segment_live_entries(
+        &self,
+        id: &CollectionId,
+        seg_id: SegId,
+        num_vectors: usize,
+    ) -> Result<LiveEntries> {
+        let col = id.as_str();
+        let rtxn = self.db.begin_read()?;
+        let tomb_table = rtxn.open_table(TOMBSTONES)?;
+        let rev_table = rtxn.open_table(REVERSE_DOC)?;
+        let meta_table = rtxn.open_table(METADATA)?;
+
+        let mut out = Vec::with_capacity(num_vectors);
+        for i in 0..num_vectors {
+            let internal_id = InternalId::from_u32(i as u32);
+            let key = meta_key(col, seg_id, internal_id);
+            if tomb_table
+                .get(key.as_str())?
+                .map(|v| v.value())
+                .unwrap_or(false)
+            {
+                out.push(None);
+                continue;
+            }
+            let doc_id = match rev_table.get(key.as_str())? {
+                Some(v) => v.value().to_string(),
+                None => {
+                    out.push(None);
+                    continue;
+                }
+            };
+            let metadata = match meta_table.get(key.as_str())? {
+                Some(v) => Some(serde_json::from_str(v.value())?),
+                None => None,
+            };
+            out.push(Some((doc_id, metadata)));
+        }
+        Ok(out)
+    }
+
+    /// Atomically commit a compaction result:
+    /// - Insert new segment metadata
+    /// - Update the manifest
+    /// - For each merged doc: update DOC_MAP/REVERSE_DOC/METADATA to the new location,
+    ///   OR tombstone the new entry if the doc was deleted/moved during the merge
+    /// - Remove old segment metadata and tombstone entries
+    pub fn commit_compaction(
+        &self,
+        id: &CollectionId,
+        new_seg_meta: &SegmentMeta,
+        new_manifest: &Manifest,
+        entries: &[CompactionEntry],
+        removed_seg_ids: &[SegId],
+    ) -> Result<()> {
+        let col = id.as_str();
+        let new_sk = seg_key(col, new_seg_meta.seg_id);
+        let new_seg_json = serde_json::to_string(new_seg_meta)?;
+        let manifest_json = serde_json::to_string(new_manifest)?;
+
+        // Collect set of removed seg_ids for membership checks.
+        let removed_set: std::collections::HashSet<SegId> =
+            removed_seg_ids.iter().copied().collect();
+
+        let wtxn = self.db.begin_write()?;
+        {
+            // Insert new segment metadata.
+            let mut seg_table = wtxn.open_table(SEGMENTS)?;
+            seg_table.insert(new_sk.as_str(), new_seg_json.as_str())?;
+
+            // Update manifest.
+            let mut manifest_table = wtxn.open_table(MANIFESTS)?;
+            manifest_table.insert(col, manifest_json.as_str())?;
+
+            let mut doc_table = wtxn.open_table(DOC_MAP)?;
+            let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
+            let mut meta_table = wtxn.open_table(METADATA)?;
+            let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
+
+            for entry in entries {
+                let new_mk = meta_key(col, new_seg_meta.seg_id, entry.new_internal_id);
+                let dk = doc_key(col, &entry.doc_id);
+
+                // Check current DOC_MAP state for this doc.
+                let current_loc: Option<DocLocation> = match doc_table.get(dk.as_str())? {
+                    Some(v) => Some(serde_json::from_str(v.value())?),
+                    None => None,
+                };
+
+                let should_tombstone = match &current_loc {
+                    // Doc was deleted during the merge.
+                    None => true,
+                    // Doc was moved to a segment not in our input set (re-upserted during merge).
+                    Some(loc) if !removed_set.contains(&loc.seg_id) => true,
+                    // Doc still points into one of the merged (now removed) segments.
+                    Some(_) => false,
+                };
+
+                if should_tombstone {
+                    tomb_table.insert(new_mk.as_str(), true)?;
+                } else {
+                    // Update DOC_MAP to point to the new location.
+                    let new_loc = DocLocation {
+                        seg_id: new_seg_meta.seg_id,
+                        internal_id: entry.new_internal_id,
+                    };
+                    let loc_json = serde_json::to_string(&new_loc)?;
+                    doc_table.insert(dk.as_str(), loc_json.as_str())?;
+
+                    // Update REVERSE_DOC.
+                    rev_table.insert(new_mk.as_str(), entry.doc_id.as_str())?;
+
+                    // Copy metadata if present.
+                    if let Some(ref m) = entry.metadata {
+                        let meta_json = serde_json::to_string(m)?;
+                        meta_table.insert(new_mk.as_str(), meta_json.as_str())?;
+                    }
+                }
+            }
+
+            // Remove old segment metadata.
+            for &old_seg_id in removed_seg_ids {
+                let old_sk = seg_key(col, old_seg_id);
+                seg_table.remove(old_sk.as_str())?;
+            }
+
+            // Remove old tombstone entries for removed segments.
+            // Collect keys to delete first to avoid mutating while iterating.
+            let prefix_base = format!("{}\0", col);
+            let mut to_delete: Vec<String> = Vec::new();
+            for entry in tomb_table.iter()? {
+                let (k, _) = entry?;
+                let key = k.value();
+                if !key.starts_with(&prefix_base) {
+                    continue;
+                }
+                let rest = &key[prefix_base.len()..];
+                if let Some((seg_str, _)) = rest.split_once('\0')
+                    && let Ok(n) = seg_str.parse::<u32>()
+                    && removed_set.contains(&SegId::from_u32(n))
+                {
+                    to_delete.push(key.to_string());
+                }
+            }
+            for k in &to_delete {
+                tomb_table.remove(k.as_str())?;
+            }
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
 }
 
 /// Result of resolving a single candidate in [`Storage::resolve_candidates`].
 pub struct ResolvedCandidate {
     pub doc_id: String,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// A single document entry produced by a compaction merge, describing where the doc
+/// lands in the new compacted segment.
+pub struct CompactionEntry {
+    pub doc_id: String,
+    pub new_internal_id: InternalId,
     pub metadata: Option<serde_json::Value>,
 }
 

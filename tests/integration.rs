@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{io::Write, thread, time::Duration};
 
 use nebel::{
     Db,
@@ -183,15 +183,13 @@ fn load_collection_restores_data() {
 #[test]
 fn multi_segment_search() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 3, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 3, Metric::L2);
+    schema.segment_params.segment_capacity = 2;
+    let col = db.create_collection(schema).unwrap();
 
     col.upsert("a", &[1.0, 0.0, 0.0], None).unwrap();
     col.upsert("b", &[0.0, 1.0, 0.0], None).unwrap();
-
-    col.add_writable_segment().unwrap();
-
+    // "c" triggers auto-seal of seg0 (capacity=2) before inserting.
     col.upsert("c", &[0.0, 0.0, 1.0], None).unwrap();
     let t = col.upsert("d", &[0.9, 0.1, 0.0], None).unwrap();
     col.wait_visible(t).unwrap();
@@ -205,13 +203,12 @@ fn multi_segment_search() {
 #[test]
 fn multi_segment_tombstone() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 2, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 2, Metric::L2);
+    schema.segment_params.segment_capacity = 1;
+    let col = db.create_collection(schema).unwrap();
 
     col.upsert("x", &[1.0, 0.0], None).unwrap();
-
-    col.add_writable_segment().unwrap();
+    // "y" triggers auto-seal of seg0 (capacity=1) before inserting.
     col.upsert("y", &[0.9, 0.1], None).unwrap();
     let t = col.delete("x").unwrap();
     col.wait_visible(t).unwrap();
@@ -271,15 +268,13 @@ fn search_exact_respects_tombstones() {
 #[test]
 fn search_exact_multi_segment() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 3, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 3, Metric::L2);
+    schema.segment_params.segment_capacity = 2;
+    let col = db.create_collection(schema).unwrap();
 
     col.upsert("a", &[1.0, 0.0, 0.0], None).unwrap();
     col.upsert("b", &[0.0, 1.0, 0.0], None).unwrap();
-
-    col.add_writable_segment().unwrap();
-
+    // "c" triggers auto-seal of seg0 (capacity=2) before inserting.
     col.upsert("c", &[0.0, 0.0, 1.0], None).unwrap();
     let t = col.upsert("d", &[0.9, 0.1, 0.0], None).unwrap();
     col.wait_visible(t).unwrap();
@@ -297,12 +292,11 @@ fn load_collection_multi_segment() {
 
     {
         let db = Db::open(dir.path()).unwrap();
-        let col = db
-            .create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
-            .unwrap();
+        let mut schema = CollectionSchema::new(id.clone(), 3, Metric::L2);
+        schema.segment_params.segment_capacity = 1;
+        let col = db.create_collection(schema).unwrap();
         col.upsert("a", &[1.0, 0.0, 0.0], None).unwrap();
-
-        col.add_writable_segment().unwrap();
+        // "b" triggers auto-seal of seg0 (capacity=1) before inserting.
         let t = col.upsert("b", &[0.0, 1.0, 0.0], None).unwrap();
         col.wait_visible(t).unwrap();
     }
@@ -362,4 +356,160 @@ fn wal_segment_rotation() {
 
     // Multiple segments should now exist.
     assert!(col.wal_segment_count() > 1);
+}
+
+// ---------------------------------------------------------------------------
+// Compaction tests
+// ---------------------------------------------------------------------------
+
+/// Build a schema with a small segment capacity and aggressive L0 threshold
+/// so compaction fires after inserting a handful of vectors.
+fn make_compaction_schema(name: &str) -> CollectionSchema {
+    let mut s = CollectionSchema::new(col(name), 3, Metric::L2);
+    s.segment_params.segment_capacity = 5;
+    s.compaction_params.num_levels = 2;
+    s.compaction_params.level_count_thresholds = vec![2, 4];
+    s
+}
+
+/// Wait long enough for the background compaction thread to finish.
+fn wait_for_compaction() {
+    thread::sleep(Duration::from_millis(2000));
+}
+
+/// After two L0 segments are sealed, the compaction worker should merge them
+/// into one L1 segment. All vectors must remain searchable.
+#[test]
+fn compaction_merges_l0_segments() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+
+    // Insert 11 vectors. The 6th insert auto-seals seg0 (capacity=5); the 11th
+    // auto-seals seg1, leaving two sealed L0 segments and triggering compaction.
+    let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
+    for i in 1..11u32 {
+        last = col
+            .upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None)
+            .unwrap();
+    }
+    col.wait_visible(last).unwrap();
+    wait_for_compaction();
+
+    // All 11 vectors must still be findable after the L0→L1 merge.
+    for i in 0..11u32 {
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1, "d{i} not found after compaction");
+        assert_eq!(hits[0].doc_id, format!("d{i}"));
+    }
+}
+
+/// Tombstones committed before the compaction snapshot is taken must be
+/// honoured: the compacted segment should not contain the deleted vectors.
+#[test]
+fn compaction_removes_tombstones() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+
+    // Insert 10 vectors (seg0 auto-seals after d4), then delete d0–d4.
+    let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
+    for i in 1..10u32 {
+        last = col
+            .upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None)
+            .unwrap();
+    }
+    col.wait_visible(last).unwrap();
+    for i in 0..5u32 {
+        last = col.delete(&format!("d{i}")).unwrap();
+    }
+    col.wait_visible(last).unwrap();
+
+    // Insert d10 — this auto-seals seg1 (now at capacity), leaving two sealed
+    // L0 segments and triggering the compaction worker. Tombstones for d0–d4
+    // are already committed, so the merge will skip them.
+    last = col.upsert("d10", &[10.0, 0.0, 0.0], None).unwrap();
+    col.wait_visible(last).unwrap();
+    wait_for_compaction();
+
+    for i in 0..5u32 {
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 5).unwrap();
+        assert!(
+            !hits.iter().any(|h| h.doc_id == format!("d{i}")),
+            "d{i} should have been removed by compaction"
+        );
+    }
+    for i in 5..10u32 {
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1).unwrap();
+        assert_eq!(
+            hits[0].doc_id,
+            format!("d{i}"),
+            "d{i} should survive compaction"
+        );
+    }
+}
+
+/// Compacted-away segment directories must be deleted from disk after the commit.
+#[test]
+fn compaction_deletes_old_segment_dirs() {
+    let (db, dir) = make_db();
+    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+
+    // Insert 11 vectors: seg_000 auto-seals after d4, seg_001 auto-seals after
+    // d9 when d10 arrives, leaving two sealed L0 segments that trigger compaction.
+    // The compaction worker allocates seg_003 as the merged output
+    // (seg_002 is the writable segment holding d10).
+    let mut last = col.upsert("d0", &[0.0, 0.0, 0.0], None).unwrap();
+    for i in 1..11u32 {
+        last = col
+            .upsert(&format!("d{i}"), &[i as f32, 0.0, 0.0], None)
+            .unwrap();
+    }
+    col.wait_visible(last).unwrap();
+    wait_for_compaction();
+
+    let base = dir.path().join("c");
+    assert!(
+        !base.join("seg_000").exists(),
+        "seg_000 should be deleted after compaction"
+    );
+    assert!(
+        !base.join("seg_001").exists(),
+        "seg_001 should be deleted after compaction"
+    );
+    assert!(
+        base.join("seg_003").exists(),
+        "merged seg_003 should exist after compaction"
+    );
+}
+
+/// Metadata stored alongside vectors must be intact after compaction.
+#[test]
+fn compaction_preserves_metadata() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+
+    // Insert 11 vectors with metadata. The 11th auto-seals seg1, triggering compaction.
+    let mut last = col
+        .upsert("d0", &[0.0, 0.0, 0.0], Some(serde_json::json!({"n": 0})))
+        .unwrap();
+    for i in 1..11u32 {
+        last = col
+            .upsert(
+                &format!("d{i}"),
+                &[i as f32, 0.0, 0.0],
+                Some(serde_json::json!({"n": i})),
+            )
+            .unwrap();
+    }
+    col.wait_visible(last).unwrap();
+    wait_for_compaction();
+
+    for i in 0..10u32 {
+        let hits = col.search(&[i as f32, 0.0, 0.0], 1, true, false).unwrap();
+        assert_eq!(hits[0].doc_id, format!("d{i}"));
+        assert_eq!(
+            hits[0].metadata.as_ref().unwrap()["n"],
+            i,
+            "metadata for d{i} corrupted after compaction"
+        );
+    }
 }

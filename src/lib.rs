@@ -1,3 +1,4 @@
+mod compaction;
 #[cfg(feature = "testing")]
 pub mod dataset;
 pub mod db;
