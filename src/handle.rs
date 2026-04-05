@@ -458,24 +458,6 @@ impl CollectionHandle {
     }
 
     // -----------------------------------------------------------------------
-    // Segment management helpers (used in tests until Stage 4 test refactor)
-    // -----------------------------------------------------------------------
-
-    /// Seal the current writable segment and start a new one.
-    /// In Stage 4+, tests should use `segment_capacity: N` schema instead.
-    pub fn add_writable_segment(&self) -> Result<SegId> {
-        let inner = &self.inner;
-        // First, drain any pending WAL records so the writable segment
-        // is populated before we seal it.
-        self.drain_wal()?;
-        let mut state = inner.apply_state.lock().unwrap();
-        seal_and_new_segment(inner, &mut state)?;
-        inner.publish_snapshot(&state);
-        drop(state);
-        notify_worker(&inner.compaction_notify);
-        Ok(inner.apply_state.lock().unwrap().manifest.writable_segment)
-    }
-
     pub fn set_wal_rotation_bytes(&self, n: u64) {
         self.inner.wal.lock().unwrap().rotation_bytes = n;
     }
@@ -484,27 +466,6 @@ impl CollectionHandle {
         self.inner.wal.lock().unwrap().segments.len()
     }
 
-    /// Apply all pending WAL records synchronously. Used by add_writable_segment.
-    fn drain_wal(&self) -> Result<()> {
-        let inner = &self.inner;
-        let records = Wal::read_all_from_dir(&inner.wal_dir())?;
-        let mut state = inner.apply_state.lock().unwrap();
-        let pending: Vec<WalRecord> = records
-            .into_iter()
-            .filter(|r| r.seq > state.applied_seq)
-            .collect();
-        for record in &pending {
-            apply_entry(inner, &mut state, record)?;
-        }
-        if !pending.is_empty() {
-            let visible = state.applied_seq + 1;
-            inner.publish_snapshot(&state);
-            drop(state);
-            inner.visible_seq.fetch_max(visible, Ordering::Release);
-            inner.visible.1.notify_all();
-        }
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
