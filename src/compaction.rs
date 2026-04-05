@@ -1,4 +1,5 @@
 use std::{
+    os::unix::fs::FileExt,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +15,7 @@ use crate::{
     segment::{SealedSegment, WritableSegment},
     snapshot::SegmentSnapshot,
     storage::CompactionEntry,
-    types::{InternalId, Level, Manifest, SegId, SegmentMeta, SegmentState},
+    types::{Level, Manifest, SegId, SegmentMeta, SegmentState},
 };
 
 // How long the compaction coordinator sleeps between checks when idle.
@@ -147,7 +148,7 @@ pub(crate) fn select_candidates(
 /// `Storage::commit_compaction`.
 pub(crate) fn run_merge(
     inner: &CollectionInner,
-    input_segs: Vec<Arc<SealedSegment>>,
+    input_segs: Vec<(SegId, usize)>,
     new_seg_id: SegId,
     output_level: Level,
 ) -> Result<(SealedSegment, SegmentMeta, Vec<CompactionEntry>)> {
@@ -159,12 +160,11 @@ pub(crate) fn run_merge(
 
     // For each input segment, snapshot live entries from storage.
     // This gives us (doc_id, metadata) per internal_id (None = tombstoned).
-    let mut all_entries: Vec<(Arc<SealedSegment>, Vec<Option<(String, Option<serde_json::Value>)>>)> =
+    let mut all_entries: Vec<(SegId, Vec<Option<(String, Option<serde_json::Value>)>>)> =
         Vec::new();
-    for seg in &input_segs {
-        let entries =
-            storage.load_segment_live_entries(id, seg.seg_id(), seg.num_vectors())?;
-        all_entries.push((Arc::clone(seg), entries));
+    for (seg_id, num_vectors) in &input_segs {
+        let entries = storage.load_segment_live_entries(id, *seg_id, *num_vectors)?;
+        all_entries.push((*seg_id, entries));
     }
 
     // Create a new writable segment to accumulate live vectors.
@@ -177,13 +177,20 @@ pub(crate) fn run_merge(
 
     let mut compaction_entries: Vec<CompactionEntry> = Vec::new();
 
-    for (seg, live) in &all_entries {
+    let record_size = dimension * 4;
+    for (seg_id, live) in &all_entries {
+        let vec_path = inner.seg_dir(*seg_id).join("vectors.seg");
+        let vec_file = std::fs::File::open(&vec_path)?;
         for (i, entry_opt) in live.iter().enumerate() {
             let Some((doc_id, metadata)) = entry_opt else {
                 continue;
             };
-            let internal_id = InternalId::from_u32(i as u32);
-            let vector = seg.read_vector(internal_id, dimension)?;
+            let mut buf = vec![0u8; record_size];
+            vec_file.read_exact_at(&mut buf, i as u64 * record_size as u64)?;
+            let vector: Vec<f32> = buf
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             let new_internal_id = ws.insert(&vector, dimension)?;
             compaction_entries.push(CompactionEntry {
                 doc_id: doc_id.clone(),
@@ -247,22 +254,22 @@ fn run_level_compaction(
     let num_levels = schema.compaction_params.num_levels;
 
     // Build SegmentInfo from the published snapshot (read lock only).
-    // Keep `snap` alive so we can clone input Arcs from it without re-locking.
-    let snap = Arc::clone(&*inner.snapshot.read().unwrap());
-    let infos: Vec<SegmentInfo> = snap
-        .segs
-        .iter()
-        .filter_map(|s| match s {
-            SegmentSnapshot::Sealed(ss) => Some(ss.meta()),
-            _ => None,
-        })
-        .map(|m| SegmentInfo {
-            seg_id: m.seg_id,
-            num_vectors: m.num_vectors,
-            tombstone_count: m.tombstone_count,
-            level: m.level,
-        })
-        .collect();
+    let infos: Vec<SegmentInfo> = {
+        let snap = inner.snapshot.read().unwrap();
+        snap.segs
+            .iter()
+            .filter_map(|s| match s {
+                SegmentSnapshot::Sealed(ss) => Some(ss.meta()),
+                _ => None,
+            })
+            .map(|m| SegmentInfo {
+                seg_id: m.seg_id,
+                num_vectors: m.num_vectors,
+                tombstone_count: m.tombstone_count,
+                level: m.level,
+            })
+            .collect()
+    };
 
     let candidates = select_candidates(
         level,
@@ -276,20 +283,14 @@ fn run_level_compaction(
         return;
     }
 
-    // Claim input segment Arcs from the snapshot (no lock needed).
+    // Build input (seg_id, num_vectors) pairs from infos — no locking needed.
     let candidate_set: std::collections::HashSet<SegId> =
         candidates.iter().copied().collect();
-    let input_seg_arcs: Vec<Arc<SealedSegment>> = snap
-        .segs
+    let input_segs: Vec<(SegId, usize)> = infos
         .iter()
-        .filter_map(|s| match s {
-            SegmentSnapshot::Sealed(ss) if candidate_set.contains(&ss.seg_id()) => {
-                Some(Arc::clone(ss))
-            }
-            _ => None,
-        })
+        .filter(|info| candidate_set.contains(&info.seg_id))
+        .map(|info| (info.seg_id, info.num_vectors))
         .collect();
-    drop(snap);
 
     // Allocate a new seg_id under the apply_state lock.
     let new_seg_id = {
@@ -302,8 +303,8 @@ fn run_level_compaction(
     let output_level = level.output(num_levels);
 
     // Run the merge (no lock held).
-    let removed_seg_ids: Vec<SegId> = input_seg_arcs.iter().map(|s| s.seg_id()).collect();
-    let merge_result = run_merge(&inner, input_seg_arcs, new_seg_id, output_level);
+    let removed_seg_ids: Vec<SegId> = input_segs.iter().map(|(seg_id, _)| *seg_id).collect();
+    let merge_result = run_merge(&inner, input_segs, new_seg_id, output_level);
 
     let (new_sealed, new_seg_meta, compaction_entries) = match merge_result {
         Ok(r) => r,
