@@ -182,6 +182,11 @@ impl FromStr for Metric {
     }
 }
 
+const DEFAULT_M: usize = 16;
+const DEFAULT_EF_CONSTRUCTION: usize = 200;
+const DEFAULT_EF_SEARCH: usize = 50;
+const DEFAULT_SEGMENT_CAPACITY: usize = 500_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentParams {
     /// Number of bi-directional links per node in the HNSW graph.
@@ -200,10 +205,10 @@ pub struct SegmentParams {
 impl Default for SegmentParams {
     fn default() -> Self {
         Self {
-            m: 16,
-            ef_construction: 200,
-            ef_search: 50,
-            segment_capacity: 100_000,
+            m: DEFAULT_M,
+            ef_construction: DEFAULT_EF_CONSTRUCTION,
+            ef_search: DEFAULT_EF_SEARCH,
+            segment_capacity: DEFAULT_SEGMENT_CAPACITY,
         }
     }
 }
