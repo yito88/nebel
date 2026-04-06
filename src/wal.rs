@@ -97,6 +97,10 @@ pub(crate) struct Wal {
     pub(crate) segments: Vec<WalSegmentMeta>,
     writer: BufWriter<fs::File>,
     pub(crate) rotation_bytes: u64,
+    /// Monotonically increasing sequence counter. Allocated and incremented
+    /// inside `append`, which is always called under `Mutex<Wal>`, so no
+    /// atomics are needed.
+    next_seq: u64,
 }
 
 impl Wal {
@@ -139,6 +143,7 @@ impl Wal {
                 }],
                 writer: BufWriter::new(file),
                 rotation_bytes: WAL_ROTATION_BYTES,
+                next_seq: 0,
             });
         }
 
@@ -178,6 +183,7 @@ impl Wal {
             segments,
             writer: BufWriter::new(new_file),
             rotation_bytes: WAL_ROTATION_BYTES,
+            next_seq: 0,
         })
     }
 
@@ -200,10 +206,18 @@ impl Wal {
         Ok(())
     }
 
-    /// Append a record durably. Format: 4-byte LE length + JSON body + '\n'.
+    /// Allocate the next sequence number, append the operation durably, and
+    /// return the assigned seq. Format: 4-byte LE length + JSON body + '\n'.
     /// Rotates to a new segment file if the active file exceeds WAL_ROTATION_BYTES.
-    pub(crate) fn append(&mut self, record: &WalRecord) -> Result<()> {
-        let body = serde_json::to_vec(record)?;
+    ///
+    /// Because seq allocation and WAL write happen together under `Mutex<Wal>`,
+    /// seq order is guaranteed to match physical write order, which is required
+    /// for the apply worker's durable-seq tracking to be correct.
+    pub(crate) fn append(&mut self, op: WalOp) -> Result<u64> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let record = WalRecord { seq, op };
+        let body = serde_json::to_vec(&record)?;
         let len = body.len() as u32;
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&body)?;
@@ -214,16 +228,22 @@ impl Wal {
         let record_byte_size = (4 + body.len() + 1) as u64;
         let active = self.segments.last_mut().unwrap();
         if active.record_count == 0 {
-            active.start_seq = record.seq;
+            active.start_seq = seq;
         }
-        active.end_seq = Some(record.seq);
+        active.end_seq = Some(seq);
         active.record_count += 1;
         active.byte_size += record_byte_size;
 
         if active.byte_size >= self.rotation_bytes {
             self.rotate()?;
         }
-        Ok(())
+        Ok(seq)
+    }
+
+    /// Reset the next sequence number. Called after recovery to continue from
+    /// the highest applied seq rather than from 0.
+    pub(crate) fn reset_next_seq(&mut self, next: u64) {
+        self.next_seq = next;
     }
 
     /// Close the current active segment and open a new one with the next wal_id.
