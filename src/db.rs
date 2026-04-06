@@ -180,9 +180,7 @@ impl Db {
             let state = inner.apply_state.lock().unwrap();
             let applied = state.applied_seq;
             if applied > applied_seq_stored {
-                inner
-                    .next_seq
-                    .store(applied + 1, std::sync::atomic::Ordering::Relaxed);
+                inner.wal.lock().unwrap().reset_next_seq(applied + 1);
                 inner
                     .durable_seq
                     .store(applied, std::sync::atomic::Ordering::Release);

@@ -102,7 +102,6 @@ pub(crate) struct CollectionInner {
     /// Per-level in-progress flags. Prevents concurrent merges at the same level.
     /// Length == `schema.compaction_params.num_levels`.
     pub(crate) level_busy: Arc<Vec<AtomicBool>>,
-    pub(crate) next_seq: AtomicU64,
     /// Highest seq that has been fsync'd to WAL. Updated by writers after sync_all.
     /// The apply worker only processes records up to this value.
     pub(crate) durable_seq: AtomicU64,
@@ -122,7 +121,10 @@ impl CollectionInner {
         applied_seq: u64,
         schema: Arc<CollectionSchema>,
     ) -> Result<Arc<Self>> {
-        let wal = Wal::open_dir(&base_dir.join(id.as_str()).join("wal"))?;
+        let mut wal = Wal::open_dir(&base_dir.join(id.as_str()).join("wal"))?;
+        // Seq allocation lives inside Wal (under its mutex). Set the starting
+        // value so new records continue from where recovery left off.
+        wal.reset_next_seq(applied_seq + 1);
 
         let initial_segs = sealed_segs
             .iter()
@@ -157,8 +159,6 @@ impl CollectionInner {
             notify: Arc::new((Mutex::new(false), Condvar::new())),
             compaction_notify: Arc::new((Mutex::new(false), Condvar::new())),
             level_busy,
-            // Start at applied_seq + 1 so first WAL record gets seq > applied_seq.
-            next_seq: AtomicU64::new(applied_seq + 1),
             // durable_seq starts at applied_seq: after recovery WAL is empty, so the
             // worker's cursor (last_applied_seq = applied_seq) won't read anything
             // until a real write bumps durable_seq above applied_seq.
@@ -286,14 +286,10 @@ impl CollectionHandle {
                 vector.len()
             );
         }
-        let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
-        inner.wal.lock().unwrap().append(&WalRecord {
-            seq,
-            op: WalOp::Upsert {
-                doc_id: doc_id.to_string(),
-                vector: vector.to_vec(),
-                metadata,
-            },
+        let seq = inner.wal.lock().unwrap().append(WalOp::Upsert {
+            doc_id: doc_id.to_string(),
+            vector: vector.to_vec(),
+            metadata,
         })?;
         inner.durable_seq.fetch_max(seq, Ordering::Release);
         notify_worker(&inner.notify);
@@ -302,13 +298,11 @@ impl CollectionHandle {
 
     pub fn delete(&self, doc_id: &str) -> Result<WriteToken> {
         let inner = &self.inner;
-        let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
-        inner.wal.lock().unwrap().append(&WalRecord {
-            seq,
-            op: WalOp::Delete {
-                doc_id: doc_id.to_string(),
-            },
-        })?;
+        let seq = inner
+            .wal
+            .lock()
+            .unwrap()
+            .append(WalOp::Delete { doc_id: doc_id.to_string() })?;
         inner.durable_seq.fetch_max(seq, Ordering::Release);
         notify_worker(&inner.notify);
         Ok(WriteToken(seq + 1))
@@ -316,13 +310,9 @@ impl CollectionHandle {
 
     pub fn update_metadata(&self, doc_id: &str, metadata: Value) -> Result<WriteToken> {
         let inner = &self.inner;
-        let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
-        inner.wal.lock().unwrap().append(&WalRecord {
-            seq,
-            op: WalOp::UpdateMetadata {
-                doc_id: doc_id.to_string(),
-                metadata,
-            },
+        let seq = inner.wal.lock().unwrap().append(WalOp::UpdateMetadata {
+            doc_id: doc_id.to_string(),
+            metadata,
         })?;
         inner.durable_seq.fetch_max(seq, Ordering::Release);
         notify_worker(&inner.notify);
