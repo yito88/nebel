@@ -348,9 +348,18 @@ fn run_recall_mode(
 // ---------------------------------------------------------------------------
 
 enum MutationOp {
-    Insert { doc_id: String, vector: Vec<f32> },
-    Update { doc_id: String, new_vector: Vec<f32> },
-    Delete { doc_id: String, original_vector: Vec<f32> },
+    Insert {
+        doc_id: String,
+        vector: Vec<f32>,
+    },
+    Update {
+        doc_id: String,
+        new_vector: Vec<f32>,
+    },
+    Delete {
+        doc_id: String,
+        original_vector: Vec<f32>,
+    },
 }
 
 fn run_mutation_mode(
@@ -459,7 +468,12 @@ fn run_mutation_mode(
                         hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>()
                     )
                 };
-                results.push(MutationResult { kind: "insert", doc_id: doc_id.clone(), passed: found, detail });
+                results.push(MutationResult {
+                    kind: "insert",
+                    doc_id: doc_id.clone(),
+                    passed: found,
+                    detail,
+                });
             }
             MutationOp::Update { doc_id, new_vector } => {
                 let hits = col.search_exact(new_vector, 2)?;
@@ -473,17 +487,33 @@ fn run_mutation_mode(
                         hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>()
                     )
                 };
-                results.push(MutationResult { kind: "update", doc_id: doc_id.clone(), passed: found, detail });
+                results.push(MutationResult {
+                    kind: "update",
+                    doc_id: doc_id.clone(),
+                    passed: found,
+                    detail,
+                });
             }
-            MutationOp::Delete { doc_id, original_vector } => {
+            MutationOp::Delete {
+                doc_id,
+                original_vector,
+            } => {
                 let hits = col.search_exact(original_vector, k_delete)?;
                 let absent = hits.iter().all(|h| h.doc_id != *doc_id);
                 let detail = if absent {
                     String::new()
                 } else {
-                    format!("'{}' still appears in top-{} results after deletion", doc_id, k_delete)
+                    format!(
+                        "'{}' still appears in top-{} results after deletion",
+                        doc_id, k_delete
+                    )
                 };
-                results.push(MutationResult { kind: "delete", doc_id: doc_id.clone(), passed: absent, detail });
+                results.push(MutationResult {
+                    kind: "delete",
+                    doc_id: doc_id.clone(),
+                    passed: absent,
+                    detail,
+                });
             }
         }
     }
@@ -493,7 +523,10 @@ fn run_mutation_mode(
     let failed = total - passed;
 
     println!("\n===== Mutation Verification Results =====");
-    println!("Total mutations: {}  (inserts={}, updates={}, deletes={})", total, n_inserts, n_updates, n_deletes);
+    println!(
+        "Total mutations: {}  (inserts={}, updates={}, deletes={})",
+        total, n_inserts, n_updates, n_deletes
+    );
     println!("Passed: {}", passed);
     println!("Failed: {}", failed);
 
@@ -502,7 +535,11 @@ fn run_mutation_mode(
         for r in results.iter().filter(|r| !r.passed) {
             println!("  [{}] doc_id='{}' -- {}", r.kind, r.doc_id, r.detail);
         }
-        bail!("mutation verification failed: {}/{} checks failed", failed, total);
+        bail!(
+            "mutation verification failed: {}/{} checks failed",
+            failed,
+            total
+        );
     }
 
     println!("All mutation checks passed.");
