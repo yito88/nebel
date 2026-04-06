@@ -298,11 +298,9 @@ impl CollectionHandle {
 
     pub fn delete(&self, doc_id: &str) -> Result<WriteToken> {
         let inner = &self.inner;
-        let seq = inner
-            .wal
-            .lock()
-            .unwrap()
-            .append(WalOp::Delete { doc_id: doc_id.to_string() })?;
+        let seq = inner.wal.lock().unwrap().append(WalOp::Delete {
+            doc_id: doc_id.to_string(),
+        })?;
         inner.durable_seq.fetch_max(seq, Ordering::Release);
         notify_worker(&inner.notify);
         Ok(WriteToken(seq + 1))
