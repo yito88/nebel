@@ -368,7 +368,7 @@ fn make_compaction_schema(name: &str) -> CollectionSchema {
     let mut s = CollectionSchema::new(col(name), 3, Metric::L2);
     s.segment_params.segment_capacity = 5;
     s.compaction_params.num_levels = 2;
-    s.compaction_params.level_count_thresholds = vec![2, 4];
+    s.compaction_params.level_count_multiplier = 1;
     s
 }
 

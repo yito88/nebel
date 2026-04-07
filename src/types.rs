@@ -61,33 +61,30 @@ impl fmt::Display for Level {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_NUM_LEVELS: usize = 4;
-const DEFAULT_COUNT_THRESHOLDS: [usize; 4] = [4, 8, 16, 32];
+const DEFAULT_COUNT_MULTIPLIER: usize = 2;
 const DEFAULT_TOMBSTONE_THRESHOLD: f64 = 0.2;
-const DEFAULT_PACKING_FILL_FACTOR: f64 = 0.8;
 
 /// Policy parameters for the tiered compaction worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionParams {
     /// Number of compaction levels (L0 = ingest level, top level = highest).
     pub num_levels: usize,
-    /// Minimum sealed segment count per level before the count-trigger fires.
-    /// `level_count_thresholds[i]` is the threshold for level `i`.
-    /// Length must equal `num_levels`.
-    pub level_count_thresholds: Vec<usize>,
+    /// Fanout multiplier for per-level count thresholds.
+    /// The threshold for level `i` is `level_count_multiplier.pow(i + 2)`, so
+    /// the default of 2 yields thresholds [4, 8, 16, 32] for a 4-level hierarchy.
+    pub level_count_multiplier: usize,
     /// Tombstone ratio above which a level becomes eligible for compaction.
+    /// Also determines the packing fill factor as `1 - tombstone_threshold`:
+    /// segments are packed to leave exactly enough headroom for this ratio of deletions.
     pub tombstone_threshold: f64,
-    /// Target fill factor: accumulate input segments until
-    /// `live_vectors >= next_level_capacity * packing_fill_factor`.
-    pub packing_fill_factor: f64,
 }
 
 impl Default for CompactionParams {
     fn default() -> Self {
         Self {
             num_levels: DEFAULT_NUM_LEVELS,
-            level_count_thresholds: DEFAULT_COUNT_THRESHOLDS.to_vec(),
+            level_count_multiplier: DEFAULT_COUNT_MULTIPLIER,
             tombstone_threshold: DEFAULT_TOMBSTONE_THRESHOLD,
-            packing_fill_factor: DEFAULT_PACKING_FILL_FACTOR,
         }
     }
 }
