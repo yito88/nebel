@@ -277,7 +277,7 @@ impl SegmentMeta {
 }
 
 /// Location of a document within storage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocLocation {
     pub seg_id: SegId,
     pub internal_id: InternalId,

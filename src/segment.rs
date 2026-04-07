@@ -203,6 +203,7 @@ impl WritableSegment {
         let metric = self.index.metric();
         self.index.file_dump(&self.meta.dir, INDEX_BASENAME)?;
         let (index, index_io) = load_index(&self.meta.dir, &metric)?;
+        let vector_file = fs::File::open(self.meta.dir.join("vectors.seg"))?;
         Ok(SealedSegment {
             meta: SegmentMeta {
                 seg_id: self.meta.seg_id,
@@ -214,6 +215,7 @@ impl WritableSegment {
             dir: self.meta.dir.clone(),
             index,
             ef_search: self.ef_search,
+            vector_file,
             index_io,
         })
     }
@@ -327,6 +329,9 @@ pub struct SealedSegment {
     dir: PathBuf,
     index: HnswIndex,
     ef_search: usize,
+    /// Open file handle to vectors.seg. Kept open so that reads remain valid even
+    /// after the segment directory is removed by compaction (Unix unlink semantics).
+    vector_file: fs::File,
     #[allow(dead_code)]
     index_io: Box<HnswIo>,
 }
@@ -355,6 +360,7 @@ impl SealedSegment {
         tombstone_count: usize,
     ) -> Result<Self> {
         let (index, index_io) = load_index(&dir, metric)?;
+        let vector_file = fs::File::open(dir.join("vectors.seg"))?;
         Ok(Self {
             meta: SegmentMeta {
                 seg_id,
@@ -366,6 +372,7 @@ impl SealedSegment {
             dir,
             index,
             ef_search,
+            vector_file,
             index_io,
         })
     }
@@ -385,9 +392,7 @@ impl SealedSegment {
         let record_size = dimension * 4;
         let offset = internal_id.as_usize() as u64 * record_size as u64;
         let mut buf = vec![0u8; record_size];
-        let path = self.dir.join("vectors.seg");
-        let file = fs::File::open(&path)?;
-        file.read_exact_at(&mut buf, offset)?;
+        self.vector_file.read_exact_at(&mut buf, offset)?;
         Ok(bytes_to_f32(&buf))
     }
 }

@@ -6,7 +6,9 @@ use crate::types::{
     VectorEntry,
 };
 
-type LiveEntries = Vec<Option<(String, Option<serde_json::Value>)>>;
+/// `(doc_id, metadata, prev_location)` — `prev_location` is the DOC_MAP value at
+/// the time of the read, used by compaction to detect concurrent updates.
+type LiveEntries = Vec<Option<(String, Option<serde_json::Value>, Option<DocLocation>)>>;
 
 // table definitions
 
@@ -455,6 +457,7 @@ impl Storage {
         let tomb_table = rtxn.open_table(TOMBSTONES)?;
         let rev_table = rtxn.open_table(REVERSE_DOC)?;
         let meta_table = rtxn.open_table(METADATA)?;
+        let doc_table = rtxn.open_table(DOC_MAP)?;
 
         let mut out = Vec::with_capacity(num_vectors);
         for i in 0..num_vectors {
@@ -479,7 +482,12 @@ impl Storage {
                 Some(v) => Some(serde_json::from_str(v.value())?),
                 None => None,
             };
-            out.push(Some((doc_id, metadata)));
+            let dk = doc_key(col, &doc_id);
+            let prev_location: Option<DocLocation> = match doc_table.get(dk.as_str())? {
+                Some(v) => Some(serde_json::from_str(v.value())?),
+                None => None,
+            };
+            out.push(Some((doc_id, metadata, prev_location)));
         }
         Ok(out)
     }
@@ -537,8 +545,10 @@ impl Storage {
                     None => true,
                     // Doc was moved to a segment not in our input set (re-upserted during merge).
                     Some(loc) if !removed_set.contains(&loc.seg_id) => true,
-                    // Doc still points into one of the merged (now removed) segments.
-                    Some(_) => false,
+                    // Doc points into the merged set, but DOC_MAP changed since we read the
+                    // segment (concurrent upsert landed in another input segment). Tombstone
+                    // our stale copy so the concurrent write remains authoritative.
+                    Some(loc) => Some(loc) != entry.prev_location.as_ref(),
                 };
 
                 if should_tombstone {
@@ -608,6 +618,11 @@ pub struct CompactionEntry {
     pub doc_id: String,
     pub new_internal_id: InternalId,
     pub metadata: Option<serde_json::Value>,
+    /// DOC_MAP value at the time `load_segment_live_entries` read this doc.
+    /// `None` means the doc had no DOC_MAP entry (fresh insert not yet committed —
+    /// should not normally appear in a sealed segment, but handled defensively).
+    /// Used in `commit_compaction` to detect concurrent updates.
+    pub prev_location: Option<DocLocation>,
 }
 
 /// Set of tombstoned `(seg_id, internal_id)` pairs for a collection,
