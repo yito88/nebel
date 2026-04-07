@@ -443,14 +443,15 @@ fn run_mutation_mode(
                 *post_freq.entry(vec_key(vector)).or_insert(0) += 1;
             }
             MutationOp::Update { doc_id, new_vector } => {
-                let base_idx: usize =
-                    doc_id.strip_prefix("doc_").unwrap().parse().unwrap();
+                let base_idx: usize = doc_id.strip_prefix("doc_").unwrap().parse().unwrap();
                 if let Some(c) = post_freq.get_mut(&vec_key(&base_vectors[base_idx])) {
                     *c = c.saturating_sub(1);
                 }
                 *post_freq.entry(vec_key(new_vector)).or_insert(0) += 1;
             }
-            MutationOp::Delete { original_vector, .. } => {
+            MutationOp::Delete {
+                original_vector, ..
+            } => {
                 let k = vec_key(original_vector);
                 if let Some(c) = post_freq.get_mut(&k) {
                     *c = c.saturating_sub(1);
@@ -458,9 +459,7 @@ fn run_mutation_mode(
             }
         }
     }
-    let post_freq_of = |v: &[f32]| -> usize {
-        *post_freq.get(&vec_key(v)).unwrap_or(&1)
-    };
+    let post_freq_of = |v: &[f32]| -> usize { *post_freq.get(&vec_key(v)).unwrap_or(&1) };
 
     println!(
         "Submitting {} mutations (inserts={}, updates={}, deletes={}, concurrency={})...",
@@ -524,7 +523,8 @@ fn run_mutation_mode(
                 } else {
                     format!(
                         "expected '{}' in top-{}, got {:?}",
-                        doc_id, k,
+                        doc_id,
+                        k,
                         hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>()
                     )
                 };
@@ -544,7 +544,8 @@ fn run_mutation_mode(
                 } else {
                     format!(
                         "expected '{}' in top-{} after update, got {:?}",
-                        doc_id, k,
+                        doc_id,
+                        k,
                         hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>()
                     )
                 };
