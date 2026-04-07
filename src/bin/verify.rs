@@ -13,7 +13,7 @@ use nebel::{
     Db,
     dataset::{load_groundtruth, load_vectors, write_raw_f32},
     eval::{hits_to_ids, recall_at_k},
-    types::{CollectionId, CollectionSchema, Metric, SegmentParams, WriteToken},
+    types::{CollectionId, CollectionSchema, CompactionParams, Metric, SegmentParams, WriteToken},
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +89,11 @@ struct Cli {
     /// Number of mutation checks (mutation mode only)
     #[arg(long, default_value_t = 100)]
     num_mutations: usize,
+
+    /// Minimum sealed segment count per level before compaction triggers.
+    /// A single value applied to all levels (overrides default [4,8,16,32]).
+    #[arg(long)]
+    level_threshold: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +107,15 @@ fn main() -> Result<()> {
         ef_construction: cli.ef_construction,
         ef_search: cli.ef_search,
         segment_capacity: cli.segment_capacity,
+    };
+    let compaction_params = if let Some(t) = cli.level_threshold {
+        let default = CompactionParams::default();
+        CompactionParams {
+            level_count_thresholds: vec![t; default.num_levels],
+            ..default
+        }
+    } else {
+        CompactionParams::default()
     };
 
     // 1. Load base vectors
@@ -136,7 +150,7 @@ fn main() -> Result<()> {
                     dimension: dim,
                     metric: cli.metric.clone(),
                     segment_params: params.clone(),
-                    compaction_params: Default::default(),
+                    compaction_params: compaction_params.clone(),
                 };
                 (db.create_collection(schema)?, false)
             }
@@ -405,6 +419,49 @@ fn run_mutation_mode(
         });
     }
 
+    // Build a post-mutation frequency map: vector bytes → number of docs in the
+    // DB that will have that vector after all mutations are applied.
+    //
+    // This is used to pick the right k for insert/update verification. The
+    // search returns the top-k closest docs; when multiple docs share the exact
+    // same vector (distance 0) we need k to be at least the total number of
+    // such docs — otherwise the target doc can legitimately fall outside top-k.
+    //
+    // Ties can come from:
+    //   (a) duplicate vectors in the base dataset itself, OR
+    //   (b) multiple mutation ops (across inserts and updates) that land on the
+    //       same vector as each other or as an existing base doc.
+    let vec_key = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+    let mut post_freq: std::collections::HashMap<Vec<u8>, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for v in base_vectors.iter() {
+        *post_freq.entry(vec_key(v)).or_insert(0) += 1;
+    }
+    for op in &ops {
+        match op {
+            MutationOp::Insert { vector, .. } => {
+                *post_freq.entry(vec_key(vector)).or_insert(0) += 1;
+            }
+            MutationOp::Update { doc_id, new_vector } => {
+                let base_idx: usize =
+                    doc_id.strip_prefix("doc_").unwrap().parse().unwrap();
+                if let Some(c) = post_freq.get_mut(&vec_key(&base_vectors[base_idx])) {
+                    *c = c.saturating_sub(1);
+                }
+                *post_freq.entry(vec_key(new_vector)).or_insert(0) += 1;
+            }
+            MutationOp::Delete { original_vector, .. } => {
+                let k = vec_key(original_vector);
+                if let Some(c) = post_freq.get_mut(&k) {
+                    *c = c.saturating_sub(1);
+                }
+            }
+        }
+    }
+    let post_freq_of = |v: &[f32]| -> usize {
+        *post_freq.get(&vec_key(v)).unwrap_or(&1)
+    };
+
     println!(
         "Submitting {} mutations (inserts={}, updates={}, deletes={}, concurrency={})...",
         num_mutations, n_inserts, n_updates, n_deletes, cli.concurrency,
@@ -456,15 +513,18 @@ fn run_mutation_mode(
     for op in &ops {
         match op {
             MutationOp::Insert { doc_id, vector } => {
-                // k=2: handles tie with the existing doc that shares the same base vector
-                let hits = col.search_exact(vector, 2)?;
+                // k = post-mutation count for this vector: covers the new doc
+                // plus any other docs (original or from other mutation ops)
+                // that share the same vector and would tie at distance 0.
+                let k = post_freq_of(vector);
+                let hits = col.search_exact(vector, k)?;
                 let found = hits.iter().any(|h| h.doc_id == *doc_id);
                 let detail = if found {
                     String::new()
                 } else {
                     format!(
-                        "expected '{}' in top-2, got {:?}",
-                        doc_id,
+                        "expected '{}' in top-{}, got {:?}",
+                        doc_id, k,
                         hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>()
                     )
                 };
@@ -476,14 +536,15 @@ fn run_mutation_mode(
                 });
             }
             MutationOp::Update { doc_id, new_vector } => {
-                let hits = col.search_exact(new_vector, 2)?;
+                let k = post_freq_of(new_vector);
+                let hits = col.search_exact(new_vector, k)?;
                 let found = hits.iter().any(|h| h.doc_id == *doc_id);
                 let detail = if found {
                     String::new()
                 } else {
                     format!(
-                        "expected '{}' in top-2 after update, got {:?}",
-                        doc_id,
+                        "expected '{}' in top-{} after update, got {:?}",
+                        doc_id, k,
                         hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>()
                     )
                 };
