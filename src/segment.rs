@@ -212,7 +212,6 @@ impl WritableSegment {
                 tombstone_count: 0,
                 level,
             },
-            dir: self.meta.dir.clone(),
             index,
             ef_search: self.ef_search,
             vector_file,
@@ -326,7 +325,6 @@ impl WritableSegment {
 /// A read-only segment whose HNSW index has been persisted to disk and memory-mapped.
 pub struct SealedSegment {
     meta: SegmentMeta,
-    dir: PathBuf,
     index: HnswIndex,
     ef_search: usize,
     /// Open file handle to vectors.seg. Kept open so that reads remain valid even
@@ -369,7 +367,6 @@ impl SealedSegment {
                 tombstone_count,
                 level,
             },
-            dir,
             index,
             ef_search,
             vector_file,
