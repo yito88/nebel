@@ -58,7 +58,7 @@ impl SegmentInfo {
 pub(crate) fn evaluate_triggers(
     infos: &[SegmentInfo],
     num_levels: usize,
-    level_count_thresholds: &[usize],
+    level_count_multiplier: usize,
     tombstone_threshold: f64,
 ) -> Vec<Level> {
     let mut eligible = Vec::new();
@@ -69,7 +69,7 @@ pub(crate) fn evaluate_triggers(
         if at_level.is_empty() {
             continue;
         }
-        let threshold = level_count_thresholds.get(i).copied().unwrap_or(usize::MAX);
+        let threshold = level_count_multiplier.pow((i + 2) as u32);
         let count_trigger = !level.is_top(num_levels) && at_level.len() >= threshold;
         let tombstone_trigger = at_level
             .iter()
@@ -94,8 +94,9 @@ pub(crate) fn select_candidates(
     infos: &[SegmentInfo],
     base_capacity: usize,
     num_levels: usize,
-    packing_fill_factor: f64,
+    tombstone_threshold: f64,
 ) -> std::collections::HashSet<SegId> {
+    let packing_fill_factor = 1.0 - tombstone_threshold;
     let target_live =
         (level.output(num_levels).capacity(base_capacity) as f64 * packing_fill_factor) as usize;
 
@@ -263,7 +264,7 @@ fn run_level_compaction(
         &infos,
         schema.segment_params.segment_capacity,
         num_levels,
-        schema.compaction_params.packing_fill_factor,
+        schema.compaction_params.tombstone_threshold,
     );
     if candidates.is_empty() {
         level_busy[level.as_usize()].store(false, Ordering::Release);
@@ -413,7 +414,7 @@ pub(crate) fn compaction_worker_loop(
         let eligible = evaluate_triggers(
             &infos,
             num_levels,
-            &schema.compaction_params.level_count_thresholds,
+            schema.compaction_params.level_count_multiplier,
             schema.compaction_params.tombstone_threshold,
         );
 

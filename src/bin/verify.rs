@@ -90,10 +90,9 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     num_mutations: usize,
 
-    /// Minimum sealed segment count per level before compaction triggers.
-    /// A single value applied to all levels (overrides default [4,8,16,32]).
+    /// Fanout multiplier for per-level count thresholds (overrides default 2).
     #[arg(long)]
-    level_threshold: Option<usize>,
+    level_count_multiplier: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,11 +107,10 @@ fn main() -> Result<()> {
         ef_search: cli.ef_search,
         segment_capacity: cli.segment_capacity,
     };
-    let compaction_params = if let Some(t) = cli.level_threshold {
-        let default = CompactionParams::default();
+    let compaction_params = if let Some(m) = cli.level_count_multiplier {
         CompactionParams {
-            level_count_thresholds: vec![t; default.num_levels],
-            ..default
+            level_count_multiplier: m,
+            ..CompactionParams::default()
         }
     } else {
         CompactionParams::default()
