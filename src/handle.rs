@@ -297,9 +297,34 @@ impl CollectionHandle {
         Ok(WriteToken(seq + 1))
     }
 
+    /// Upsert a batch of vectors atomically: all entries in the batch are written to the WAL with
+    /// a single `fsync`, so either the entire batch is durable or none of it is.
+    ///
+    /// # Duplicate `doc_id` handling
+    ///
+    /// If the same `doc_id` appears more than once in `entries`, only the **last** occurrence is
+    /// kept. Earlier entries for the same `doc_id` are silently discarded before writing to the
+    /// WAL.
+    ///
+    /// # Batch size limit
+    ///
+    /// `entries` must contain at most [`APPLY_BATCH_MAX`] entries. Larger slices are rejected with
+    /// an error.
+    ///
+    /// # Visibility
+    ///
+    /// The returned [`WriteToken`] can be passed to [`Collection::wait_visible`] to block until
+    /// all vectors in the batch have been applied and are visible to search.
     pub fn upsert_batch(&self, entries: &[(&str, &[f32], Option<Value>)]) -> Result<WriteToken> {
         if entries.is_empty() {
             return Ok(WriteToken(self.inner.durable_seq.load(Ordering::Acquire)));
+        }
+        if entries.len() > APPLY_BATCH_MAX {
+            bail!(
+                "batch size {} exceeds maximum of {}",
+                entries.len(),
+                APPLY_BATCH_MAX
+            );
         }
         let inner = &self.inner;
         let expected_dim = inner.schema.dimension;
@@ -313,12 +338,23 @@ impl CollectionHandle {
                 );
             }
         }
-        let ops: Vec<WalOp> = entries
+        // Deduplicate by doc_id: last entry wins.
+        let mut seen: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(entries.len());
+        for (i, (doc_id, _, _)) in entries.iter().enumerate() {
+            seen.insert(doc_id, i);
+        }
+        let mut deduped: Vec<usize> = seen.into_values().collect();
+        deduped.sort_unstable();
+        let ops: Vec<WalOp> = deduped
             .iter()
-            .map(|(doc_id, vector, metadata)| WalOp::Upsert {
-                doc_id: doc_id.to_string(),
-                vector: vector.to_vec(),
-                metadata: metadata.clone(),
+            .map(|&i| {
+                let (doc_id, vector, metadata) = &entries[i];
+                WalOp::Upsert {
+                    doc_id: doc_id.to_string(),
+                    vector: vector.to_vec(),
+                    metadata: metadata.clone(),
+                }
             })
             .collect();
         let last_seq = inner.wal.lock().unwrap().append_batch(ops)?;
