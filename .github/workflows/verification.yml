@@ -64,6 +64,7 @@ jobs:
             --base-file data/raw/sift/sift_learn.fvecs \
             --segment-capacity 200 \
             --num-mutations 600 \
+            --concurrency 4 \
             | tee mutation_output.txt
 
       - name: Check recall threshold
