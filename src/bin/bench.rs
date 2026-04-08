@@ -79,7 +79,7 @@ struct Cli {
     #[arg(long, default_value_t = 50)]
     ef_search: usize,
 
-    #[arg(long, default_value_t = 100_000)]
+    #[arg(long, default_value_t = 500_000)]
     segment_capacity: usize,
 
     // --- shared execution ---

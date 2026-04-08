@@ -29,7 +29,7 @@ use crate::{
 };
 
 const INGEST_BATCH_SIZE: usize = 2048;
-const APPLY_BATCH_MAX: usize = 1000;
+const APPLY_BATCH_MAX: usize = 2048;
 const APPLY_INTERVAL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
