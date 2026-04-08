@@ -4,6 +4,7 @@ use nebel::{
     Db,
     types::{CollectionId, CollectionSchema, Metric},
 };
+use serde_json::json;
 use tempfile::tempdir;
 
 fn make_db() -> (Db, tempfile::TempDir) {
@@ -512,4 +513,79 @@ fn compaction_preserves_metadata() {
             "metadata for d{i} corrupted after compaction"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// upsert_batch tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upsert_batch_basic() {
+    let (db, _dir) = make_db();
+    let col = db
+        .create_collection(CollectionSchema::new(col("col"), 3, Metric::L2))
+        .unwrap();
+
+    let token = col
+        .upsert_batch(&[
+            ("a", [1.0f32, 0.0, 0.0].as_slice(), None),
+            ("b", [0.0, 1.0, 0.0].as_slice(), None),
+            ("c", [0.0, 0.0, 1.0].as_slice(), None),
+        ])
+        .unwrap();
+    col.wait_visible(token).unwrap();
+
+    let hits = col.search(&[1.0, 0.01, 0.0], 1, false, false).unwrap();
+    assert_eq!(hits[0].doc_id, "a");
+    let hits = col.search(&[0.0, 1.0, 0.01], 1, false, false).unwrap();
+    assert_eq!(hits[0].doc_id, "b");
+    let hits = col.search(&[0.0, 0.01, 1.0], 1, false, false).unwrap();
+    assert_eq!(hits[0].doc_id, "c");
+}
+
+#[test]
+fn upsert_batch_empty_is_noop() {
+    let (db, _dir) = make_db();
+    let col = db
+        .create_collection(CollectionSchema::new(col("col"), 3, Metric::L2))
+        .unwrap();
+
+    let token = col.upsert_batch(&[]).unwrap();
+    col.wait_visible(token).unwrap();
+}
+
+#[test]
+fn upsert_batch_dimension_mismatch() {
+    let (db, _dir) = make_db();
+    let col = db
+        .create_collection(CollectionSchema::new(col("col"), 3, Metric::L2))
+        .unwrap();
+
+    let result = col.upsert_batch(&[
+        ("a", [1.0f32, 0.0, 0.0].as_slice(), None),
+        ("b", [0.0, 1.0].as_slice(), None), // wrong dim
+    ]);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("index 1"), "error should mention index: {msg}");
+}
+
+#[test]
+fn upsert_batch_with_metadata() {
+    let (db, _dir) = make_db();
+    let col = db
+        .create_collection(CollectionSchema::new(col("col"), 2, Metric::L2))
+        .unwrap();
+
+    let token = col
+        .upsert_batch(&[
+            ("x", [1.0f32, 0.0].as_slice(), Some(json!({"label": "x"}))),
+            ("y", [0.0, 1.0].as_slice(), None),
+        ])
+        .unwrap();
+    col.wait_visible(token).unwrap();
+
+    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    assert_eq!(hits[0].doc_id, "x");
+    assert_eq!(hits[0].metadata.as_ref().unwrap()["label"], "x");
 }

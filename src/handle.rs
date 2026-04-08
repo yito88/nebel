@@ -297,6 +297,39 @@ impl CollectionHandle {
         Ok(WriteToken(seq + 1))
     }
 
+    pub fn upsert_batch(
+        &self,
+        entries: &[(&str, &[f32], Option<Value>)],
+    ) -> Result<WriteToken> {
+        if entries.is_empty() {
+            return Ok(WriteToken(self.inner.durable_seq.load(Ordering::Acquire)));
+        }
+        let inner = &self.inner;
+        let expected_dim = inner.schema.dimension;
+        for (i, (_, vector, _)) in entries.iter().enumerate() {
+            if vector.len() != expected_dim {
+                bail!(
+                    "dimension mismatch at index {}: expected {}, got {}",
+                    i,
+                    expected_dim,
+                    vector.len()
+                );
+            }
+        }
+        let ops: Vec<WalOp> = entries
+            .iter()
+            .map(|(doc_id, vector, metadata)| WalOp::Upsert {
+                doc_id: doc_id.to_string(),
+                vector: vector.to_vec(),
+                metadata: metadata.clone(),
+            })
+            .collect();
+        let last_seq = inner.wal.lock().unwrap().append_batch(ops)?;
+        inner.durable_seq.fetch_max(last_seq, Ordering::Release);
+        notify_worker(&inner.notify);
+        Ok(WriteToken(last_seq + 1))
+    }
+
     pub fn delete(&self, doc_id: &str) -> Result<WriteToken> {
         let inner = &self.inner;
         let seq = inner.wal.lock().unwrap().append(WalOp::Delete {
