@@ -374,7 +374,7 @@ fn flush_upsert_batch(
 // ---------------------------------------------------------------------------
 
 /// Apply a single WAL record to `state`. Shared between the apply worker and recovery.
-pub(crate) fn apply_entry(
+fn apply_entry(
     inner: &CollectionInner,
     state: &mut ApplyState,
     record: &WalRecord,

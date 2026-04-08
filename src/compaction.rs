@@ -26,7 +26,7 @@ const CHUNK_VEC_NUM: usize = 2048;
 
 /// Per-segment summary used by trigger evaluation and candidate selection.
 #[derive(Debug, Clone)]
-pub(crate) struct SegmentInfo {
+struct SegmentInfo {
     pub seg_id: SegId,
     pub num_vectors: usize,
     pub tombstone_count: usize,
@@ -56,7 +56,7 @@ impl SegmentInfo {
 /// For levels 0..top-1: triggers when `segment_count >= threshold` OR
 ///   any segment at that level has `tombstone_ratio > tombstone_threshold`.
 /// For the top level: triggers only on tombstone ratio (same-level consolidation).
-pub(crate) fn evaluate_triggers(
+fn evaluate_triggers(
     infos: &[SegmentInfo],
     num_levels: usize,
     level_count_multiplier: usize,
@@ -90,7 +90,7 @@ pub(crate) fn evaluate_triggers(
 /// Select input segments for a compaction at `level`.
 ///
 /// Returns an empty Vec if not enough segments can be gathered to justify a merge.
-pub(crate) fn select_candidates(
+fn select_candidates(
     level: Level,
     infos: &[SegmentInfo],
     base_capacity: usize,
@@ -151,7 +151,7 @@ pub(crate) fn select_candidates(
 ///
 /// This runs without holding `apply_state` — the correctness check is in
 /// `Storage::commit_compaction`.
-pub(crate) fn run_merge(
+fn run_merge(
     inner: &CollectionInner,
     input_segs: Vec<(SegId, usize)>,
     new_seg_id: SegId,

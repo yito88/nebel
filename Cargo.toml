@@ -8,10 +8,6 @@ name = "nebel"
 path = "src/lib.rs"
 
 [[bin]]
-name = "nebel"
-path = "src/main.rs"
-
-[[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
 required-features = ["testing"]

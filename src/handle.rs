@@ -439,10 +439,7 @@ impl CollectionHandle {
     }
 
     // -----------------------------------------------------------------------
-    pub fn set_wal_rotation_bytes(&self, n: u64) {
-        self.inner.wal.lock().unwrap().rotation_bytes = n;
-    }
-
+    #[cfg(feature = "testing")]
     pub fn wal_segment_count(&self) -> usize {
         self.inner.wal.lock().unwrap().segments.len()
     }

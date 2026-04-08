@@ -94,7 +94,7 @@ impl Db {
         Ok(handle)
     }
 
-    pub(crate) fn load_collection_inner(&self, id: &CollectionId) -> Result<CollectionHandle> {
+    fn load_collection_inner(&self, id: &CollectionId) -> Result<CollectionHandle> {
         let schema = self
             .storage
             .get_collection(id)?
