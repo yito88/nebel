@@ -1016,6 +1016,7 @@ fn main() -> Result<()> {
                 metric: cli.metric.clone(),
                 segment_params: params.clone(),
                 compaction_params: Default::default(),
+                wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
             };
             let upsert_col = db2.create_collection(upsert_schema)?;
 
