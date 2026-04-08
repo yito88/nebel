@@ -6,6 +6,7 @@ pub mod db;
 #[cfg(feature = "testing")]
 pub mod eval;
 pub mod handle;
+mod search;
 mod segment;
 mod snapshot;
 mod storage;

@@ -1,7 +1,7 @@
 use std::{
     os::unix::fs::FileExt,
     sync::{
-        Arc, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -355,6 +355,31 @@ fn run_level_compaction(
     }
 
     level_busy[level.as_usize()].store(false, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// CompactionWorkerGuard
+// ---------------------------------------------------------------------------
+
+/// Joins the background compaction coordinator when the last `CollectionHandle` drops.
+pub(crate) struct CompactionWorkerGuard {
+    pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) notify: PendingNotify,
+    pub(crate) handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for CompactionWorkerGuard {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        {
+            let mut pending = self.notify.0.lock().unwrap();
+            *pending = true;
+        }
+        self.notify.1.notify_one();
+        if let Some(h) = self.handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
