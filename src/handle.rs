@@ -10,6 +10,12 @@ use std::{
 use anyhow::{Result, bail};
 use serde_json::Value;
 
+#[cfg(feature = "testing")]
+use crate::{
+    apply::seal_and_new_segment,
+    search::search_exact_snapshot,
+    types::{Level, SegmentMeta, SegmentState, VectorEntry},
+};
 use crate::{
     apply::{
         APPLY_BATCH_MAX, ApplyState, ApplyWorkerGuard, PendingNotify, apply_worker_loop,
@@ -22,12 +28,6 @@ use crate::{
     storage::Storage,
     types::{CollectionId, CollectionSchema, Manifest, SearchHit, SegId, WriteToken},
     wal::{Wal, WalOp},
-};
-#[cfg(feature = "testing")]
-use crate::{
-    apply::seal_and_new_segment,
-    search::search_exact_snapshot,
-    types::{Level, SegmentMeta, SegmentState, VectorEntry},
 };
 #[cfg(feature = "testing")]
 use std::{fs, io::Read, path::Path};

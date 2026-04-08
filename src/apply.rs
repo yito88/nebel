@@ -374,11 +374,7 @@ fn flush_upsert_batch(
 // ---------------------------------------------------------------------------
 
 /// Apply a single WAL record to `state`. Shared between the apply worker and recovery.
-fn apply_entry(
-    inner: &CollectionInner,
-    state: &mut ApplyState,
-    record: &WalRecord,
-) -> Result<()> {
+fn apply_entry(inner: &CollectionInner, state: &mut ApplyState, record: &WalRecord) -> Result<()> {
     let storage = &*inner.storage;
     let schema = &*inner.schema;
     let id = &inner.id;
