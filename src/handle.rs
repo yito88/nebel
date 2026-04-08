@@ -29,7 +29,7 @@ use crate::{
 };
 
 const INGEST_BATCH_SIZE: usize = 2048;
-const APPLY_BATCH_SIZE: usize = 100;
+const APPLY_BATCH_MAX: usize = 1000;
 const APPLY_INTERVAL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
@@ -514,7 +514,7 @@ fn apply_worker_loop(
             .segment_paths_from(cursor.current_wal_id);
 
         let (pending, new_cursor) =
-            match read_records_from_cursor(&segments, cursor, durable, APPLY_BATCH_SIZE) {
+            match read_records_from_cursor(&segments, cursor, durable, APPLY_BATCH_MAX) {
                 Ok(r) => r,
                 Err(_) => {
                     *notify.0.lock().unwrap() = false;
@@ -530,15 +530,7 @@ fn apply_worker_loop(
         // Apply records.
         let mut state = inner.apply_state.lock().unwrap();
         let seg_id_before = state.manifest.next_seg_id;
-        for record in &pending {
-            // Idempotency guard: skip if somehow already applied.
-            if record.seq <= state.applied_seq {
-                continue;
-            }
-            if apply_entry(&inner, &mut state, record).is_err() {
-                break;
-            }
-        }
+        let _ = apply_records(&inner, &mut state, &pending);
 
         let applied = state.applied_seq;
         let sealed = state.manifest.next_seg_id != seg_id_before;
@@ -637,6 +629,118 @@ fn read_records_from_cursor(
     }
 
     Ok((records, new_cursor))
+}
+
+// ---------------------------------------------------------------------------
+// apply_records / flush_upsert_batch
+// ---------------------------------------------------------------------------
+
+/// Apply a slice of WAL records to `state`, batching consecutive `Upsert` operations.
+/// Non-upsert records are handled one at a time via `apply_entry`.
+pub(crate) fn apply_records(
+    inner: &CollectionInner,
+    state: &mut ApplyState,
+    records: &[WalRecord],
+) -> Result<()> {
+    let mut i = 0;
+    while i < records.len() {
+        if records[i].seq <= state.applied_seq {
+            i += 1;
+            continue;
+        }
+        if matches!(records[i].op, WalOp::Upsert { .. }) {
+            let start = i;
+            while i < records.len()
+                && records[i].seq > state.applied_seq
+                && matches!(records[i].op, WalOp::Upsert { .. })
+            {
+                i += 1;
+            }
+            flush_upsert_batch(inner, state, &records[start..i])?;
+        } else {
+            apply_entry(inner, state, &records[i])?;
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Insert a slice of `Upsert` WAL records into the writable segment, splitting across
+/// segment-capacity boundaries as needed. Each chunk is committed as one redb transaction.
+fn flush_upsert_batch(
+    inner: &CollectionInner,
+    state: &mut ApplyState,
+    records: &[WalRecord],
+) -> Result<()> {
+    let schema = &*inner.schema;
+    let storage = &*inner.storage;
+    let id = &inner.id;
+    let capacity = schema.segment_params.segment_capacity;
+
+    let mut offset = 0;
+    while offset < records.len() {
+        let current_count = state.writable_seg.read().unwrap().num_vectors();
+        if current_count >= capacity {
+            seal_and_new_segment(inner, state)?;
+        }
+        let remaining_capacity = capacity - state.writable_seg.read().unwrap().num_vectors();
+        let chunk_size = (records.len() - offset).min(remaining_capacity);
+        let chunk = &records[offset..offset + chunk_size];
+
+        let vectors: Vec<Vec<f32>> = chunk
+            .iter()
+            .map(|r| {
+                let WalOp::Upsert { vector, .. } = &r.op else {
+                    unreachable!()
+                };
+                vector.clone()
+            })
+            .collect();
+
+        let internal_ids = {
+            let mut ws = state.writable_seg.write().unwrap();
+            ws.insert_batch(&vectors, schema.dimension)?
+        };
+
+        let seg_id = state.manifest.writable_segment;
+        let num_vectors = state.writable_seg.read().unwrap().num_vectors();
+
+        let entries: Vec<VectorEntry<'_>> = chunk
+            .iter()
+            .zip(&internal_ids)
+            .map(|(r, &iid)| {
+                let WalOp::Upsert {
+                    doc_id, metadata, ..
+                } = &r.op
+                else {
+                    unreachable!()
+                };
+                VectorEntry {
+                    doc_id: doc_id.as_str(),
+                    internal_id: iid,
+                    metadata: metadata.as_ref(),
+                }
+            })
+            .collect();
+
+        let last_seq = chunk.last().unwrap().seq;
+        storage.apply_upsert_batch(
+            id,
+            &SegmentMeta {
+                seg_id,
+                num_vectors,
+                state: SegmentState::Writable,
+                tombstone_count: 0,
+                level: Level::ZERO,
+            },
+            &entries,
+            last_seq,
+        )?;
+
+        state.applied_seq = last_seq;
+        offset += chunk_size;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

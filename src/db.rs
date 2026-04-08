@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    handle::{CollectionHandle, CollectionInner, apply_entry},
+    handle::{CollectionHandle, CollectionInner, apply_records},
     segment::{SealedSegment, WritableSegment},
     storage::Storage,
     types::{CollectionId, CollectionSchema, Manifest, SegId, SegmentMeta, SegmentState},
@@ -198,13 +198,7 @@ impl Db {
     /// Apply records (skipping already-applied ones by seq).
     fn apply_and_persist(records: &[WalRecord], inner: &CollectionInner) -> Result<()> {
         let mut state = inner.apply_state.lock().unwrap();
-        for record in records {
-            if record.seq <= state.applied_seq {
-                continue;
-            }
-            apply_entry(inner, &mut state, record)?;
-        }
-        Ok(())
+        apply_records(inner, &mut state, records)
     }
 
     fn seg_dir(&self, id: &CollectionId, seg_id: SegId) -> PathBuf {
