@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 
@@ -274,6 +276,94 @@ impl Storage {
                     meta_table.insert(mk.as_str(), mj.as_str())?;
                 }
             }
+            let mut seq_table = wtxn.open_table(APPLIED_SEQ)?;
+            seq_table.insert(col, seq)?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Atomically apply a batch of upsert WAL records in a single redb transaction.
+    /// For each entry, the old doc location (if any) is tombstoned; tombstone counts are
+    /// accumulated per-segment and flushed in the same transaction. The new segment metadata,
+    /// all doc/reverse/vector-metadata entries, and `applied_seq` are also written atomically.
+    pub fn apply_upsert_batch(
+        &self,
+        id: &CollectionId,
+        seg_meta: &SegmentMeta,
+        entries: &[VectorEntry<'_>],
+        seq: u64,
+    ) -> Result<()> {
+        let col = id.as_str();
+        let sk = seg_key(col, seg_meta.seg_id);
+        let seg_json = serde_json::to_string(seg_meta)?;
+
+        // Pre-serialize new locations and metadata outside the transaction.
+        let prepared: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                let dk = doc_key(col, e.doc_id);
+                let loc = DocLocation {
+                    seg_id: seg_meta.seg_id,
+                    internal_id: e.internal_id,
+                };
+                let loc_json = serde_json::to_string(&loc)?;
+                let mk = meta_key(col, seg_meta.seg_id, e.internal_id);
+                let meta_json = match e.metadata {
+                    Some(m) => Some(serde_json::to_string(m)?),
+                    None => None,
+                };
+                Ok((dk, loc_json, mk, e.doc_id, meta_json))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut doc_table = wtxn.open_table(DOC_MAP)?;
+            let mut seg_table = wtxn.open_table(SEGMENTS)?;
+            let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
+
+            // For each entry, tombstone its old location and accumulate tombstone counts.
+            let mut tombstone_increments: HashMap<SegId, usize> = HashMap::new();
+            for e in entries {
+                let dk = doc_key(col, e.doc_id);
+                if let Some(v) = doc_table.get(dk.as_str())? {
+                    let old_loc: DocLocation = serde_json::from_str(v.value())?;
+                    let tk = meta_key(col, old_loc.seg_id, old_loc.internal_id);
+                    tomb_table.insert(tk.as_str(), true)?;
+                    *tombstone_increments.entry(old_loc.seg_id).or_default() += 1;
+                }
+            }
+
+            // Flush tombstone_count increments per segment.
+            for (old_seg_id, inc) in &tombstone_increments {
+                let old_sk = seg_key(col, *old_seg_id);
+                let updated = if let Some(v) = seg_table.get(old_sk.as_str())? {
+                    let mut meta: SegmentMeta = serde_json::from_str(v.value())?;
+                    meta.tombstone_count += inc;
+                    Some(serde_json::to_string(&meta)?)
+                } else {
+                    None
+                };
+                if let Some(updated) = updated {
+                    seg_table.insert(old_sk.as_str(), updated.as_str())?;
+                }
+            }
+
+            // Write new segment metadata.
+            seg_table.insert(sk.as_str(), seg_json.as_str())?;
+
+            // Write all new entries.
+            let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
+            let mut meta_table = wtxn.open_table(METADATA)?;
+            for (dk, loc_json, mk, entry_doc_id, meta_json) in &prepared {
+                doc_table.insert(dk.as_str(), loc_json.as_str())?;
+                rev_table.insert(mk.as_str(), *entry_doc_id)?;
+                if let Some(mj) = meta_json {
+                    meta_table.insert(mk.as_str(), mj.as_str())?;
+                }
+            }
+
             let mut seq_table = wtxn.open_table(APPLIED_SEQ)?;
             seq_table.insert(col, seq)?;
         }
