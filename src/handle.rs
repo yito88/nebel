@@ -25,7 +25,7 @@ use crate::{
 };
 #[cfg(feature = "testing")]
 use crate::{
-    apply::{apply_entry, seal_and_new_segment},
+    apply::seal_and_new_segment,
     search::search_exact_snapshot,
     types::{Level, SegmentMeta, SegmentState, VectorEntry},
 };
