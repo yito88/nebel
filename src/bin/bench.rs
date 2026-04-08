@@ -30,6 +30,7 @@ enum BenchMode {
     Search,
     Write,
     Mix,
+    Ingest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -239,6 +240,29 @@ struct MixSummary {
     write_p50_latency_ms: f64,
     write_p95_latency_ms: f64,
     write_p99_latency_ms: f64,
+
+    params: SegmentParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IngestSummary {
+    dataset_name: String,
+    metric: Metric,
+    num_vectors: usize,
+
+    ingest_file_secs: f64,
+    ingest_file_vps: f64,
+
+    /// Time for all upsert() calls to return (WAL writes + fsyncs only)
+    upsert_wal_secs: f64,
+    upsert_wal_vps: f64,
+
+    /// Total time including wait_visible (WAL + background HNSW apply)
+    upsert_total_secs: f64,
+    upsert_total_vps: f64,
+
+    /// How many times faster ingest_file is vs upsert total
+    speedup: f64,
 
     params: SegmentParams,
 }
@@ -951,6 +975,131 @@ fn main() -> Result<()> {
             );
 
             // Save summary if requested
+            if let Some(ref path) = cli.save_summary {
+                println!("\nSaving summary to {}...", path);
+                if let Some(parent) = Path::new(path).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, serde_json::to_string_pretty(&summary)?)?;
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Ingest mode — compare ingest_file vs upsert end-to-end
+        // -----------------------------------------------------------------------
+        BenchMode::Ingest => {
+            if reused {
+                bail!("Ingest mode requires a fresh DB — delete --data-dir contents first or omit --data-dir");
+            }
+
+            let nv = base_vectors.len();
+
+            // --- ingest_file path (uses the collection from shared setup) ---
+            println!("Benchmarking ingest_file ({} vectors)...", nv);
+            let tmp_raw = db_dir.path().join("ingest_bench.raw");
+            write_raw_f32(&tmp_raw, &base_vectors)?;
+            let t0 = Instant::now();
+            let n_ingested = col.ingest_file(&tmp_raw)?;
+            let ingest_file_secs = t0.elapsed().as_secs_f64();
+            println!(
+                "  ingest_file: {:.3}s  ({:.0} vecs/sec)",
+                ingest_file_secs,
+                n_ingested as f64 / ingest_file_secs
+            );
+
+            // --- upsert path (fresh DB in a separate temp dir to avoid lock conflict) ---
+            let upsert_tmp = tempfile::tempdir()?;
+            let db2 = Db::open(upsert_tmp.path())?;
+            let upsert_schema = CollectionSchema {
+                name: CollectionId::new("upsert_bench"),
+                dimension: dim,
+                metric: cli.metric.clone(),
+                segment_params: params.clone(),
+                compaction_params: Default::default(),
+            };
+            let upsert_col = db2.create_collection(upsert_schema)?;
+
+            println!("Benchmarking upsert ({} vectors)...", nv);
+            let wal_start = Instant::now();
+            let mut last_token = None;
+            for (i, vec) in base_vectors.iter().enumerate() {
+                last_token = Some(upsert_col.upsert(&format!("doc_{}", i), vec, None)?);
+            }
+            let upsert_wal_secs = wal_start.elapsed().as_secs_f64();
+            println!(
+                "  WAL loop done: {:.3}s  ({:.0} vecs/sec)",
+                upsert_wal_secs,
+                nv as f64 / upsert_wal_secs
+            );
+
+            println!("  Waiting for visibility...");
+            let vis_start = Instant::now();
+            if let Some(token) = last_token {
+                upsert_col.wait_visible(token)?;
+            }
+            let upsert_total_secs = upsert_wal_secs + vis_start.elapsed().as_secs_f64();
+            println!(
+                "  Total (WAL + apply): {:.3}s  ({:.0} vecs/sec)",
+                upsert_total_secs,
+                nv as f64 / upsert_total_secs
+            );
+
+            let summary = IngestSummary {
+                dataset_name: cli.dataset_name.clone(),
+                metric: cli.metric.clone(),
+                num_vectors: nv,
+                ingest_file_secs,
+                ingest_file_vps: nv as f64 / ingest_file_secs,
+                upsert_wal_secs,
+                upsert_wal_vps: nv as f64 / upsert_wal_secs,
+                upsert_total_secs,
+                upsert_total_vps: nv as f64 / upsert_total_secs,
+                speedup: upsert_total_secs / ingest_file_secs,
+                params,
+            };
+
+            println!("\n===== Ingest Benchmark Summary =====");
+            println!(
+                "Dataset: {}   Metric: {:?}   Vectors: {}",
+                summary.dataset_name, summary.metric, summary.num_vectors
+            );
+            println!(
+                "HNSW params: m={} ef_c={} ef_s={} cap={}",
+                summary.params.m,
+                summary.params.ef_construction,
+                summary.params.ef_search,
+                summary.params.segment_capacity
+            );
+            println!("---");
+            println!(
+                "{:<32} {:>10} {:>16}",
+                "Path", "Time (s)", "Throughput (vps)"
+            );
+            println!("{}", "-".repeat(60));
+            println!(
+                "{:<32} {:>10.3} {:>16.0}  (baseline)",
+                "ingest_file", summary.ingest_file_secs, summary.ingest_file_vps
+            );
+            println!(
+                "{:<32} {:>10.3} {:>16.0}  ({:.1}x slower)",
+                "upsert (WAL loop only)",
+                summary.upsert_wal_secs,
+                summary.upsert_wal_vps,
+                summary.upsert_wal_secs / summary.ingest_file_secs
+            );
+            println!(
+                "{:<32} {:>10.3} {:>16.0}  ({:.1}x slower)",
+                "upsert (WAL + wait_visible)",
+                summary.upsert_total_secs,
+                summary.upsert_total_vps,
+                summary.speedup
+            );
+            println!("{}", "-".repeat(60));
+            println!(
+                "ingest_file speedup vs upsert total: {:.1}x",
+                summary.speedup
+            );
+
             if let Some(ref path) = cli.save_summary {
                 println!("\nSaving summary to {}...", path);
                 if let Some(parent) = Path::new(path).parent() {
