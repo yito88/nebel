@@ -997,7 +997,9 @@ fn main() -> Result<()> {
         // -----------------------------------------------------------------------
         BenchMode::Ingest => {
             if reused {
-                bail!("Ingest mode requires a fresh DB — delete --data-dir contents first or omit --data-dir");
+                bail!(
+                    "Ingest mode requires a fresh DB — delete --data-dir contents first or omit --data-dir"
+                );
             }
 
             let nv = base_vectors.len();
@@ -1030,10 +1032,12 @@ fn main() -> Result<()> {
             let batch_col = db2.create_collection(batch_schema)?;
 
             // Pre-generate doc IDs to avoid allocation inside the timed loop.
-            let batch_doc_ids: Vec<String> =
-                (0..nv).map(|i| format!("doc_{}", i)).collect();
+            let batch_doc_ids: Vec<String> = (0..nv).map(|i| format!("doc_{}", i)).collect();
 
-            println!("Benchmarking upsert_batch (batch_size={}, {} vectors)...", batch_size, nv);
+            println!(
+                "Benchmarking upsert_batch (batch_size={}, {} vectors)...",
+                batch_size, nv
+            );
             let batch_wal_start = Instant::now();
             let mut last_batch_token = None;
             for (chunk_idx, chunk) in base_vectors.chunks(batch_size).enumerate() {
@@ -1057,7 +1061,8 @@ fn main() -> Result<()> {
             if let Some(token) = last_batch_token {
                 batch_col.wait_visible(token)?;
             }
-            let upsert_batch_total_secs = upsert_batch_wal_secs + batch_vis_start.elapsed().as_secs_f64();
+            let upsert_batch_total_secs =
+                upsert_batch_wal_secs + batch_vis_start.elapsed().as_secs_f64();
             println!(
                 "  Total (WAL + apply): {:.3}s  ({:.0} vecs/sec)",
                 upsert_batch_total_secs,
