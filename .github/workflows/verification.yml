@@ -54,6 +54,19 @@ jobs:
             --data-dir data/verify-db \
             | tee verify_output.txt
 
+      - name: Run mutation verification
+        id: mutation
+        if: always()
+        continue-on-error: true
+        run: |
+          ./target/release/verify \
+            --mode mutation \
+            --base-file data/raw/sift/sift_learn.fvecs \
+            --segment-capacity 200 \
+            --num-mutations 600 \
+            --concurrency 4 \
+            | tee mutation_output.txt
+
       - name: Check recall threshold
         run: |
           ANN_RECALL=$(grep -oP 'search \(ANN\) avg recall@\d+:\s+\K[0-9.]+' verify_output.txt)
@@ -70,17 +83,23 @@ jobs:
         run: |
           ANN_RECALL=$(grep -oP 'search \(ANN\) avg recall@\d+:\s+\K[0-9.]+' verify_output.txt || echo "N/A")
           if [ "$ANN_RECALL" != "N/A" ] && python3 -c "exit(0 if float('$ANN_RECALL') >= 0.9 else 1)" 2>/dev/null; then
-            STATUS="✅ PASS"
+            RECALL_STATUS="✅ PASS"
           else
-            STATUS="❌ FAIL"
+            RECALL_STATUS="❌ FAIL"
+          fi
+          if [ "${{ steps.mutation.outcome }}" = "success" ]; then
+            MUTATION_STATUS="✅ PASS"
+          else
+            MUTATION_STATUS="❌ FAIL"
           fi
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           {
             echo "## Verification Results"
             echo ""
-            echo "| Date | Commit | Run | ANN Recall | Status |"
+            echo "| Check | Date | Commit | Run | Status |"
             echo "|---|---|---|---|---|"
-            echo "| $(date -u '+%Y-%m-%d %H:%M UTC') | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) | [#$GITHUB_RUN_NUMBER]($RUN_URL) | $ANN_RECALL | $STATUS |"
+            echo "| Recall (ANN=$ANN_RECALL) | $(date -u '+%Y-%m-%d %H:%M UTC') | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) | [#$GITHUB_RUN_NUMBER]($RUN_URL) | $RECALL_STATUS |"
+            echo "| Mutation | $(date -u '+%Y-%m-%d %H:%M UTC') | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) | [#$GITHUB_RUN_NUMBER]($RUN_URL) | $MUTATION_STATUS |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout gh-pages
@@ -92,6 +111,8 @@ jobs:
 
       - name: Update verification history
         if: always()
+        env:
+          MUTATION_OUTCOME: ${{ steps.mutation.outcome }}
         run: |
           mkdir -p gh-pages/data
           python3 - <<'EOF'
@@ -119,6 +140,7 @@ jobs:
               "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
               "ann_recall": ann_recall,
               "passed": ann_recall is not None and ann_recall >= 0.9,
+              "mutation_passed": os.environ.get("MUTATION_OUTCOME") == "success",
           }
 
           history.append(run_entry)
@@ -138,3 +160,11 @@ jobs:
           git add data/verification.json
           git diff --cached --quiet || git commit -m "verify: run #$GITHUB_RUN_NUMBER (${GITHUB_SHA::7})"
           git push
+
+      - name: Assert mutation passed
+        if: always()
+        run: |
+          if [ "${{ steps.mutation.outcome }}" != "success" ]; then
+            echo "Mutation verification failed"
+            exit 1
+          fi
