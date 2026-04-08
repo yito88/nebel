@@ -183,6 +183,11 @@ const DEFAULT_M: usize = 16;
 const DEFAULT_EF_CONSTRUCTION: usize = 200;
 const DEFAULT_EF_SEARCH: usize = 50;
 const DEFAULT_SEGMENT_CAPACITY: usize = 500_000;
+pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
+
+fn default_wal_segment_bytes() -> u64 {
+    DEFAULT_WAL_SEGMENT_BYTES
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentParams {
@@ -218,6 +223,8 @@ pub struct CollectionSchema {
     pub segment_params: SegmentParams,
     #[serde(default)]
     pub compaction_params: CompactionParams,
+    #[serde(default = "default_wal_segment_bytes")]
+    pub wal_segment_bytes: u64,
 }
 
 impl CollectionSchema {
@@ -229,6 +236,7 @@ impl CollectionSchema {
             metric,
             segment_params: SegmentParams::default(),
             compaction_params: CompactionParams::default(),
+            wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
         }
     }
 }

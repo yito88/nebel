@@ -122,6 +122,7 @@ impl CollectionInner {
         schema: Arc<CollectionSchema>,
     ) -> Result<Arc<Self>> {
         let mut wal = Wal::open_dir(&base_dir.join(id.as_str()).join("wal"))?;
+        wal.rotation_bytes = schema.wal_segment_bytes;
         // Seq allocation lives inside Wal (under its mutex). Set the starting
         // value so new records continue from where recovery left off.
         wal.reset_next_seq(applied_seq + 1);

@@ -13,7 +13,10 @@ use nebel::{
     Db,
     dataset::{load_groundtruth, load_vectors, write_raw_f32},
     eval::{hits_to_ids, recall_at_k},
-    types::{CollectionId, CollectionSchema, CompactionParams, Metric, SegmentParams, WriteToken},
+    types::{
+        CollectionId, CollectionSchema, CompactionParams, DEFAULT_WAL_SEGMENT_BYTES, Metric,
+        SegmentParams, WriteToken,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -149,6 +152,7 @@ fn main() -> Result<()> {
                     metric: cli.metric.clone(),
                     segment_params: params.clone(),
                     compaction_params: compaction_params.clone(),
+                    wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
                 };
                 (db.create_collection(schema)?, false)
             }
@@ -164,6 +168,7 @@ fn main() -> Result<()> {
             metric: cli.metric.clone(),
             segment_params: params.clone(),
             compaction_params: Default::default(),
+            wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
         };
         let col = db.create_collection(schema)?;
         (DbDir::Temp(tmp), col, false)
