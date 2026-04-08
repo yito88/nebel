@@ -20,8 +20,6 @@ The current codebase is a storage engine and evaluation harness, not a networked
 
 - No server, REST API, or gRPC interface
 - No filtering, hybrid search, or metadata predicates
-- No compaction or merge process for old sealed segments
-- No WAL-backed durability for `ingest_file`
 - No collection deletion or schema migration support
 
 ## Storage model
@@ -78,6 +76,7 @@ col.wait_visible(token)?;
 Supported write operations:
 
 - `upsert(doc_id, vector, metadata)`
+- `upsert_batch(&[doc_id, vector, metadata])`
 - `delete(doc_id)`
 - `update_metadata(doc_id, metadata)`
 
@@ -103,16 +102,6 @@ let hits = col.search_exact(&[1.0, 0.1, 0.0, 0.0], 5)?;
 ```
 
 `SearchHit.score` is the raw distance produced by the configured metric implementation. Lower scores rank first.
-
-### Bulk ingest
-
-`ingest_file(path)` reads a raw little-endian `f32` stream with no header. Records are interpreted using the collection dimension.
-
-```rust
-let count = col.ingest_file("base_vectors.raw")?;
-```
-
-This path bypasses the WAL and writes directly into the active writable segment, so it is fast but has different recovery guarantees from `upsert`.
 
 ## Consistency and durability
 

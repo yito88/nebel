@@ -380,6 +380,7 @@ impl CollectionHandle {
     // Ingest (fast-path: bypasses WAL, directly applies to segments)
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "testing")]
     pub fn ingest_file(&self, file_path: impl AsRef<Path>) -> Result<usize> {
         let inner = &self.inner;
         let storage = &*inner.storage;
