@@ -354,8 +354,8 @@ fn wal_segment_rotation() {
     }
     col.wait_visible(last).unwrap();
 
-    // Multiple segments should now exist.
-    assert!(col.wal_segment_count() > 1);
+    // After all records are applied, closed segments are pruned; only the active segment remains.
+    assert_eq!(col.wal_segment_count(), 1);
 }
 
 // ---------------------------------------------------------------------------

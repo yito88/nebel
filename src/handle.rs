@@ -549,6 +549,9 @@ fn apply_worker_loop(
             ..new_cursor
         };
 
+        // Drop fully-applied closed WAL segments.
+        inner.wal.lock().unwrap().truncate_applied(applied);
+
         // Clear pending flag; re-set if more records may exist.
         *notify.0.lock().unwrap() = false;
         // inner drops here.
