@@ -252,19 +252,22 @@
       const rows = history.slice(-20).reverse().map(r => {
         const cls = r.passed ? 'pass' : 'fail';
         const label = r.passed ? 'PASS' : 'FAIL';
+        const mutCls = r.mutation_passed ? 'pass' : (r.mutation_passed == null ? '' : 'fail');
+        const mutLabel = r.mutation_passed == null ? '-' : (r.mutation_passed ? 'PASS' : 'FAIL');
         return `<tr>
           <td>${fmtDate(r.date)}</td>
           <td><a href="${r.run_url}" target="_blank">#${r.run_number}</a></td>
           <td><a href="https://github.com/yito88/nebel/commit/${r.commit}" target="_blank">${r.commit}</a></td>
           <td>${r.ann_recall != null ? r.ann_recall.toFixed(4) : 'N/A'}</td>
           <td class="${cls}">${label}</td>
+          <td class="${mutCls}">${mutLabel}</td>
         </tr>`;
       }).join('');
 
       document.getElementById('verifyTable').innerHTML = `
         <table>
           <thead><tr>
-            <th>Date</th><th>Run</th><th>Commit</th><th>ANN Recall</th><th>Status</th>
+            <th>Date</th><th>Run</th><th>Commit</th><th>ANN Recall</th><th>Recall</th><th>Mutation</th>
           </tr></thead>
           <tbody>${rows}</tbody>
         </table>`;
