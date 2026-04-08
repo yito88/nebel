@@ -123,6 +123,11 @@ struct Cli {
     #[arg(long)]
     save_summary: Option<String>,
 
+    // --- ingest-mode options ---
+    /// Batch size for upsert_batch in ingest mode
+    #[arg(long, default_value_t = 256)]
+    ingest_batch_size: usize,
+
     // --- write-mode options ---
     /// Number of write operations to benchmark
     #[arg(long, default_value_t = 1000)]
@@ -253,15 +258,18 @@ struct IngestSummary {
     ingest_file_secs: f64,
     ingest_file_vps: f64,
 
-    /// Time for all upsert() calls to return (WAL writes + fsyncs only)
-    upsert_wal_secs: f64,
-    upsert_wal_vps: f64,
+    /// Batch size used for upsert_batch
+    upsert_batch_size: usize,
 
-    /// Total time including wait_visible (WAL + background HNSW apply)
-    upsert_total_secs: f64,
-    upsert_total_vps: f64,
+    /// Time for all upsert_batch() calls to return (WAL writes + single fsyncs)
+    upsert_batch_wal_secs: f64,
+    upsert_batch_wal_vps: f64,
 
-    /// How many times faster ingest_file is vs upsert total
+    /// Total time including wait_visible for upsert_batch
+    upsert_batch_total_secs: f64,
+    upsert_batch_total_vps: f64,
+
+    /// How many times faster ingest_file is vs upsert_batch total
     speedup: f64,
 
     params: SegmentParams,
@@ -1007,41 +1015,53 @@ fn main() -> Result<()> {
                 n_ingested as f64 / ingest_file_secs
             );
 
-            // --- upsert path (fresh DB in a separate temp dir to avoid lock conflict) ---
-            let upsert_tmp = tempfile::tempdir()?;
-            let db2 = Db::open(upsert_tmp.path())?;
-            let upsert_schema = CollectionSchema {
-                name: CollectionId::new("upsert_bench"),
+            // --- upsert_batch path (fresh DB in a separate temp dir to avoid lock conflict) ---
+            let batch_size = cli.ingest_batch_size;
+            let batch_tmp = tempfile::tempdir()?;
+            let db2 = Db::open(batch_tmp.path())?;
+            let batch_schema = CollectionSchema {
+                name: CollectionId::new("upsert_batch_bench"),
                 dimension: dim,
                 metric: cli.metric.clone(),
                 segment_params: params.clone(),
                 compaction_params: Default::default(),
+                wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
             };
-            let upsert_col = db2.create_collection(upsert_schema)?;
+            let batch_col = db2.create_collection(batch_schema)?;
 
-            println!("Benchmarking upsert ({} vectors)...", nv);
-            let wal_start = Instant::now();
-            let mut last_token = None;
-            for (i, vec) in base_vectors.iter().enumerate() {
-                last_token = Some(upsert_col.upsert(&format!("doc_{}", i), vec, None)?);
+            // Pre-generate doc IDs to avoid allocation inside the timed loop.
+            let batch_doc_ids: Vec<String> =
+                (0..nv).map(|i| format!("doc_{}", i)).collect();
+
+            println!("Benchmarking upsert_batch (batch_size={}, {} vectors)...", batch_size, nv);
+            let batch_wal_start = Instant::now();
+            let mut last_batch_token = None;
+            for (chunk_idx, chunk) in base_vectors.chunks(batch_size).enumerate() {
+                let offset = chunk_idx * batch_size;
+                let entries: Vec<(&str, &[f32], Option<serde_json::Value>)> = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (batch_doc_ids[offset + i].as_str(), v.as_slice(), None))
+                    .collect();
+                last_batch_token = Some(batch_col.upsert_batch(&entries)?);
             }
-            let upsert_wal_secs = wal_start.elapsed().as_secs_f64();
+            let upsert_batch_wal_secs = batch_wal_start.elapsed().as_secs_f64();
             println!(
                 "  WAL loop done: {:.3}s  ({:.0} vecs/sec)",
-                upsert_wal_secs,
-                nv as f64 / upsert_wal_secs
+                upsert_batch_wal_secs,
+                nv as f64 / upsert_batch_wal_secs
             );
 
             println!("  Waiting for visibility...");
-            let vis_start = Instant::now();
-            if let Some(token) = last_token {
-                upsert_col.wait_visible(token)?;
+            let batch_vis_start = Instant::now();
+            if let Some(token) = last_batch_token {
+                batch_col.wait_visible(token)?;
             }
-            let upsert_total_secs = upsert_wal_secs + vis_start.elapsed().as_secs_f64();
+            let upsert_batch_total_secs = upsert_batch_wal_secs + batch_vis_start.elapsed().as_secs_f64();
             println!(
                 "  Total (WAL + apply): {:.3}s  ({:.0} vecs/sec)",
-                upsert_total_secs,
-                nv as f64 / upsert_total_secs
+                upsert_batch_total_secs,
+                nv as f64 / upsert_batch_total_secs
             );
 
             let summary = IngestSummary {
@@ -1050,11 +1070,12 @@ fn main() -> Result<()> {
                 num_vectors: nv,
                 ingest_file_secs,
                 ingest_file_vps: nv as f64 / ingest_file_secs,
-                upsert_wal_secs,
-                upsert_wal_vps: nv as f64 / upsert_wal_secs,
-                upsert_total_secs,
-                upsert_total_vps: nv as f64 / upsert_total_secs,
-                speedup: upsert_total_secs / ingest_file_secs,
+                upsert_batch_size: batch_size,
+                upsert_batch_wal_secs,
+                upsert_batch_wal_vps: nv as f64 / upsert_batch_wal_secs,
+                upsert_batch_total_secs,
+                upsert_batch_total_vps: nv as f64 / upsert_batch_total_secs,
+                speedup: upsert_batch_total_secs / ingest_file_secs,
                 params,
             };
 
@@ -1082,21 +1103,21 @@ fn main() -> Result<()> {
             );
             println!(
                 "{:<32} {:>10.3} {:>16.0}  ({:.1}x slower)",
-                "upsert (WAL loop only)",
-                summary.upsert_wal_secs,
-                summary.upsert_wal_vps,
-                summary.upsert_wal_secs / summary.ingest_file_secs
+                format!("upsert_batch/{} (WAL only)", summary.upsert_batch_size),
+                summary.upsert_batch_wal_secs,
+                summary.upsert_batch_wal_vps,
+                summary.upsert_batch_wal_secs / summary.ingest_file_secs
             );
             println!(
                 "{:<32} {:>10.3} {:>16.0}  ({:.1}x slower)",
-                "upsert (WAL + wait_visible)",
-                summary.upsert_total_secs,
-                summary.upsert_total_vps,
+                format!("upsert_batch/{} (WAL + wait)", summary.upsert_batch_size),
+                summary.upsert_batch_total_secs,
+                summary.upsert_batch_total_vps,
                 summary.speedup
             );
             println!("{}", "-".repeat(60));
             println!(
-                "ingest_file speedup vs upsert total: {:.1}x",
+                "ingest_file speedup vs upsert_batch total: {:.1}x",
                 summary.speedup
             );
 
