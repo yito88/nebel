@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub(crate) const WAL_ROTATION_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
+use crate::types::DEFAULT_WAL_SEGMENT_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct WalId(pub u64);
@@ -142,7 +142,7 @@ impl Wal {
                     state: WalSegmentState::Active,
                 }],
                 writer: BufWriter::new(file),
-                rotation_bytes: WAL_ROTATION_BYTES,
+                rotation_bytes: DEFAULT_WAL_SEGMENT_BYTES,
                 next_seq: 0,
             });
         }
@@ -182,7 +182,7 @@ impl Wal {
             wal_dir: wal_dir.to_path_buf(),
             segments,
             writer: BufWriter::new(new_file),
-            rotation_bytes: WAL_ROTATION_BYTES,
+            rotation_bytes: DEFAULT_WAL_SEGMENT_BYTES,
             next_seq: 0,
         })
     }
@@ -222,7 +222,7 @@ impl Wal {
 
     /// Allocate the next sequence number, append the operation durably, and
     /// return the assigned seq. Format: 4-byte LE length + JSON body + '\n'.
-    /// Rotates to a new segment file if the active file exceeds WAL_ROTATION_BYTES.
+    /// Rotates to a new segment file if the active file exceeds DEFAULT_WAL_SEGMENT_BYTES.
     ///
     /// Because seq allocation and WAL write happen together under `Mutex<Wal>`,
     /// seq order is guaranteed to match physical write order, which is required
