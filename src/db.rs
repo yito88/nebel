@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    handle::{CollectionHandle, CollectionInner, apply_records},
+    apply::apply_records,
+    handle::{CollectionHandle, CollectionInner},
     segment::{SealedSegment, WritableSegment},
     storage::Storage,
     types::{CollectionId, CollectionSchema, Manifest, SegId, SegmentMeta, SegmentState},

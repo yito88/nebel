@@ -10,7 +10,8 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    handle::{CollectionInner, PendingNotify},
+    apply::PendingNotify,
+    handle::CollectionInner,
     segment::{SealedSegment, WritableSegment},
     snapshot::SegmentSnapshot,
     storage::CompactionEntry,
