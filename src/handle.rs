@@ -297,10 +297,7 @@ impl CollectionHandle {
         Ok(WriteToken(seq + 1))
     }
 
-    pub fn upsert_batch(
-        &self,
-        entries: &[(&str, &[f32], Option<Value>)],
-    ) -> Result<WriteToken> {
+    pub fn upsert_batch(&self, entries: &[(&str, &[f32], Option<Value>)]) -> Result<WriteToken> {
         if entries.is_empty() {
             return Ok(WriteToken(self.inner.durable_seq.load(Ordering::Acquire)));
         }
