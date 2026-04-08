@@ -228,6 +228,34 @@ impl Wal {
     /// seq order is guaranteed to match physical write order, which is required
     /// for the apply worker's durable-seq tracking to be correct.
     pub(crate) fn append(&mut self, op: WalOp) -> Result<u64> {
+        let seq = self.write_record(op)?;
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        if self.segments.last().unwrap().byte_size >= self.rotation_bytes {
+            self.rotate()?;
+        }
+        Ok(seq)
+    }
+
+    /// Like [`append`], but writes all ops under a single fsync.
+    /// Returns the seq of the last record. Caller must ensure `ops` is non-empty.
+    pub(crate) fn append_batch(&mut self, ops: Vec<WalOp>) -> Result<u64> {
+        debug_assert!(!ops.is_empty());
+        let mut last_seq = 0u64;
+        for op in ops {
+            last_seq = self.write_record(op)?;
+        }
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        if self.segments.last().unwrap().byte_size >= self.rotation_bytes {
+            self.rotate()?;
+        }
+        Ok(last_seq)
+    }
+
+    /// Write one record to the `BufWriter` and update segment metadata.
+    /// Does NOT flush or sync — caller is responsible.
+    fn write_record(&mut self, op: WalOp) -> Result<u64> {
         let seq = self.next_seq;
         self.next_seq += 1;
         let record = WalRecord { seq, op };
@@ -236,9 +264,6 @@ impl Wal {
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&body)?;
         self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
-
         let record_byte_size = (4 + body.len() + 1) as u64;
         let active = self.segments.last_mut().unwrap();
         if active.record_count == 0 {
@@ -247,10 +272,6 @@ impl Wal {
         active.end_seq = Some(seq);
         active.record_count += 1;
         active.byte_size += record_byte_size;
-
-        if active.byte_size >= self.rotation_bytes {
-            self.rotate()?;
-        }
         Ok(seq)
     }
 
