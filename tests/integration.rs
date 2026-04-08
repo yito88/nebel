@@ -338,12 +338,10 @@ fn recovery_from_wal_after_crash() {
 #[test]
 fn wal_segment_rotation() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("test"), 3, Metric::Cosine))
-        .unwrap();
-
     // Set a tiny rotation threshold so a handful of records triggers it.
-    col.set_wal_rotation_bytes(512);
+    let mut schema = CollectionSchema::new(col("test"), 3, Metric::Cosine);
+    schema.wal_segment_bytes = 512;
+    let col = db.create_collection(schema).unwrap();
     assert_eq!(col.wal_segment_count(), 1);
 
     // Write enough records to exceed the threshold several times.

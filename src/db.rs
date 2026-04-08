@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    handle::{CollectionHandle, CollectionInner, apply_records},
+    apply::apply_records,
+    handle::{CollectionHandle, CollectionInner},
     segment::{SealedSegment, WritableSegment},
     storage::Storage,
     types::{CollectionId, CollectionSchema, Manifest, SegId, SegmentMeta, SegmentState},
@@ -93,7 +94,7 @@ impl Db {
         Ok(handle)
     }
 
-    pub(crate) fn load_collection_inner(&self, id: &CollectionId) -> Result<CollectionHandle> {
+    fn load_collection_inner(&self, id: &CollectionId) -> Result<CollectionHandle> {
         let schema = self
             .storage
             .get_collection(id)?
