@@ -197,6 +197,20 @@ impl Wal {
             .collect()
     }
 
+    /// Remove all `Closed` segments whose last record has been applied (`end_seq <= applied_seq`).
+    pub(crate) fn truncate_applied(&mut self, applied_seq: u64) {
+        let to_remove: Vec<WalId> = self
+            .segments
+            .iter()
+            .filter(|s| s.state == WalSegmentState::Closed)
+            .filter(|s| s.end_seq.is_none_or(|end| end <= applied_seq))
+            .map(|s| s.wal_id)
+            .collect();
+        for wal_id in to_remove {
+            let _ = self.remove_segment(wal_id);
+        }
+    }
+
     /// Delete a segment file and remove it from the in-memory list.
     pub(crate) fn remove_segment(&mut self, wal_id: WalId) -> Result<()> {
         if let Some(pos) = self.segments.iter().position(|s| s.wal_id == wal_id) {
