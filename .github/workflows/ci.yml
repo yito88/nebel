@@ -42,3 +42,45 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  mutation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cache SIFT dataset
+        id: cache-sift
+        uses: actions/cache@v5
+        with:
+          path: data/raw/sift
+          key: sift-v1
+
+      - name: Download SIFT dataset
+        if: steps.cache-sift.outputs.cache-hit != 'true'
+        run: bash scripts/download_sift.sh
+
+      - name: Build verify binary
+        run: cargo build --release --bin verify --features testing
+
+      - name: Run mutation verification
+        run: |
+          ./target/release/verify \
+            --mode mutation \
+            --base-file data/raw/sift/sift_learn.fvecs \
+            --segment-capacity 200 \
+            --num-mutations 600 \
+            --concurrency 4
