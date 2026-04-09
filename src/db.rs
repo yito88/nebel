@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
+use tracing::info;
 
 use crate::{
     apply::apply_records,
@@ -31,6 +32,7 @@ impl Db {
         fs::create_dir_all(&base_dir)?;
         let db_path = base_dir.join(DB_NAME);
         let storage = Arc::new(Storage::open(&db_path)?);
+        info!(path = %base_dir.display(), "opened database");
         Ok(Self {
             base_dir,
             storage,
@@ -66,6 +68,8 @@ impl Db {
         )?;
         let ws_arc = Arc::new(RwLock::new(ws));
         let schema_arc = Arc::new(schema);
+        let dimension = schema_arc.dimension;
+        let metric = schema_arc.metric.clone();
         let inner = CollectionInner::new(
             id.clone(),
             Arc::clone(&self.storage),
@@ -76,6 +80,12 @@ impl Db {
             0,
             schema_arc,
         )?;
+        info!(
+            collection = %id,
+            dimension,
+            metric = ?metric,
+            "created collection",
+        );
         let handle = CollectionHandle::from_arc(inner);
         self.collections.lock().unwrap().insert(id, handle.clone());
         Ok(handle)
@@ -178,9 +188,10 @@ impl Db {
         }
 
         // Step 4: Sync sequence counters with the final applied_seq.
-        {
+        let replayed = {
             let state = inner.apply_state.lock().unwrap();
             let applied = state.applied_seq;
+            let replayed = applied.saturating_sub(applied_seq_stored);
             if applied > applied_seq_stored {
                 inner.wal.lock().unwrap().reset_next_seq(applied + 1);
                 inner
@@ -192,7 +203,33 @@ impl Db {
                     .visible_seq
                     .store(applied + 1, std::sync::atomic::Ordering::Release);
             }
-        }
+            replayed
+        };
+
+        let total_vectors: usize = {
+            let state = inner.apply_state.lock().unwrap();
+            let ws_count = state.writable_seg.read().unwrap().num_vectors();
+            state
+                .sealed_segs
+                .iter()
+                .map(|s| s.num_vectors())
+                .sum::<usize>()
+                + ws_count
+        };
+        let num_segments = inner
+            .apply_state
+            .lock()
+            .unwrap()
+            .manifest
+            .active_segments
+            .len();
+        info!(
+            collection = %id,
+            segments = num_segments,
+            vectors = total_vectors,
+            wal_replayed = replayed,
+            "loaded collection",
+        );
 
         Ok(CollectionHandle::from_arc(inner))
     }
