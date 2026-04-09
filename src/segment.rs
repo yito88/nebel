@@ -70,14 +70,6 @@ impl HnswIndex {
         }
     }
 
-    fn parallel_insert(&self, data: &[(&Vec<f32>, usize)]) {
-        match self {
-            HnswIndex::L2(idx) => idx.parallel_insert(data),
-            HnswIndex::Cosine(idx) => idx.parallel_insert(data),
-            HnswIndex::Dot(idx) => idx.parallel_insert(data),
-        }
-    }
-
     fn file_dump(&self, dir: &Path, basename: &str) -> Result<()> {
         match self {
             HnswIndex::L2(idx) => idx
@@ -232,7 +224,7 @@ impl WritableSegment {
     }
 
     /// Append a batch of vectors, write them to the file in one pass, and
-    /// insert them into the index with `parallel_insert`.
+    /// insert them into the index sequentially.
     ///
     /// Returns the assigned internal_ids in the same order as `vectors`.
     pub fn insert_batch(
@@ -251,12 +243,9 @@ impl WritableSegment {
         }
         self.vector_file.flush()?;
 
-        let data: Vec<(&Vec<f32>, usize)> = vectors
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (v, first_id + i))
-            .collect();
-        self.index.parallel_insert(&data);
+        for (i, v) in vectors.iter().enumerate() {
+            self.index.insert((v.as_slice(), first_id + i));
+        }
 
         let ids = (first_id..first_id + vectors.len())
             .map(|i| InternalId::from_u32(i as u32))
@@ -306,12 +295,9 @@ impl WritableSegment {
                 .map(bytes_to_f32)
                 .collect();
 
-            let data: Vec<(&Vec<f32>, usize)> = vectors
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (v, offset + i))
-                .collect();
-            self.index.parallel_insert(&data);
+            for (i, v) in vectors.iter().enumerate() {
+                self.index.insert((v.as_slice(), offset + i));
+            }
             offset += n;
         }
         Ok(())
