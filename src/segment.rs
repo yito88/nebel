@@ -10,7 +10,6 @@ use hnsw_rs::prelude::*;
 
 use crate::types::{InternalId, Level, Metric, SegId, SegmentMeta, SegmentParams, SegmentState};
 
-const MAX_ELEMENTS: usize = 1_000_000;
 const MAX_LAYER: usize = 16;
 const INDEX_BASENAME: &str = "index";
 
@@ -26,25 +25,25 @@ enum HnswIndex {
 }
 
 impl HnswIndex {
-    fn new(metric: &Metric, m: usize, ef_construction: usize) -> Self {
+    fn new(metric: &Metric, m: usize, max_elements: usize, ef_construction: usize) -> Self {
         match metric {
             Metric::L2 => HnswIndex::L2(Hnsw::new(
                 m,
-                MAX_ELEMENTS,
+                max_elements,
                 MAX_LAYER,
                 ef_construction,
                 DistL2 {},
             )),
             Metric::Cosine => HnswIndex::Cosine(Hnsw::new(
                 m,
-                MAX_ELEMENTS,
+                max_elements,
                 MAX_LAYER,
                 ef_construction,
                 DistCosine {},
             )),
             Metric::Dot => HnswIndex::Dot(Hnsw::new(
                 m,
-                MAX_ELEMENTS,
+                max_elements,
                 MAX_LAYER,
                 ef_construction,
                 DistDot {},
@@ -131,11 +130,14 @@ pub struct WritableSegment {
 
 impl WritableSegment {
     /// Create a new empty writable segment on disk.
+    /// `capacity` is the maximum number of vectors this segment will hold;
+    /// it is used to pre-size the HNSW index.
     pub fn create(
         seg_id: SegId,
         dir: PathBuf,
         metric: &Metric,
         params: &SegmentParams,
+        capacity: usize,
     ) -> Result<Self> {
         fs::create_dir_all(&dir)?;
         let vector_file = fs::OpenOptions::new()
@@ -144,7 +146,7 @@ impl WritableSegment {
             .write(true)
             .truncate(true)
             .open(dir.join("vectors.seg"))?;
-        let index = HnswIndex::new(metric, params.m, params.ef_construction);
+        let index = HnswIndex::new(metric, params.m, capacity, params.ef_construction);
         Ok(Self {
             meta: SegMeta {
                 seg_id,
@@ -172,7 +174,12 @@ impl WritableSegment {
             .read(true)
             .write(true)
             .open(dir.join("vectors.seg"))?;
-        let index = HnswIndex::new(metric, params.m, params.ef_construction);
+        let index = HnswIndex::new(
+            metric,
+            params.m,
+            params.segment_capacity,
+            params.ef_construction,
+        );
         let mut seg = Self {
             meta: SegMeta {
                 seg_id,

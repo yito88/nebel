@@ -62,6 +62,7 @@ impl Db {
             seg_dir,
             &schema.metric,
             &schema.segment_params,
+            schema.segment_params.segment_capacity,
         )?;
         let ws_arc = Arc::new(RwLock::new(ws));
         let schema_arc = Arc::new(schema);

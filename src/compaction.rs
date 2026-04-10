@@ -18,8 +18,6 @@ use crate::{
     types::{Level, Manifest, SegId, SegmentMeta, SegmentState},
 };
 
-const CHUNK_VEC_NUM: usize = 2048;
-
 // ---------------------------------------------------------------------------
 // SegmentInfo
 // ---------------------------------------------------------------------------
@@ -164,20 +162,28 @@ fn run_merge(
     let new_dir = inner.seg_dir(new_seg_id);
 
     // Create a new writable segment to accumulate live vectors.
-    let mut ws =
-        WritableSegment::create(new_seg_id, new_dir, &schema.metric, &schema.segment_params)?;
+    // Size the HNSW index to the output level's capacity so it is never over-allocated.
+    let output_capacity = output_level.capacity(schema.segment_params.segment_capacity);
+    let mut ws = WritableSegment::create(
+        new_seg_id,
+        new_dir,
+        &schema.metric,
+        &schema.segment_params,
+        output_capacity,
+    )?;
 
     let mut compaction_entries: Vec<CompactionEntry> = Vec::new();
 
     let record_size = dimension * 4;
-    let mut buf = vec![0u8; CHUNK_VEC_NUM * record_size];
+    let chunk_vec_num = schema.segment_params.insert_batch_size;
+    let mut buf = vec![0u8; chunk_vec_num * record_size];
     for (seg_id, num_vectors) in &input_segs {
         let mut live = storage.load_segment_live_entries(id, *seg_id, *num_vectors)?;
         let vec_path = inner.seg_dir(*seg_id).join("vectors.seg");
         let vec_file = std::fs::File::open(&vec_path)?;
 
-        for (chunk_idx, chunk) in live.chunks_mut(CHUNK_VEC_NUM).enumerate() {
-            let byte_offset = (chunk_idx * CHUNK_VEC_NUM * record_size) as u64;
+        for (chunk_idx, chunk) in live.chunks_mut(chunk_vec_num).enumerate() {
+            let byte_offset = (chunk_idx * chunk_vec_num * record_size) as u64;
             vec_file.read_exact_at(&mut buf[..chunk.len() * record_size], byte_offset)?;
 
             let mut live_meta: Vec<(
