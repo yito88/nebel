@@ -451,6 +451,7 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
         new_dir,
         &inner.schema.metric,
         &inner.schema.segment_params,
+        inner.schema.segment_params.segment_capacity,
     )?;
 
     state.sealed_segs.push(sealed_arc);
