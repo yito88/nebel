@@ -45,8 +45,8 @@ pub(crate) fn search_snapshot(
         _ => None,
     });
 
-    let (sealed_cands, ws_cands) = rayon::join(
-        || {
+    let (sealed_cands, ws_cands) = std::thread::scope(|scope| {
+        let sealed_handle = scope.spawn(|| {
             sealed
                 .par_iter()
                 .filter(|s| s.num_vectors() > 0)
@@ -58,26 +58,25 @@ pub(crate) fn search_snapshot(
                         .map(move |(id, dist)| (sid, id, dist))
                         .collect::<Vec<_>>()
                 })
-                .collect()
-        },
-        || {
-            writable
-                .map(|w| {
-                    let ws = w.read().unwrap();
-                    let sid = ws.seg_id();
-                    let hits = if ws.num_vectors() > 0 {
-                        ws.search(query, k).unwrap_or_default()
-                    } else {
-                        vec![]
-                    };
-                    drop(ws);
-                    hits.into_iter()
-                        .map(|(id, dist)| (sid, id, dist))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        },
-    );
+                .collect::<Vec<_>>()
+        });
+        let ws_cands: Vec<(SegId, InternalId, f32)> = writable
+            .map(|w| {
+                let ws = w.read().unwrap();
+                let sid = ws.seg_id();
+                let hits = if ws.num_vectors() > 0 {
+                    ws.search(query, k).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                drop(ws);
+                hits.into_iter()
+                    .map(|(id, dist)| (sid, id, dist))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (sealed_handle.join().unwrap(), ws_cands)
+    });
     let mut candidates: Vec<(SegId, InternalId, f32)> = sealed_cands;
     candidates.extend(ws_cands);
     candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(CmpOrdering::Equal));
@@ -164,8 +163,8 @@ pub(crate) fn search_exact_snapshot(
         _ => None,
     });
 
-    let (sealed_cands, ws_cands): (Vec<HeapEntry>, Vec<HeapEntry>) = rayon::join(
-        || {
+    let (sealed_cands, ws_cands): (Vec<HeapEntry>, Vec<HeapEntry>) = std::thread::scope(|scope| {
+        let sealed_handle = scope.spawn(|| {
             sealed
                 .par_iter()
                 .flat_map(|seg| {
@@ -186,35 +185,34 @@ pub(crate) fn search_exact_snapshot(
                         })
                         .collect::<Vec<_>>()
                 })
-                .collect()
-        },
-        || {
-            writable
-                .map(|w| {
-                    let ws = w.read().unwrap();
-                    let sid = ws.seg_id();
-                    let n = ws.num_vectors() as u32;
-                    let entries: Vec<HeapEntry> = (0..n)
-                        .map(InternalId::from_u32)
-                        .filter_map(|internal_id| {
-                            if tombstones.contains(&(sid, internal_id)) {
-                                return None;
-                            }
-                            let vector = ws.read_vector(internal_id, dimension).ok()?;
-                            let distance = compute_distance(metric, query, &vector);
-                            Some(HeapEntry {
-                                distance,
-                                seg_id: sid,
-                                internal_id,
-                            })
+                .collect::<Vec<HeapEntry>>()
+        });
+        let ws_cands: Vec<HeapEntry> = writable
+            .map(|w| {
+                let ws = w.read().unwrap();
+                let sid = ws.seg_id();
+                let n = ws.num_vectors() as u32;
+                let entries: Vec<HeapEntry> = (0..n)
+                    .map(InternalId::from_u32)
+                    .filter_map(|internal_id| {
+                        if tombstones.contains(&(sid, internal_id)) {
+                            return None;
+                        }
+                        let vector = ws.read_vector(internal_id, dimension).ok()?;
+                        let distance = compute_distance(metric, query, &vector);
+                        Some(HeapEntry {
+                            distance,
+                            seg_id: sid,
+                            internal_id,
                         })
-                        .collect();
-                    drop(ws);
-                    entries
-                })
-                .unwrap_or_default()
-        },
-    );
+                    })
+                    .collect();
+                drop(ws);
+                entries
+            })
+            .unwrap_or_default();
+        (sealed_handle.join().unwrap(), ws_cands)
+    });
     let mut candidates = sealed_cands;
     candidates.extend(ws_cands);
 
