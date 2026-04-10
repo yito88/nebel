@@ -88,5 +88,14 @@
     "ann_recall": 0.974,
     "passed": true,
     "mutation_passed": true
+  },
+  {
+    "date": "2026-04-10T05:42:12Z",
+    "commit": "0a63e0d",
+    "run_number": 12,
+    "run_url": "https://github.com/yito88/nebel/actions/runs/24228055975",
+    "ann_recall": 0.979,
+    "passed": true,
+    "mutation_passed": true
   }
 ]
