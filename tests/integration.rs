@@ -1,10 +1,10 @@
-use std::{io::Write, thread, time::Duration};
+use std::{collections::HashMap, io::Write, thread, time::Duration};
 
 use nebel::{
     Db,
+    metadata::{FieldSchema, FieldType, MetadataSchema, MetadataValue},
     types::{CollectionId, CollectionSchema, Metric},
 };
-use serde_json::json;
 use tempfile::tempdir;
 
 fn make_db() -> (Db, tempfile::TempDir) {
@@ -72,33 +72,63 @@ fn upsert_replaces_vector() {
 #[test]
 fn metadata_roundtrip() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 2, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 2, Metric::L2);
+    schema.metadata_schema = Some(MetadataSchema {
+        fields: vec![
+            FieldSchema {
+                id: 0,
+                name: "label".into(),
+                ty: FieldType::String,
+                filterable: false,
+            },
+            FieldSchema {
+                id: 1,
+                name: "value".into(),
+                ty: FieldType::Int64,
+                filterable: false,
+            },
+        ],
+    });
+    let col = db.create_collection(schema).unwrap();
 
-    let meta = serde_json::json!({"label": "test", "value": 42});
-    let t = col.upsert("doc", &[1.0, 0.0], Some(meta.clone())).unwrap();
+    let meta = HashMap::from([
+        ("label".to_string(), MetadataValue::String("test".into())),
+        ("value".to_string(), MetadataValue::Int64(42)),
+    ]);
+    let t = col.upsert("doc", &[1.0, 0.0], Some(meta)).unwrap();
     col.wait_visible(t).unwrap();
 
     let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
-    assert_eq!(hits[0].metadata.as_ref().unwrap()["label"], "test");
+    let meta = hits[0].metadata.as_ref().unwrap();
+    assert!(matches!(meta["label"], MetadataValue::String(ref s) if s == "test"));
 }
 
 #[test]
 fn update_metadata_only() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 2, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 2, Metric::L2);
+    schema.metadata_schema = Some(MetadataSchema {
+        fields: vec![FieldSchema {
+            id: 0,
+            name: "v".into(),
+            ty: FieldType::Int64,
+            filterable: false,
+        }],
+    });
+    let col = db.create_collection(schema).unwrap();
 
     col.upsert("doc", &[1.0, 0.0], None).unwrap();
     let t = col
-        .update_metadata("doc", serde_json::json!({"v": 99}))
+        .update_metadata(
+            "doc",
+            HashMap::from([("v".to_string(), MetadataValue::Int64(99))]),
+        )
         .unwrap();
     col.wait_visible(t).unwrap();
 
     let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
-    assert_eq!(hits[0].metadata.as_ref().unwrap()["v"], 99);
+    let meta = hits[0].metadata.as_ref().unwrap();
+    assert!(matches!(meta["v"], MetadataValue::Int64(99)));
 }
 
 #[test]
@@ -153,11 +183,18 @@ fn load_collection_restores_data() {
 
     {
         let db = Db::open(dir.path()).unwrap();
-        let col = db
-            .create_collection(CollectionSchema::new(id.clone(), 3, Metric::L2))
-            .unwrap();
+        let mut schema = CollectionSchema::new(id.clone(), 3, Metric::L2);
+        schema.metadata_schema = Some(MetadataSchema {
+            fields: vec![FieldSchema {
+                id: 0,
+                name: "tag".into(),
+                ty: FieldType::String,
+                filterable: false,
+            }],
+        });
+        let col = db.create_collection(schema).unwrap();
 
-        let meta = serde_json::json!({"tag": "hello"});
+        let meta = HashMap::from([("tag".to_string(), MetadataValue::String("hello".into()))]);
         col.upsert("a", &[1.0, 0.0, 0.0], Some(meta)).unwrap();
         col.upsert("b", &[0.0, 1.0, 0.0], None).unwrap();
         let t = col.upsert("c", &[0.0, 0.0, 1.0], None).unwrap();
@@ -175,7 +212,9 @@ fn load_collection_restores_data() {
         !hits.iter().any(|h| h.doc_id == "c"),
         "deleted doc must not reappear"
     );
-    assert_eq!(hits[0].metadata.as_ref().unwrap()["tag"], "hello");
+    assert!(
+        matches!(hits[0].metadata.as_ref().unwrap()["tag"], MetadataValue::String(ref s) if s == "hello")
+    );
 
     let vec = hits[0].vector.as_ref().unwrap();
     assert!((vec[0] - 1.0).abs() < 1e-6);
@@ -484,18 +523,34 @@ fn compaction_deletes_old_segment_dirs() {
 #[test]
 fn compaction_preserves_metadata() {
     let (db, _dir) = make_db();
-    let col = db.create_collection(make_compaction_schema("c")).unwrap();
+    let mut schema = make_compaction_schema("c");
+    schema.metadata_schema = Some(MetadataSchema {
+        fields: vec![FieldSchema {
+            id: 0,
+            name: "n".into(),
+            ty: FieldType::Int64,
+            filterable: false,
+        }],
+    });
+    let col = db.create_collection(schema).unwrap();
 
     // Insert 11 vectors with metadata. The 11th auto-seals seg1, triggering compaction.
     let mut last = col
-        .upsert("d0", &[0.0, 0.0, 0.0], Some(serde_json::json!({"n": 0})))
+        .upsert(
+            "d0",
+            &[0.0, 0.0, 0.0],
+            Some(HashMap::from([("n".to_string(), MetadataValue::Int64(0))])),
+        )
         .unwrap();
     for i in 1..11u32 {
         last = col
             .upsert(
                 &format!("d{i}"),
                 &[i as f32, 0.0, 0.0],
-                Some(serde_json::json!({"n": i})),
+                Some(HashMap::from([(
+                    "n".to_string(),
+                    MetadataValue::Int64(i as i64),
+                )])),
             )
             .unwrap();
     }
@@ -505,9 +560,8 @@ fn compaction_preserves_metadata() {
     for i in 0..10u32 {
         let hits = col.search(&[i as f32, 0.0, 0.0], 1, true, false).unwrap();
         assert_eq!(hits[0].doc_id, format!("d{i}"));
-        assert_eq!(
-            hits[0].metadata.as_ref().unwrap()["n"],
-            i,
+        assert!(
+            matches!(hits[0].metadata.as_ref().unwrap()["n"], MetadataValue::Int64(v) if v == i as i64),
             "metadata for d{i} corrupted after compaction"
         );
     }
@@ -571,13 +625,21 @@ fn upsert_batch_dimension_mismatch() {
 #[test]
 fn upsert_batch_with_metadata() {
     let (db, _dir) = make_db();
-    let col = db
-        .create_collection(CollectionSchema::new(col("col"), 2, Metric::L2))
-        .unwrap();
+    let mut schema = CollectionSchema::new(col("col"), 2, Metric::L2);
+    schema.metadata_schema = Some(MetadataSchema {
+        fields: vec![FieldSchema {
+            id: 0,
+            name: "label".into(),
+            ty: FieldType::String,
+            filterable: false,
+        }],
+    });
+    let col = db.create_collection(schema).unwrap();
 
+    let x_meta = HashMap::from([("label".to_string(), MetadataValue::String("x".into()))]);
     let token = col
         .upsert_batch(&[
-            ("x", [1.0f32, 0.0].as_slice(), Some(json!({"label": "x"}))),
+            ("x", [1.0f32, 0.0].as_slice(), Some(x_meta)),
             ("y", [0.0, 1.0].as_slice(), None),
         ])
         .unwrap();
@@ -585,5 +647,7 @@ fn upsert_batch_with_metadata() {
 
     let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
     assert_eq!(hits[0].doc_id, "x");
-    assert_eq!(hits[0].metadata.as_ref().unwrap()["label"], "x");
+    assert!(
+        matches!(hits[0].metadata.as_ref().unwrap()["label"], MetadataValue::String(ref s) if s == "x")
+    );
 }

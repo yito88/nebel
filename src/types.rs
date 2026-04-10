@@ -1,6 +1,8 @@
-use std::{fmt, str::FromStr};
+use std::{collections::HashMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
+
+use crate::metadata::{FieldId, MetadataSchema, MetadataValue};
 
 // ---------------------------------------------------------------------------
 // Level
@@ -235,6 +237,9 @@ pub struct CollectionSchema {
     pub compaction_params: CompactionParams,
     #[serde(default = "default_wal_segment_bytes")]
     pub wal_segment_bytes: u64,
+    /// Optional typed metadata schema. If `None`, the collection accepts no metadata.
+    #[serde(default)]
+    pub metadata_schema: Option<MetadataSchema>,
 }
 
 impl CollectionSchema {
@@ -247,6 +252,7 @@ impl CollectionSchema {
             segment_params: SegmentParams::default(),
             compaction_params: CompactionParams::default(),
             wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
+            metadata_schema: None,
         }
     }
 }
@@ -303,7 +309,8 @@ pub struct DocLocation {
 pub struct VectorEntry<'a> {
     pub doc_id: &'a str,
     pub internal_id: InternalId,
-    pub metadata: Option<&'a serde_json::Value>,
+    /// Pre-validated, field_id-keyed metadata (None = no metadata for this entry).
+    pub metadata: Option<&'a HashMap<FieldId, MetadataValue>>,
 }
 
 /// Monotonic sequence token returned by every write operation.
@@ -316,6 +323,6 @@ pub struct SearchHit {
     pub doc_id: String,
     /// Raw distance (lower = closer for L2).
     pub score: f32,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata: Option<HashMap<String, MetadataValue>>,
     pub vector: Option<Vec<f32>>,
 }

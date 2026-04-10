@@ -9,11 +9,14 @@ use std::{
     time::Duration,
 };
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use crate::{
     handle::CollectionInner,
+    metadata::{FieldId, MetadataValue},
     segment::{SealedSegment, WritableSegment},
     types::{Level, Manifest, SegmentMeta, SegmentState, VectorEntry},
     wal::{ApplyCursor, WalId, WalOp, WalRecord},
@@ -334,20 +337,32 @@ fn flush_upsert_batch(
         let seg_id = state.manifest.writable_segment;
         let num_vectors = state.writable_seg.read().unwrap().num_vectors();
 
+        // Convert field-name-keyed metadata to field-id-keyed for storage.
+        let validated_metadatas: Vec<Option<HashMap<FieldId, MetadataValue>>> = chunk
+            .iter()
+            .map(|r| {
+                let WalOp::Upsert { metadata, .. } = &r.op else {
+                    unreachable!()
+                };
+                match (metadata, schema.metadata_schema.as_ref()) {
+                    (Some(m), Some(ms)) => Some(ms.names_to_ids(m)),
+                    _ => None,
+                }
+            })
+            .collect();
+
         let entries: Vec<VectorEntry<'_>> = chunk
             .iter()
             .zip(&internal_ids)
-            .map(|(r, &iid)| {
-                let WalOp::Upsert {
-                    doc_id, metadata, ..
-                } = &r.op
-                else {
+            .zip(&validated_metadatas)
+            .map(|((r, &iid), meta)| {
+                let WalOp::Upsert { doc_id, .. } = &r.op else {
                     unreachable!()
                 };
                 VectorEntry {
                     doc_id: doc_id.as_str(),
                     internal_id: iid,
-                    metadata: metadata.as_ref(),
+                    metadata: meta.as_ref(),
                 }
             })
             .collect();
@@ -399,6 +414,11 @@ fn apply_entry(inner: &CollectionInner, state: &mut ApplyState, record: &WalReco
             };
             let seg_id = state.manifest.writable_segment;
             let num_vectors = state.writable_seg.read().unwrap().num_vectors();
+            let validated_meta: Option<HashMap<FieldId, MetadataValue>> =
+                match (metadata, schema.metadata_schema.as_ref()) {
+                    (Some(m), Some(ms)) => Some(ms.names_to_ids(m)),
+                    _ => None,
+                };
             storage.apply_upsert(
                 id,
                 doc_id.as_str(),
@@ -412,7 +432,7 @@ fn apply_entry(inner: &CollectionInner, state: &mut ApplyState, record: &WalReco
                 &[VectorEntry {
                     doc_id: doc_id.as_str(),
                     internal_id,
-                    metadata: metadata.as_ref(),
+                    metadata: validated_meta.as_ref(),
                 }],
                 record.seq,
             )?;
@@ -421,7 +441,12 @@ fn apply_entry(inner: &CollectionInner, state: &mut ApplyState, record: &WalReco
             storage.apply_delete(id, doc_id, record.seq)?;
         }
         WalOp::UpdateMetadata { doc_id, metadata } => {
-            storage.apply_update_metadata(id, doc_id, metadata, record.seq)?;
+            let validated_meta: HashMap<FieldId, MetadataValue> =
+                match schema.metadata_schema.as_ref() {
+                    Some(ms) => ms.names_to_ids(metadata),
+                    None => HashMap::new(),
+                };
+            storage.apply_update_metadata(id, doc_id, &validated_meta, record.seq)?;
         }
     }
 

@@ -83,7 +83,12 @@ pub(crate) fn search_snapshot(
 
     // Resolve tombstones, doc_ids, and metadata in a single read transaction.
     let keys: Vec<(SegId, InternalId)> = candidates.iter().map(|&(s, i, _)| (s, i)).collect();
-    let resolved = storage.resolve_candidates(id, &keys, include_metadata)?;
+    let resolved = storage.resolve_candidates(
+        id,
+        &keys,
+        include_metadata,
+        snap.schema.metadata_schema.as_ref(),
+    )?;
 
     let mut hits = Vec::new();
     for ((seg_id, internal_id, distance), resolved) in candidates.iter().zip(resolved.into_iter()) {
@@ -225,7 +230,7 @@ pub(crate) fn search_exact_snapshot(
 
     // Resolve doc_ids in a single read transaction.
     let keys: Vec<(SegId, InternalId)> = top_k.iter().map(|e| (e.seg_id, e.internal_id)).collect();
-    let resolved = storage.resolve_candidates(id, &keys, false)?;
+    let resolved = storage.resolve_candidates(id, &keys, false, None)?;
 
     let mut hits = Vec::with_capacity(top_k.len());
     for (entry, r) in top_k.iter().zip(resolved.into_iter()) {

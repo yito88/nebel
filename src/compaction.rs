@@ -16,7 +16,7 @@ use crate::{
     segment::{SealedSegment, WritableSegment},
     snapshot::SegmentSnapshot,
     storage::CompactionEntry,
-    types::{Level, Manifest, SegId, SegmentMeta, SegmentState},
+    types::{DocLocation, Level, Manifest, SegId, SegmentMeta, SegmentState},
 };
 
 // ---------------------------------------------------------------------------
@@ -187,14 +187,10 @@ fn run_merge(
             let byte_offset = (chunk_idx * chunk_vec_num * record_size) as u64;
             vec_file.read_exact_at(&mut buf[..chunk.len() * record_size], byte_offset)?;
 
-            let mut live_meta: Vec<(
-                String,
-                Option<serde_json::Value>,
-                Option<crate::types::DocLocation>,
-            )> = Vec::new();
+            let mut live_meta: Vec<(String, Option<DocLocation>)> = Vec::new();
             let mut vectors: Vec<Vec<f32>> = Vec::new();
             for (i, entry_opt) in chunk.iter_mut().enumerate() {
-                let Some((doc_id, metadata, prev_location)) = entry_opt.take() else {
+                let Some((doc_id, prev_location)) = entry_opt.take() else {
                     continue;
                 };
                 let start = i * record_size;
@@ -204,17 +200,14 @@ fn run_merge(
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect(),
                 );
-                live_meta.push((doc_id, metadata, prev_location));
+                live_meta.push((doc_id, prev_location));
             }
 
             let new_ids = ws.insert_batch(&vectors, dimension)?;
-            for ((doc_id, metadata, prev_location), new_internal_id) in
-                live_meta.into_iter().zip(new_ids)
-            {
+            for ((doc_id, prev_location), new_internal_id) in live_meta.into_iter().zip(new_ids) {
                 compaction_entries.push(CompactionEntry {
                     doc_id,
                     new_internal_id,
-                    metadata,
                     prev_location,
                 });
             }
