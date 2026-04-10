@@ -116,39 +116,56 @@ impl MetadataValue {
 // Binary encoding / decoding
 // ---------------------------------------------------------------------------
 
-const TAG_STRING: u8 = 1;
-const TAG_INT64: u8 = 2;
-const TAG_FLOAT64: u8 = 3;
-const TAG_BOOL: u8 = 4;
-const TAG_BYTES: u8 = 5;
-const TAG_TIMESTAMP: u8 = 6;
+#[repr(u8)]
+enum ValueTag {
+    String = 1,
+    Int64 = 2,
+    Float64 = 3,
+    Bool = 4,
+    Bytes = 5,
+    Timestamp = 6,
+}
+
+impl ValueTag {
+    fn try_from(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::String),
+            2 => Some(Self::Int64),
+            3 => Some(Self::Float64),
+            4 => Some(Self::Bool),
+            5 => Some(Self::Bytes),
+            6 => Some(Self::Timestamp),
+            _ => None,
+        }
+    }
+}
 
 /// Encode a `MetadataValue` to bytes: `[tag:u8][payload...]`.
 pub fn encode_value(v: &MetadataValue) -> Vec<u8> {
     match v {
         MetadataValue::String(s) => {
-            let mut out = vec![TAG_STRING];
+            let mut out = vec![ValueTag::String as u8];
             out.extend_from_slice(s.as_bytes());
             out
         }
         MetadataValue::Int64(i) => {
-            let mut out = vec![TAG_INT64];
+            let mut out = vec![ValueTag::Int64 as u8];
             out.extend_from_slice(&i.to_be_bytes());
             out
         }
         MetadataValue::Float64(f) => {
-            let mut out = vec![TAG_FLOAT64];
+            let mut out = vec![ValueTag::Float64 as u8];
             out.extend_from_slice(&f.to_be_bytes());
             out
         }
-        MetadataValue::Bool(b) => vec![TAG_BOOL, u8::from(*b)],
+        MetadataValue::Bool(b) => vec![ValueTag::Bool as u8, u8::from(*b)],
         MetadataValue::Bytes(b) => {
-            let mut out = vec![TAG_BYTES];
+            let mut out = vec![ValueTag::Bytes as u8];
             out.extend_from_slice(b);
             out
         }
         MetadataValue::Timestamp(t) => {
-            let mut out = vec![TAG_TIMESTAMP];
+            let mut out = vec![ValueTag::Timestamp as u8];
             out.extend_from_slice(&t.to_be_bytes());
             out
         }
@@ -160,13 +177,13 @@ pub fn decode_value(b: &[u8]) -> Result<MetadataValue> {
     if b.is_empty() {
         bail!("empty metadata value bytes");
     }
-    match b[0] {
-        TAG_STRING => {
+    match ValueTag::try_from(b[0]) {
+        Some(ValueTag::String) => {
             let s = std::str::from_utf8(&b[1..])
                 .map_err(|_| anyhow!("invalid UTF-8 in String metadata value"))?;
             Ok(MetadataValue::String(s.to_string()))
         }
-        TAG_INT64 => {
+        Some(ValueTag::Int64) => {
             if b.len() < 9 {
                 bail!("truncated Int64 metadata value");
             }
@@ -174,7 +191,7 @@ pub fn decode_value(b: &[u8]) -> Result<MetadataValue> {
                 b[1..9].try_into().unwrap(),
             )))
         }
-        TAG_FLOAT64 => {
+        Some(ValueTag::Float64) => {
             if b.len() < 9 {
                 bail!("truncated Float64 metadata value");
             }
@@ -182,14 +199,14 @@ pub fn decode_value(b: &[u8]) -> Result<MetadataValue> {
                 b[1..9].try_into().unwrap(),
             )))
         }
-        TAG_BOOL => {
+        Some(ValueTag::Bool) => {
             if b.len() < 2 {
                 bail!("truncated Bool metadata value");
             }
             Ok(MetadataValue::Bool(b[1] != 0))
         }
-        TAG_BYTES => Ok(MetadataValue::Bytes(b[1..].to_vec())),
-        TAG_TIMESTAMP => {
+        Some(ValueTag::Bytes) => Ok(MetadataValue::Bytes(b[1..].to_vec())),
+        Some(ValueTag::Timestamp) => {
             if b.len() < 9 {
                 bail!("truncated Timestamp metadata value");
             }
@@ -197,7 +214,7 @@ pub fn decode_value(b: &[u8]) -> Result<MetadataValue> {
                 b[1..9].try_into().unwrap(),
             )))
         }
-        tag => bail!("unknown metadata value tag: {}", tag),
+        None => bail!("unknown metadata value tag: {}", b[0]),
     }
 }
 
