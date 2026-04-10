@@ -157,6 +157,7 @@ fn main() -> Result<()> {
                     segment_params: params.clone(),
                     compaction_params: compaction_params.clone(),
                     wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
+                    metadata_schema: None,
                 };
                 (db.create_collection(schema)?, false)
             }
@@ -173,6 +174,7 @@ fn main() -> Result<()> {
             segment_params: params.clone(),
             compaction_params: Default::default(),
             wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
+            metadata_schema: None,
         };
         let col = db.create_collection(schema)?;
         (DbDir::Temp(tmp), col, false)

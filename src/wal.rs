@@ -4,11 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::types::DEFAULT_WAL_SEGMENT_BYTES;
+use crate::{metadata::MetadataValue, types::DEFAULT_WAL_SEGMENT_BYTES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct WalId(pub u64);
@@ -46,14 +47,14 @@ pub(crate) enum WalOp {
     Upsert {
         doc_id: String,
         vector: Vec<f32>,
-        metadata: Option<Value>,
+        metadata: Option<HashMap<String, MetadataValue>>,
     },
     Delete {
         doc_id: String,
     },
     UpdateMetadata {
         doc_id: String,
-        metadata: Value,
+        metadata: HashMap<String, MetadataValue>,
     },
 }
 

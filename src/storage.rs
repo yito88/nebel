@@ -3,16 +3,24 @@ use std::collections::HashMap;
 use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 
-use crate::types::{
-    CollectionId, CollectionSchema, DocLocation, InternalId, Manifest, SegId, SegmentMeta,
-    VectorEntry,
+use crate::{
+    metadata::{
+        FieldId, MetadataSchema, MetadataValue, decode_value, doc_ord_key, encode_value,
+        meta_value_key, meta_value_prefix,
+    },
+    types::{
+        CollectionId, CollectionSchema, DocLocation, InternalId, Manifest, SegId, SegmentMeta,
+        VectorEntry,
+    },
 };
 
-/// `(doc_id, metadata, prev_location)` — `prev_location` is the DOC_MAP value at
-/// the time of the read, used by compaction to detect concurrent updates.
-type LiveEntries = Vec<Option<(String, Option<serde_json::Value>, Option<DocLocation>)>>;
+/// `(doc_id, prev_location)` — `prev_location` is the DOC_MAP value at the time of the read,
+/// used by compaction to detect concurrent updates.
+type LiveEntries = Vec<Option<(String, Option<DocLocation>)>>;
 
-// table definitions
+// ---------------------------------------------------------------------------
+// Table definitions
+// ---------------------------------------------------------------------------
 
 /// collection_name -> CollectionSchema (JSON)
 const COLLECTIONS: TableDefinition<&str, &str> = TableDefinition::new("collections");
@@ -26,9 +34,6 @@ const DOC_MAP: TableDefinition<&str, &str> = TableDefinition::new("doc_map");
 /// "{collection}\0{seg_id}\0{internal_id}" -> bool (true = deleted)
 const TOMBSTONES: TableDefinition<&str, bool> = TableDefinition::new("tombstones");
 
-/// "{collection}\0{seg_id}\0{internal_id}" -> metadata JSON string
-const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
-
 /// "{collection}\0{seg_id}\0{internal_id}" -> doc_id string
 const REVERSE_DOC: TableDefinition<&str, &str> = TableDefinition::new("reverse_doc");
 
@@ -38,7 +43,29 @@ const MANIFESTS: TableDefinition<&str, &str> = TableDefinition::new("manifests")
 /// collection_name -> last applied WAL seq (u64)
 const APPLIED_SEQ: TableDefinition<&str, u64> = TableDefinition::new("applied_seq");
 
-// key helpers
+// --- New metadata tables ---
+
+/// "{collection}\0{field_name}" -> field_id (u32)
+const FIELD_NAME_TO_ID: TableDefinition<&str, u32> = TableDefinition::new("field_name_to_id");
+
+/// "{collection}\0{field_id:010}" -> FieldSchema (JSON)
+const FIELD_ID_TO_SCHEMA: TableDefinition<&str, &str> = TableDefinition::new("field_id_to_schema");
+
+/// "{collection}\0{doc_id}" -> doc_ord (u64)
+const DOC_ID_TO_ORD: TableDefinition<&str, u64> = TableDefinition::new("doc_id_to_ord");
+
+/// "{collection}\0" + doc_ord_be8 -> doc_id string
+const DOC_ORD_TO_ID: TableDefinition<&[u8], &str> = TableDefinition::new("doc_ord_to_id");
+
+/// "{collection}\0" + doc_ord_be8 + field_id_be4 -> [tag][payload]
+const METADATA_VALUES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata_values");
+
+/// collection_name -> next_doc_ord (u64)
+const COLLECTION_META: TableDefinition<&str, u64> = TableDefinition::new("collection_meta");
+
+// ---------------------------------------------------------------------------
+// Key helpers
+// ---------------------------------------------------------------------------
 
 fn seg_key(collection: &str, seg_id: SegId) -> String {
     format!("{}\0{}", collection, seg_id)
@@ -51,6 +78,22 @@ fn doc_key(collection: &str, doc_id: &str) -> String {
 fn meta_key(collection: &str, seg_id: SegId, internal_id: InternalId) -> String {
     format!("{}\0{}\0{}", collection, seg_id, internal_id)
 }
+
+fn field_name_key(collection: &str, field_name: &str) -> String {
+    format!("{}\0{}", collection, field_name)
+}
+
+fn field_id_key(collection: &str, field_id: FieldId) -> String {
+    format!("{}\0{:010}", collection, field_id)
+}
+
+fn doc_id_to_ord_key(collection: &str, doc_id: &str) -> String {
+    format!("{}\0{}", collection, doc_id)
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
 
 pub struct Storage {
     db: Database,
@@ -65,10 +108,15 @@ impl Storage {
         wtxn.open_table(SEGMENTS)?;
         wtxn.open_table(DOC_MAP)?;
         wtxn.open_table(TOMBSTONES)?;
-        wtxn.open_table(METADATA)?;
         wtxn.open_table(REVERSE_DOC)?;
         wtxn.open_table(MANIFESTS)?;
         wtxn.open_table(APPLIED_SEQ)?;
+        wtxn.open_table(FIELD_NAME_TO_ID)?;
+        wtxn.open_table(FIELD_ID_TO_SCHEMA)?;
+        wtxn.open_table(DOC_ID_TO_ORD)?;
+        wtxn.open_table(DOC_ORD_TO_ID)?;
+        wtxn.open_table(METADATA_VALUES)?;
+        wtxn.open_table(COLLECTION_META)?;
         wtxn.commit()?;
         Ok(Self { db })
     }
@@ -93,6 +141,22 @@ impl Storage {
             manifest_table.insert(name, manifest_json.as_str())?;
             let mut seg_table = wtxn.open_table(SEGMENTS)?;
             seg_table.insert(sk.as_str(), seg_json.as_str())?;
+
+            // Initialize DocOrd counter and write field schemas if metadata schema is present.
+            let mut col_meta_table = wtxn.open_table(COLLECTION_META)?;
+            col_meta_table.insert(name, 0u64)?;
+
+            if let Some(ms) = &schema.metadata_schema {
+                let mut fn_table = wtxn.open_table(FIELD_NAME_TO_ID)?;
+                let mut fi_table = wtxn.open_table(FIELD_ID_TO_SCHEMA)?;
+                for field in &ms.fields {
+                    let fk = field_name_key(name, &field.name);
+                    fn_table.insert(fk.as_str(), field.id)?;
+                    let fik = field_id_key(name, field.id);
+                    let field_json = serde_json::to_string(field)?;
+                    fi_table.insert(fik.as_str(), field_json.as_str())?;
+                }
+            }
         }
         wtxn.commit()?;
         Ok(())
@@ -119,7 +183,6 @@ impl Storage {
     }
 
     /// Atomically seal an old segment, register a new writable segment, and update the manifest.
-    /// All three writes happen in a single redb transaction.
     pub fn seal_segment(
         &self,
         id: &CollectionId,
@@ -158,21 +221,28 @@ impl Storage {
     }
 
     /// Resolve a batch of candidates in a single read transaction.
+    ///
     /// For each `(seg_id, internal_id)`, checks the tombstone, looks up the doc_id,
-    /// and optionally fetches metadata.
+    /// and optionally fetches typed metadata from `METADATA_VALUES`.
     /// Returns one `Option<ResolvedCandidate>` per input — `None` if tombstoned or missing.
     pub fn resolve_candidates(
         &self,
         id: &CollectionId,
         candidates: &[(SegId, InternalId)],
         include_metadata: bool,
+        metadata_schema: Option<&MetadataSchema>,
     ) -> Result<Vec<Option<ResolvedCandidate>>> {
         let col = id.as_str();
         let rtxn = self.db.begin_read()?;
         let tomb_table = rtxn.open_table(TOMBSTONES)?;
         let rev_table = rtxn.open_table(REVERSE_DOC)?;
-        let meta_table = if include_metadata {
-            Some(rtxn.open_table(METADATA)?)
+        let doc_ord_table = if include_metadata && metadata_schema.is_some() {
+            Some(rtxn.open_table(DOC_ID_TO_ORD)?)
+        } else {
+            None
+        };
+        let meta_table = if include_metadata && metadata_schema.is_some() {
+            Some(rtxn.open_table(METADATA_VALUES)?)
         } else {
             None
         };
@@ -195,22 +265,48 @@ impl Storage {
                     continue;
                 }
             };
-            let metadata = if let Some(ref mt) = meta_table {
-                match mt.get(key.as_str())? {
-                    Some(v) => Some(serde_json::from_str(v.value())?),
-                    None => None,
+
+            let metadata = if let (Some(ord_table), Some(mv_table), Some(schema)) =
+                (doc_ord_table.as_ref(), meta_table.as_ref(), metadata_schema)
+            {
+                let dk = doc_id_to_ord_key(col, &doc_id);
+                if let Some(ord_v) = ord_table.get(dk.as_str())? {
+                    let doc_ord = ord_v.value();
+                    let prefix = meta_value_prefix(col, doc_ord);
+                    let end = meta_value_key(col, doc_ord, u32::MAX);
+                    let mut map = HashMap::new();
+                    for entry in mv_table.range(prefix.as_slice()..=end.as_slice())? {
+                        let (k, v) = entry?;
+                        let key_bytes = k.value();
+                        // Last 4 bytes of the key are the field_id.
+                        if key_bytes.len() < 4 {
+                            continue;
+                        }
+                        let field_id = u32::from_be_bytes(
+                            key_bytes[key_bytes.len() - 4..].try_into().unwrap(),
+                        );
+                        if let (Some(field), Ok(val)) =
+                            (schema.field_by_id(field_id), decode_value(v.value()))
+                        {
+                            map.insert(field.name.clone(), val);
+                        }
+                    }
+                    if map.is_empty() { None } else { Some(map) }
+                } else {
+                    None
                 }
             } else {
                 None
             };
+
             results.push(Some(ResolvedCandidate { doc_id, metadata }));
         }
         Ok(results)
     }
 
     /// Atomically apply an upsert WAL record: tombstone the old location (if any),
-    /// write new segment metadata, doc/reverse/vector-metadata entries, and advance applied_seq.
-    /// The old doc location is read inside the transaction, making the full operation atomic.
+    /// write new segment metadata, doc/reverse entries, DocOrd mappings, typed metadata
+    /// values, and advance applied_seq.
     pub fn apply_upsert(
         &self,
         id: &CollectionId,
@@ -223,23 +319,6 @@ impl Storage {
         let sk = seg_key(col, seg_meta.seg_id);
         let seg_json = serde_json::to_string(seg_meta)?;
         let old_dk = doc_key(col, doc_id);
-        let prepared: Vec<_> = entries
-            .iter()
-            .map(|e| {
-                let dk = doc_key(col, e.doc_id);
-                let loc = DocLocation {
-                    seg_id: seg_meta.seg_id,
-                    internal_id: e.internal_id,
-                };
-                let loc_json = serde_json::to_string(&loc)?;
-                let mk = meta_key(col, seg_meta.seg_id, e.internal_id);
-                let meta_json = match e.metadata {
-                    Some(m) => Some(serde_json::to_string(m)?),
-                    None => None,
-                };
-                Ok((dk, loc_json, mk, e.doc_id, meta_json))
-            })
-            .collect::<Result<Vec<_>>>()?;
 
         let wtxn = self.db.begin_write()?;
         {
@@ -253,7 +332,6 @@ impl Storage {
                 let tk = meta_key(col, loc.seg_id, loc.internal_id);
                 let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
                 tomb_table.insert(tk.as_str(), true)?;
-                // Increment tombstone_count on the affected segment.
                 let old_sk = seg_key(col, loc.seg_id);
                 let updated_meta = if let Some(v) = seg_table.get(old_sk.as_str())? {
                     let mut meta: SegmentMeta = serde_json::from_str(v.value())?;
@@ -267,15 +345,52 @@ impl Storage {
                 }
             }
             seg_table.insert(sk.as_str(), seg_json.as_str())?;
+
             let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
-            let mut meta_table = wtxn.open_table(METADATA)?;
-            for (dk, loc_json, mk, entry_doc_id, meta_json) in &prepared {
+            let mut ord_table = wtxn.open_table(DOC_ID_TO_ORD)?;
+            let mut ord_rev_table = wtxn.open_table(DOC_ORD_TO_ID)?;
+            let mut meta_vals_table = wtxn.open_table(METADATA_VALUES)?;
+            let mut col_meta_table = wtxn.open_table(COLLECTION_META)?;
+
+            let mut next_doc_ord = col_meta_table.get(col)?.map(|v| v.value()).unwrap_or(0);
+
+            for e in entries {
+                let dk = doc_key(col, e.doc_id);
+                let loc = DocLocation {
+                    seg_id: seg_meta.seg_id,
+                    internal_id: e.internal_id,
+                };
+                let loc_json = serde_json::to_string(&loc)?;
                 doc_table.insert(dk.as_str(), loc_json.as_str())?;
-                rev_table.insert(mk.as_str(), *entry_doc_id)?;
-                if let Some(mj) = meta_json {
-                    meta_table.insert(mk.as_str(), mj.as_str())?;
+
+                let mk = meta_key(col, seg_meta.seg_id, e.internal_id);
+                rev_table.insert(mk.as_str(), e.doc_id)?;
+
+                // Assign or look up DocOrd.
+                let ord_key = doc_id_to_ord_key(col, e.doc_id);
+                let doc_ord = if let Some(v) = ord_table.get(ord_key.as_str())? {
+                    v.value()
+                } else {
+                    let new_ord = next_doc_ord;
+                    next_doc_ord += 1;
+                    ord_table.insert(ord_key.as_str(), new_ord)?;
+                    let ok = doc_ord_key(col, new_ord);
+                    ord_rev_table.insert(ok.as_slice(), e.doc_id)?;
+                    new_ord
+                };
+
+                // Write typed metadata values.
+                if let Some(meta_map) = e.metadata {
+                    for (&field_id, value) in meta_map {
+                        let vk = meta_value_key(col, doc_ord, field_id);
+                        let encoded = encode_value(value);
+                        meta_vals_table.insert(vk.as_slice(), encoded.as_slice())?;
+                    }
                 }
             }
+
+            col_meta_table.insert(col, next_doc_ord)?;
+
             let mut seq_table = wtxn.open_table(APPLIED_SEQ)?;
             seq_table.insert(col, seq)?;
         }
@@ -284,9 +399,6 @@ impl Storage {
     }
 
     /// Atomically apply a batch of upsert WAL records in a single redb transaction.
-    /// For each entry, the old doc location (if any) is tombstoned; tombstone counts are
-    /// accumulated per-segment and flushed in the same transaction. The new segment metadata,
-    /// all doc/reverse/vector-metadata entries, and `applied_seq` are also written atomically.
     pub fn apply_upsert_batch(
         &self,
         id: &CollectionId,
@@ -298,32 +410,13 @@ impl Storage {
         let sk = seg_key(col, seg_meta.seg_id);
         let seg_json = serde_json::to_string(seg_meta)?;
 
-        // Pre-serialize new locations and metadata outside the transaction.
-        let prepared: Vec<_> = entries
-            .iter()
-            .map(|e| {
-                let dk = doc_key(col, e.doc_id);
-                let loc = DocLocation {
-                    seg_id: seg_meta.seg_id,
-                    internal_id: e.internal_id,
-                };
-                let loc_json = serde_json::to_string(&loc)?;
-                let mk = meta_key(col, seg_meta.seg_id, e.internal_id);
-                let meta_json = match e.metadata {
-                    Some(m) => Some(serde_json::to_string(m)?),
-                    None => None,
-                };
-                Ok((dk, loc_json, mk, e.doc_id, meta_json))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         let wtxn = self.db.begin_write()?;
         {
             let mut doc_table = wtxn.open_table(DOC_MAP)?;
             let mut seg_table = wtxn.open_table(SEGMENTS)?;
             let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
 
-            // For each entry, tombstone its old location and accumulate tombstone counts.
+            // Tombstone old locations, accumulate per-segment tombstone counts.
             let mut tombstone_increments: HashMap<SegId, usize> = HashMap::new();
             for e in entries {
                 let dk = doc_key(col, e.doc_id);
@@ -350,19 +443,52 @@ impl Storage {
                 }
             }
 
-            // Write new segment metadata.
             seg_table.insert(sk.as_str(), seg_json.as_str())?;
 
-            // Write all new entries.
             let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
-            let mut meta_table = wtxn.open_table(METADATA)?;
-            for (dk, loc_json, mk, entry_doc_id, meta_json) in &prepared {
+            let mut ord_table = wtxn.open_table(DOC_ID_TO_ORD)?;
+            let mut ord_rev_table = wtxn.open_table(DOC_ORD_TO_ID)?;
+            let mut meta_vals_table = wtxn.open_table(METADATA_VALUES)?;
+            let mut col_meta_table = wtxn.open_table(COLLECTION_META)?;
+
+            let mut next_doc_ord = col_meta_table.get(col)?.map(|v| v.value()).unwrap_or(0);
+
+            for e in entries {
+                let dk = doc_key(col, e.doc_id);
+                let loc = DocLocation {
+                    seg_id: seg_meta.seg_id,
+                    internal_id: e.internal_id,
+                };
+                let loc_json = serde_json::to_string(&loc)?;
                 doc_table.insert(dk.as_str(), loc_json.as_str())?;
-                rev_table.insert(mk.as_str(), *entry_doc_id)?;
-                if let Some(mj) = meta_json {
-                    meta_table.insert(mk.as_str(), mj.as_str())?;
+
+                let mk = meta_key(col, seg_meta.seg_id, e.internal_id);
+                rev_table.insert(mk.as_str(), e.doc_id)?;
+
+                // Assign or look up DocOrd.
+                let ord_key = doc_id_to_ord_key(col, e.doc_id);
+                let doc_ord = if let Some(v) = ord_table.get(ord_key.as_str())? {
+                    v.value()
+                } else {
+                    let new_ord = next_doc_ord;
+                    next_doc_ord += 1;
+                    ord_table.insert(ord_key.as_str(), new_ord)?;
+                    let ok = doc_ord_key(col, new_ord);
+                    ord_rev_table.insert(ok.as_slice(), e.doc_id)?;
+                    new_ord
+                };
+
+                // Write typed metadata values.
+                if let Some(meta_map) = e.metadata {
+                    for (&field_id, value) in meta_map {
+                        let vk = meta_value_key(col, doc_ord, field_id);
+                        let encoded = encode_value(value);
+                        meta_vals_table.insert(vk.as_slice(), encoded.as_slice())?;
+                    }
                 }
             }
+
+            col_meta_table.insert(col, next_doc_ord)?;
 
             let mut seq_table = wtxn.open_table(APPLIED_SEQ)?;
             seq_table.insert(col, seq)?;
@@ -372,8 +498,7 @@ impl Storage {
     }
 
     /// Atomically apply a delete WAL record: tombstone and remove doc location (if it exists),
-    /// and advance applied_seq.
-    /// The doc location is read inside the transaction, making the full operation atomic.
+    /// clean up DocOrd and metadata values, and advance applied_seq.
     pub fn apply_delete(&self, id: &CollectionId, doc_id: &str, seq: u64) -> Result<()> {
         let col = id.as_str();
         let dk = doc_key(col, doc_id);
@@ -389,7 +514,6 @@ impl Storage {
                 let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
                 tomb_table.insert(tk.as_str(), true)?;
                 doc_table.remove(dk.as_str())?;
-                // Increment tombstone_count on the affected segment.
                 let old_sk = seg_key(col, loc.seg_id);
                 let mut seg_table = wtxn.open_table(SEGMENTS)?;
                 let updated_meta = if let Some(v) = seg_table.get(old_sk.as_str())? {
@@ -403,6 +527,30 @@ impl Storage {
                     seg_table.insert(old_sk.as_str(), updated.as_str())?;
                 }
             }
+
+            // Remove DocOrd mappings and METADATA_VALUES.
+            let ord_key = doc_id_to_ord_key(col, doc_id);
+            let mut ord_table = wtxn.open_table(DOC_ID_TO_ORD)?;
+            if let Some(ord_v) = ord_table.remove(ord_key.as_str())? {
+                let doc_ord = ord_v.value();
+                let ok = doc_ord_key(col, doc_ord);
+                let mut ord_rev_table = wtxn.open_table(DOC_ORD_TO_ID)?;
+                ord_rev_table.remove(ok.as_slice())?;
+
+                // Range-delete all METADATA_VALUES entries for this doc_ord.
+                let prefix = meta_value_prefix(col, doc_ord);
+                let end = meta_value_key(col, doc_ord, u32::MAX);
+                let mut meta_vals_table = wtxn.open_table(METADATA_VALUES)?;
+                let to_delete: Vec<Vec<u8>> = meta_vals_table
+                    .range(prefix.as_slice()..=end.as_slice())?
+                    .filter_map(|e| e.ok())
+                    .map(|(k, _)| k.value().to_vec())
+                    .collect();
+                for k in &to_delete {
+                    meta_vals_table.remove(k.as_slice())?;
+                }
+            }
+
             let mut seq_table = wtxn.open_table(APPLIED_SEQ)?;
             seq_table.insert(col, seq)?;
         }
@@ -410,30 +558,28 @@ impl Storage {
         Ok(())
     }
 
-    /// Atomically apply an update-metadata WAL record: write the new metadata (if the doc exists)
-    /// and advance applied_seq.
-    /// The doc location is read inside the transaction, making the full operation atomic.
+    /// Atomically apply an update-metadata WAL record: look up DocOrd and write new typed
+    /// metadata values for fields present in `meta`, then advance applied_seq.
     pub fn apply_update_metadata(
         &self,
         id: &CollectionId,
         doc_id: &str,
-        meta: &serde_json::Value,
+        meta: &HashMap<FieldId, MetadataValue>,
         seq: u64,
     ) -> Result<()> {
         let col = id.as_str();
-        let dk = doc_key(col, doc_id);
+        let ord_key = doc_id_to_ord_key(col, doc_id);
         let wtxn = self.db.begin_write()?;
         {
-            let doc_table = wtxn.open_table(DOC_MAP)?;
-            let old_loc: Option<DocLocation> = match doc_table.get(dk.as_str())? {
-                Some(v) => Some(serde_json::from_str(v.value())?),
-                None => None,
-            };
-            if let Some(loc) = &old_loc {
-                let mk = meta_key(col, loc.seg_id, loc.internal_id);
-                let json = serde_json::to_string(meta)?;
-                let mut meta_table = wtxn.open_table(METADATA)?;
-                meta_table.insert(mk.as_str(), json.as_str())?;
+            let ord_table = wtxn.open_table(DOC_ID_TO_ORD)?;
+            if let Some(ord_v) = ord_table.get(ord_key.as_str())? {
+                let doc_ord = ord_v.value();
+                let mut meta_vals_table = wtxn.open_table(METADATA_VALUES)?;
+                for (&field_id, value) in meta {
+                    let vk = meta_value_key(col, doc_ord, field_id);
+                    let encoded = encode_value(value);
+                    meta_vals_table.insert(vk.as_slice(), encoded.as_slice())?;
+                }
             }
             let mut seq_table = wtxn.open_table(APPLIED_SEQ)?;
             seq_table.insert(col, seq)?;
@@ -443,8 +589,7 @@ impl Storage {
     }
 
     /// Load all tombstoned `(seg_id, internal_id)` pairs for a collection in
-    /// a single read transaction. Used by brute-force search to avoid per-vector
-    /// transaction overhead.
+    /// a single read transaction.
     #[cfg(feature = "testing")]
     pub fn load_tombstone_set(&self, id: &CollectionId) -> Result<TombstoneSet> {
         let col = id.as_str();
@@ -461,7 +606,6 @@ impl Storage {
             if !v.value() {
                 continue;
             }
-            // key format: "{collection}\0{seg_id}\0{internal_id}"
             let rest = &key[prefix.len()..];
             if let Some((seg_str, id_str)) = rest.split_once('\0')
                 && let (Ok(seg_id), Ok(internal_id)) =
@@ -473,8 +617,8 @@ impl Storage {
         Ok(set)
     }
 
-    /// Write segment metadata, doc locations, reverse-doc mappings, and
-    /// optional per-vector metadata in a single redb transaction.
+    /// Write segment metadata, doc locations, reverse-doc mappings, DocOrd mappings,
+    /// and typed metadata values in a single redb transaction.
     pub fn write_vector_entries(
         &self,
         id: &CollectionId,
@@ -482,44 +626,57 @@ impl Storage {
         entries: &[VectorEntry<'_>],
     ) -> Result<()> {
         let col = id.as_str();
-        let seg_key = seg_key(col, seg_meta.seg_id);
+        let sk = seg_key(col, seg_meta.seg_id);
         let seg_json = serde_json::to_string(seg_meta)?;
 
-        // Pre-serialise doc locations so we don't do it inside the txn.
-        let prepared: Vec<_> = entries
-            .iter()
-            .map(|e| {
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut seg_table = wtxn.open_table(SEGMENTS)?;
+            seg_table.insert(sk.as_str(), seg_json.as_str())?;
+
+            let mut doc_table = wtxn.open_table(DOC_MAP)?;
+            let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
+            let mut ord_table = wtxn.open_table(DOC_ID_TO_ORD)?;
+            let mut ord_rev_table = wtxn.open_table(DOC_ORD_TO_ID)?;
+            let mut meta_vals_table = wtxn.open_table(METADATA_VALUES)?;
+            let mut col_meta_table = wtxn.open_table(COLLECTION_META)?;
+
+            let mut next_doc_ord = col_meta_table.get(col)?.map(|v| v.value()).unwrap_or(0);
+
+            for e in entries {
                 let dk = doc_key(col, e.doc_id);
                 let loc = DocLocation {
                     seg_id: seg_meta.seg_id,
                     internal_id: e.internal_id,
                 };
                 let loc_json = serde_json::to_string(&loc)?;
-                let mk = meta_key(col, seg_meta.seg_id, e.internal_id);
-                let meta_json = match e.metadata {
-                    Some(m) => Some(serde_json::to_string(m)?),
-                    None => None,
-                };
-                Ok((dk, loc_json, mk, e.doc_id, meta_json))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let wtxn = self.db.begin_write()?;
-        {
-            let mut seg_table = wtxn.open_table(SEGMENTS)?;
-            seg_table.insert(seg_key.as_str(), seg_json.as_str())?;
-
-            let mut doc_table = wtxn.open_table(DOC_MAP)?;
-            let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
-            let mut meta_table = wtxn.open_table(METADATA)?;
-
-            for (dk, loc_json, mk, doc_id, meta_json) in &prepared {
                 doc_table.insert(dk.as_str(), loc_json.as_str())?;
-                rev_table.insert(mk.as_str(), *doc_id)?;
-                if let Some(mj) = meta_json {
-                    meta_table.insert(mk.as_str(), mj.as_str())?;
+
+                let mk = meta_key(col, seg_meta.seg_id, e.internal_id);
+                rev_table.insert(mk.as_str(), e.doc_id)?;
+
+                let ord_key = doc_id_to_ord_key(col, e.doc_id);
+                let doc_ord = if let Some(v) = ord_table.get(ord_key.as_str())? {
+                    v.value()
+                } else {
+                    let new_ord = next_doc_ord;
+                    next_doc_ord += 1;
+                    ord_table.insert(ord_key.as_str(), new_ord)?;
+                    let ok = doc_ord_key(col, new_ord);
+                    ord_rev_table.insert(ok.as_slice(), e.doc_id)?;
+                    new_ord
+                };
+
+                if let Some(meta_map) = e.metadata {
+                    for (&field_id, value) in meta_map {
+                        let vk = meta_value_key(col, doc_ord, field_id);
+                        let encoded = encode_value(value);
+                        meta_vals_table.insert(vk.as_slice(), encoded.as_slice())?;
+                    }
                 }
             }
+
+            col_meta_table.insert(col, next_doc_ord)?;
         }
         wtxn.commit()?;
         Ok(())
@@ -532,7 +689,7 @@ impl Storage {
         Ok(table.get(id.as_str())?.map(|v| v.value()))
     }
 
-    /// Read doc_id and metadata for every internal_id in a segment in a single transaction.
+    /// Read doc_id and prev_location for every internal_id in a segment.
     ///
     /// Returns one entry per internal_id (index = internal_id).
     /// The entry is `None` when the slot is tombstoned or has no reverse-doc mapping.
@@ -546,7 +703,6 @@ impl Storage {
         let rtxn = self.db.begin_read()?;
         let tomb_table = rtxn.open_table(TOMBSTONES)?;
         let rev_table = rtxn.open_table(REVERSE_DOC)?;
-        let meta_table = rtxn.open_table(METADATA)?;
         let doc_table = rtxn.open_table(DOC_MAP)?;
 
         let mut out = Vec::with_capacity(num_vectors);
@@ -568,26 +724,24 @@ impl Storage {
                     continue;
                 }
             };
-            let metadata = match meta_table.get(key.as_str())? {
-                Some(v) => Some(serde_json::from_str(v.value())?),
-                None => None,
-            };
             let dk = doc_key(col, &doc_id);
             let prev_location: Option<DocLocation> = match doc_table.get(dk.as_str())? {
                 Some(v) => Some(serde_json::from_str(v.value())?),
                 None => None,
             };
-            out.push(Some((doc_id, metadata, prev_location)));
+            out.push(Some((doc_id, prev_location)));
         }
         Ok(out)
     }
 
     /// Atomically commit a compaction result:
-    /// - Insert new segment metadata
-    /// - Update the manifest
-    /// - For each merged doc: update DOC_MAP/REVERSE_DOC/METADATA to the new location,
+    /// - Insert new segment metadata and update the manifest
+    /// - For each merged doc: update DOC_MAP/REVERSE_DOC to the new location,
     ///   OR tombstone the new entry if the doc was deleted/moved during the merge
-    /// - Remove old segment metadata and tombstone entries
+    /// - Remove old segment metadata and tombstone entries for removed segments
+    ///
+    /// Note: METADATA_VALUES / DOC_ID_TO_ORD / DOC_ORD_TO_ID are keyed by stable
+    /// DocOrd and do not need to be updated during compaction.
     pub fn commit_compaction(
         &self,
         id: &CollectionId,
@@ -601,65 +755,46 @@ impl Storage {
         let new_seg_json = serde_json::to_string(new_seg_meta)?;
         let manifest_json = serde_json::to_string(new_manifest)?;
 
-        // Collect set of removed seg_ids for membership checks.
         let removed_set: std::collections::HashSet<SegId> =
             removed_seg_ids.iter().copied().collect();
 
         let wtxn = self.db.begin_write()?;
         {
-            // Insert new segment metadata.
             let mut seg_table = wtxn.open_table(SEGMENTS)?;
             seg_table.insert(new_sk.as_str(), new_seg_json.as_str())?;
 
-            // Update manifest.
             let mut manifest_table = wtxn.open_table(MANIFESTS)?;
             manifest_table.insert(col, manifest_json.as_str())?;
 
             let mut doc_table = wtxn.open_table(DOC_MAP)?;
             let mut rev_table = wtxn.open_table(REVERSE_DOC)?;
-            let mut meta_table = wtxn.open_table(METADATA)?;
             let mut tomb_table = wtxn.open_table(TOMBSTONES)?;
 
             for entry in entries {
                 let new_mk = meta_key(col, new_seg_meta.seg_id, entry.new_internal_id);
                 let dk = doc_key(col, &entry.doc_id);
 
-                // Check current DOC_MAP state for this doc.
                 let current_loc: Option<DocLocation> = match doc_table.get(dk.as_str())? {
                     Some(v) => Some(serde_json::from_str(v.value())?),
                     None => None,
                 };
 
                 let should_tombstone = match &current_loc {
-                    // Doc was deleted during the merge.
                     None => true,
-                    // Doc was moved to a segment not in our input set (re-upserted during merge).
                     Some(loc) if !removed_set.contains(&loc.seg_id) => true,
-                    // Doc points into the merged set, but DOC_MAP changed since we read the
-                    // segment (concurrent upsert landed in another input segment). Tombstone
-                    // our stale copy so the concurrent write remains authoritative.
                     Some(loc) => Some(loc) != entry.prev_location.as_ref(),
                 };
 
                 if should_tombstone {
                     tomb_table.insert(new_mk.as_str(), true)?;
                 } else {
-                    // Update DOC_MAP to point to the new location.
                     let new_loc = DocLocation {
                         seg_id: new_seg_meta.seg_id,
                         internal_id: entry.new_internal_id,
                     };
                     let loc_json = serde_json::to_string(&new_loc)?;
                     doc_table.insert(dk.as_str(), loc_json.as_str())?;
-
-                    // Update REVERSE_DOC.
                     rev_table.insert(new_mk.as_str(), entry.doc_id.as_str())?;
-
-                    // Copy metadata if present.
-                    if let Some(ref m) = entry.metadata {
-                        let meta_json = serde_json::to_string(m)?;
-                        meta_table.insert(new_mk.as_str(), meta_json.as_str())?;
-                    }
                 }
             }
 
@@ -669,8 +804,7 @@ impl Storage {
                 seg_table.remove(old_sk.as_str())?;
             }
 
-            // Remove old tombstone entries for removed segments.
-            // Collect keys to delete first to avoid mutating while iterating.
+            // Remove tombstone entries for removed segments.
             let prefix_base = format!("{}\0", col);
             let mut to_delete: Vec<String> = Vec::new();
             for entry in tomb_table.iter()? {
@@ -696,26 +830,24 @@ impl Storage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public result types
+// ---------------------------------------------------------------------------
+
 /// Result of resolving a single candidate in [`Storage::resolve_candidates`].
 pub struct ResolvedCandidate {
     pub doc_id: String,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata: Option<HashMap<String, MetadataValue>>,
 }
 
-/// A single document entry produced by a compaction merge, describing where the doc
-/// lands in the new compacted segment.
+/// A single document entry produced by a compaction merge.
 pub struct CompactionEntry {
     pub doc_id: String,
     pub new_internal_id: InternalId,
-    pub metadata: Option<serde_json::Value>,
     /// DOC_MAP value at the time `load_segment_live_entries` read this doc.
-    /// `None` means the doc had no DOC_MAP entry (fresh insert not yet committed —
-    /// should not normally appear in a sealed segment, but handled defensively).
-    /// Used in `commit_compaction` to detect concurrent updates.
     pub prev_location: Option<DocLocation>,
 }
 
-/// Set of tombstoned `(seg_id, internal_id)` pairs for a collection,
-/// loaded in a single read transaction by [`Storage::load_tombstone_set`].
+/// Set of tombstoned `(seg_id, internal_id)` pairs for a collection.
 #[cfg(feature = "testing")]
 pub type TombstoneSet = std::collections::HashSet<(SegId, InternalId)>;

@@ -7,8 +7,9 @@ use std::{
     thread,
 };
 
+use std::collections::HashMap;
+
 use anyhow::{Result, bail};
-use serde_json::Value;
 
 #[cfg(feature = "testing")]
 use crate::{
@@ -19,6 +20,7 @@ use crate::{
 use crate::{
     apply::{ApplyState, ApplyWorkerGuard, PendingNotify, apply_worker_loop, notify_worker},
     compaction::CompactionWorkerGuard,
+    metadata::MetadataValue,
     search::search_snapshot,
     segment::{SealedSegment, WritableSegment},
     snapshot::{CollectionSnapshot, SegmentSnapshot},
@@ -140,6 +142,9 @@ impl CollectionInner {
     }
 }
 
+/// One entry for [`CollectionHandle::upsert_batch`]: `(doc_id, vector, metadata)`.
+pub type UpsertEntry<'a> = (&'a str, &'a [f32], Option<HashMap<String, MetadataValue>>);
+
 // ---------------------------------------------------------------------------
 // CollectionHandle
 // ---------------------------------------------------------------------------
@@ -200,7 +205,7 @@ impl CollectionHandle {
         &self,
         doc_id: &str,
         vector: &[f32],
-        metadata: Option<Value>,
+        metadata: Option<HashMap<String, MetadataValue>>,
     ) -> Result<WriteToken> {
         let inner = &self.inner;
         if vector.len() != inner.schema.dimension {
@@ -209,6 +214,14 @@ impl CollectionHandle {
                 inner.schema.dimension,
                 vector.len()
             );
+        }
+        if let Some(ref m) = metadata {
+            match inner.schema.metadata_schema.as_ref() {
+                Some(ms) => {
+                    ms.validate(m)?;
+                }
+                None => bail!("collection has no metadata schema; metadata must be None"),
+            }
         }
         let seq = inner.wal.lock().unwrap().append(WalOp::Upsert {
             doc_id: doc_id.to_string(),
@@ -238,7 +251,7 @@ impl CollectionHandle {
     ///
     /// The returned [`WriteToken`] can be passed to [`CollectionHandle::wait_visible`] to block
     /// until all vectors in the batch have been applied and are visible to search.
-    pub fn upsert_batch(&self, entries: &[(&str, &[f32], Option<Value>)]) -> Result<WriteToken> {
+    pub fn upsert_batch(&self, entries: &[UpsertEntry<'_>]) -> Result<WriteToken> {
         if entries.is_empty() {
             return Ok(WriteToken(self.inner.durable_seq.load(Ordering::Acquire)));
         }
@@ -252,7 +265,7 @@ impl CollectionHandle {
             );
         }
         let expected_dim = inner.schema.dimension;
-        for (i, (_, vector, _)) in entries.iter().enumerate() {
+        for (i, (_, vector, metadata)) in entries.iter().enumerate() {
             if vector.len() != expected_dim {
                 bail!(
                     "dimension mismatch at index {}: expected {}, got {}",
@@ -260,6 +273,14 @@ impl CollectionHandle {
                     expected_dim,
                     vector.len()
                 );
+            }
+            if let Some(m) = metadata {
+                match inner.schema.metadata_schema.as_ref() {
+                    Some(ms) => {
+                        ms.validate(m)?;
+                    }
+                    None => bail!("collection has no metadata schema; metadata must be None"),
+                }
             }
         }
         // Deduplicate by doc_id: last entry wins.
@@ -297,8 +318,18 @@ impl CollectionHandle {
         Ok(WriteToken(seq + 1))
     }
 
-    pub fn update_metadata(&self, doc_id: &str, metadata: Value) -> Result<WriteToken> {
+    pub fn update_metadata(
+        &self,
+        doc_id: &str,
+        metadata: HashMap<String, MetadataValue>,
+    ) -> Result<WriteToken> {
         let inner = &self.inner;
+        match inner.schema.metadata_schema.as_ref() {
+            Some(ms) => {
+                ms.validate(&metadata)?;
+            }
+            None => bail!("collection has no metadata schema; cannot update metadata"),
+        }
         let seq = inner.wal.lock().unwrap().append(WalOp::UpdateMetadata {
             doc_id: doc_id.to_string(),
             metadata,
