@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
+use tracing::{info, warn};
 
 use crate::{
     apply::PendingNotify,
@@ -278,6 +279,13 @@ fn run_level_compaction(
         return;
     }
 
+    info!(
+        collection = %id,
+        level = %level,
+        input_segments = candidates.len(),
+        "compaction started",
+    );
+
     // Build input (seg_id, num_vectors) pairs from infos — no locking needed.
     let input_segs: Vec<(SegId, usize)> = infos
         .iter()
@@ -302,7 +310,12 @@ fn run_level_compaction(
     let (new_sealed, new_seg_meta, compaction_entries) = match merge_result {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[compaction] merge failed at {}: {}", level, e);
+            warn!(
+                collection = %id,
+                level = %level,
+                error = %e,
+                "compaction merge failed",
+            );
             level_busy[level.as_usize()].store(false, Ordering::Release);
             return;
         }
@@ -345,18 +358,34 @@ fn run_level_compaction(
     };
     match commit_result {
         Ok(()) => {
+            info!(
+                collection = %id,
+                level = %level,
+                output_level = %output_level,
+                new_seg_id = %new_seg_id,
+                input_segments = removed_seg_ids.len(),
+                vectors = new_seg_meta.num_vectors,
+                "compaction completed",
+            );
             for seg_id in &removed_seg_ids {
                 let seg_dir = inner.seg_dir(*seg_id);
                 if let Err(e) = std::fs::remove_dir_all(&seg_dir) {
-                    eprintln!(
-                        "[compaction] failed to delete segment dir {:?}: {}",
-                        seg_dir, e
+                    warn!(
+                        collection = %id,
+                        seg_dir = %seg_dir.display(),
+                        error = %e,
+                        "failed to delete old segment dir",
                     );
                 }
             }
         }
         Err(e) => {
-            eprintln!("[compaction] commit_compaction failed at {}: {}", level, e);
+            warn!(
+                collection = %id,
+                level = %level,
+                error = %e,
+                "compaction commit failed",
+            );
         }
     }
 
