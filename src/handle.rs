@@ -17,10 +17,7 @@ use crate::{
     types::{Level, SegmentMeta, SegmentState, VectorEntry},
 };
 use crate::{
-    apply::{
-        APPLY_BATCH_MAX, ApplyState, ApplyWorkerGuard, PendingNotify, apply_worker_loop,
-        notify_worker,
-    },
+    apply::{ApplyState, ApplyWorkerGuard, PendingNotify, apply_worker_loop, notify_worker},
     compaction::CompactionWorkerGuard,
     search::search_snapshot,
     segment::{SealedSegment, WritableSegment},
@@ -31,9 +28,6 @@ use crate::{
 };
 #[cfg(feature = "testing")]
 use std::{fs, io::Read, path::Path};
-
-#[cfg(feature = "testing")]
-const INGEST_BATCH_SIZE: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // CollectionInner
@@ -237,8 +231,8 @@ impl CollectionHandle {
     ///
     /// # Batch size limit
     ///
-    /// `entries` must contain at most [`APPLY_BATCH_MAX`] entries. Larger slices are rejected with
-    /// an error.
+    /// `entries` must contain at most `SegmentParams::insert_batch_size` entries (default 2048).
+    /// Larger slices are rejected with an error.
     ///
     /// # Visibility
     ///
@@ -248,14 +242,15 @@ impl CollectionHandle {
         if entries.is_empty() {
             return Ok(WriteToken(self.inner.durable_seq.load(Ordering::Acquire)));
         }
-        if entries.len() > APPLY_BATCH_MAX {
+        let inner = &self.inner;
+        let batch_max = inner.schema.segment_params.insert_batch_size;
+        if entries.len() > batch_max {
             bail!(
                 "batch size {} exceeds maximum of {}",
                 entries.len(),
-                APPLY_BATCH_MAX
+                batch_max
             );
         }
-        let inner = &self.inner;
         let expected_dim = inner.schema.dimension;
         for (i, (_, vector, _)) in entries.iter().enumerate() {
             if vector.len() != expected_dim {
@@ -353,7 +348,8 @@ impl CollectionHandle {
         let record_size = dimension * 4;
 
         let mut file = fs::File::open(file_path)?;
-        let mut buf = vec![0u8; record_size * INGEST_BATCH_SIZE];
+        let ingest_batch_size = inner.schema.segment_params.insert_batch_size;
+        let mut buf = vec![0u8; record_size * ingest_batch_size];
         let mut count = 0usize;
 
         loop {

@@ -254,6 +254,7 @@ fn main() -> Result<()> {
         ef_construction: cli.ef_construction,
         ef_search: cli.ef_search,
         segment_capacity: cli.segment_capacity,
+        ..SegmentParams::default()
     };
 
     // Validate mode-specific required args
