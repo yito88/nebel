@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::Result;
+use tracing::{debug, info, warn};
 
 use crate::{
     handle::CollectionInner,
@@ -139,7 +140,8 @@ pub(crate) fn apply_worker_loop(
         let (pending, new_cursor) =
             match read_records_from_cursor(&segments, cursor, durable, batch_size) {
                 Ok(r) => r,
-                Err(_) => {
+                Err(e) => {
+                    warn!(error = %e, "failed to read WAL records");
                     *notify.0.lock().unwrap() = false;
                     continue;
                 }
@@ -151,6 +153,7 @@ pub(crate) fn apply_worker_loop(
         }
 
         // Apply records.
+        debug!(records = pending.len(), "applying WAL batch");
         let mut state = inner.apply_state.lock().unwrap();
         let seg_id_before = state.manifest.next_seg_id;
         let _ = apply_records(&inner, &mut state, &pending);
@@ -472,6 +475,14 @@ pub(crate) fn seal_and_new_segment(inner: &CollectionInner, state: &mut ApplySta
         &SegmentMeta::new(new_id),
         &state.manifest,
     )?;
+
+    info!(
+        collection = %inner.id,
+        sealed_seg = %old_id,
+        vectors = num_vectors,
+        new_writable_seg = %new_id,
+        "segment sealed",
+    );
 
     Ok(())
 }
