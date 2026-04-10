@@ -183,6 +183,7 @@ const DEFAULT_M: usize = 16;
 const DEFAULT_EF_CONSTRUCTION: usize = 200;
 const DEFAULT_EF_SEARCH: usize = 50;
 const DEFAULT_SEGMENT_CAPACITY: usize = 500_000;
+pub const DEFAULT_INSERT_BATCH_SIZE: usize = 2048;
 pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
 
 fn default_wal_segment_bytes() -> u64 {
@@ -202,6 +203,14 @@ pub struct SegmentParams {
     pub ef_search: usize,
     /// Number of vectors a writable segment holds before it is sealed.
     pub segment_capacity: usize,
+    /// Number of vectors inserted into the HNSW index per batch.
+    /// Used during recovery (rebuild_index), WAL apply, and bulk ingest.
+    #[serde(default = "default_insert_batch_size")]
+    pub insert_batch_size: usize,
+}
+
+fn default_insert_batch_size() -> usize {
+    DEFAULT_INSERT_BATCH_SIZE
 }
 
 impl Default for SegmentParams {
@@ -211,6 +220,7 @@ impl Default for SegmentParams {
             ef_construction: DEFAULT_EF_CONSTRUCTION,
             ef_search: DEFAULT_EF_SEARCH,
             segment_capacity: DEFAULT_SEGMENT_CAPACITY,
+            insert_batch_size: DEFAULT_INSERT_BATCH_SIZE,
         }
     }
 }

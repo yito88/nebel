@@ -18,7 +18,6 @@ use crate::{
     wal::{ApplyCursor, WalId, WalOp, WalRecord},
 };
 
-pub(crate) const APPLY_BATCH_MAX: usize = 2048;
 const APPLY_INTERVAL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
@@ -136,8 +135,9 @@ pub(crate) fn apply_worker_loop(
             .unwrap()
             .segment_paths_from(cursor.current_wal_id);
 
+        let batch_size = inner.schema.segment_params.insert_batch_size;
         let (pending, new_cursor) =
-            match read_records_from_cursor(&segments, cursor, durable, APPLY_BATCH_MAX) {
+            match read_records_from_cursor(&segments, cursor, durable, batch_size) {
                 Ok(r) => r,
                 Err(_) => {
                     *notify.0.lock().unwrap() = false;

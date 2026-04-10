@@ -12,8 +12,6 @@ use crate::types::{InternalId, Level, Metric, SegId, SegmentMeta, SegmentParams,
 
 const MAX_ELEMENTS: usize = 1_000_000;
 const MAX_LAYER: usize = 16;
-/// 256 MB buffer for rebuilding the HNSW index in chunks.
-const REBUILD_BUF_BYTES: usize = 256 * 1024 * 1024;
 const INDEX_BASENAME: &str = "index";
 
 // ---------------------------------------------------------------------------
@@ -127,6 +125,7 @@ pub struct WritableSegment {
     meta: SegMeta,
     index: HnswIndex,
     ef_search: usize,
+    insert_batch_size: usize,
     vector_file: fs::File,
 }
 
@@ -155,6 +154,7 @@ impl WritableSegment {
             },
             index,
             ef_search: params.ef_search,
+            insert_batch_size: params.insert_batch_size,
             vector_file,
         })
     }
@@ -182,6 +182,7 @@ impl WritableSegment {
             },
             index,
             ef_search: params.ef_search,
+            insert_batch_size: params.insert_batch_size,
             vector_file,
         };
         seg.rebuild_index(dimension)?;
@@ -289,7 +290,7 @@ impl WritableSegment {
             return Ok(());
         }
         let record_size = dimension * 4;
-        let vectors_per_chunk = REBUILD_BUF_BYTES / record_size;
+        let vectors_per_chunk = self.insert_batch_size;
         let chunk_bytes = vectors_per_chunk * record_size;
         let mut buf = vec![0u8; chunk_bytes];
         let mut offset = 0usize;
