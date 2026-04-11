@@ -272,7 +272,7 @@ fn search_exact_matches_brute_force() {
     col.wait_visible(t).unwrap();
 
     let query = [1.0, 0.05, 0.0];
-    let exact = col.search_exact(&query, 3).unwrap();
+    let exact = col.search_exact(&query, 3, false).unwrap();
     let approx = col.search(&query, 3, false, false).unwrap();
 
     assert_eq!(exact.len(), 3);
@@ -300,7 +300,7 @@ fn search_exact_respects_tombstones() {
     let t = col.delete("x").unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search_exact(&[1.0, 0.0], 2).unwrap();
+    let hits = col.search_exact(&[1.0, 0.0], 2, false).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].doc_id, "y");
 }
@@ -319,7 +319,7 @@ fn search_exact_multi_segment() {
     let t = col.upsert("d", &[0.9, 0.1, 0.0], None).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search_exact(&[1.0, 0.0, 0.0], 2).unwrap();
+    let hits = col.search_exact(&[1.0, 0.0, 0.0], 2, false).unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].doc_id, "a");
     assert_eq!(hits[1].doc_id, "d");
@@ -368,7 +368,7 @@ fn recovery_from_wal_after_crash() {
     // Reopen — recovery applies WAL records synchronously in load_collection_inner.
     let db2 = Db::open(dir.path()).unwrap();
     let col2 = db2.collection("test").unwrap();
-    let hits = col2.search_exact(&[1.0, 0.0, 0.0], 3).unwrap();
+    let hits = col2.search_exact(&[1.0, 0.0, 0.0], 3, false).unwrap();
     assert_eq!(hits.len(), 3);
     let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
     assert!(ids.contains(&"a") && ids.contains(&"b") && ids.contains(&"c"));
@@ -435,7 +435,7 @@ fn compaction_merges_l0_segments() {
 
     // All 11 vectors must still be findable after the L0→L1 merge.
     for i in 0..11u32 {
-        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1).unwrap();
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1, false).unwrap();
         assert_eq!(hits.len(), 1, "d{i} not found after compaction");
         assert_eq!(hits[0].doc_id, format!("d{i}"));
     }
@@ -469,14 +469,14 @@ fn compaction_removes_tombstones() {
     wait_for_compaction();
 
     for i in 0..5u32 {
-        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 5).unwrap();
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 5, false).unwrap();
         assert!(
             !hits.iter().any(|h| h.doc_id == format!("d{i}")),
             "d{i} should have been removed by compaction"
         );
     }
     for i in 5..10u32 {
-        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1).unwrap();
+        let hits = col.search_exact(&[i as f32, 0.0, 0.0], 1, false).unwrap();
         assert_eq!(
             hits[0].doc_id,
             format!("d{i}"),

@@ -362,9 +362,14 @@ impl CollectionHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub fn search_exact(&self, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
+    pub fn search_exact(
+        &self,
+        query: &[f32],
+        k: usize,
+        include_metadata: bool,
+    ) -> Result<Vec<SearchHit>> {
         let snap = { Arc::clone(&*self.inner.snapshot.read().unwrap()) };
-        search_exact_snapshot(&self.inner, &snap, query, k)
+        search_exact_snapshot(&self.inner, &snap, query, k, include_metadata)
     }
 
     // -----------------------------------------------------------------------

@@ -133,6 +133,7 @@ pub(crate) fn search_exact_snapshot(
     snap: &CollectionSnapshot,
     query: &[f32],
     k: usize,
+    include_metadata: bool,
 ) -> Result<Vec<SearchHit>> {
     let dimension = snap.schema.dimension;
     if query.len() != dimension {
@@ -230,7 +231,12 @@ pub(crate) fn search_exact_snapshot(
 
     // Resolve doc_ids in a single read transaction.
     let keys: Vec<(SegId, InternalId)> = top_k.iter().map(|e| (e.seg_id, e.internal_id)).collect();
-    let resolved = storage.resolve_candidates(id, &keys, false, None)?;
+    let resolved = storage.resolve_candidates(
+        id,
+        &keys,
+        include_metadata,
+        snap.schema.metadata_schema.as_ref(),
+    )?;
 
     let mut hits = Vec::with_capacity(top_k.len());
     for (entry, r) in top_k.iter().zip(resolved.into_iter()) {
@@ -238,7 +244,7 @@ pub(crate) fn search_exact_snapshot(
         hits.push(SearchHit {
             doc_id: r.doc_id,
             score: entry.distance,
-            metadata: None,
+            metadata: r.metadata,
             vector: None,
         });
     }

@@ -9,10 +9,13 @@ use rand::rngs::StdRng;
 use rand::{SeedableRng, seq::SliceRandom};
 use rayon::prelude::*;
 
+use std::collections::HashMap;
+
 use nebel::{
     Db,
     dataset::{load_groundtruth, load_vectors, write_raw_f32},
     eval::{hits_to_ids, recall_at_k},
+    metadata::{FieldSchema, FieldType, MetadataSchema, MetadataValue},
     types::{
         CollectionId, CollectionSchema, CompactionParams, DEFAULT_WAL_SEGMENT_BYTES, Metric,
         SegmentParams, WriteToken,
@@ -144,6 +147,12 @@ fn main() -> Result<()> {
         }
     }
 
+    let metadata_schema = if cli.mode == Mode::Mutation {
+        Some(mutation_metadata_schema())
+    } else {
+        None
+    };
+
     let (db_dir, col, reused) = if let Some(ref dir) = cli.data_dir {
         let path = PathBuf::from(dir);
         let db = Db::open(&path)?;
@@ -157,7 +166,7 @@ fn main() -> Result<()> {
                     segment_params: params.clone(),
                     compaction_params: compaction_params.clone(),
                     wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
-                    metadata_schema: None,
+                    metadata_schema: metadata_schema.clone(),
                 };
                 (db.create_collection(schema)?, false)
             }
@@ -174,7 +183,7 @@ fn main() -> Result<()> {
             segment_params: params.clone(),
             compaction_params: Default::default(),
             wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
-            metadata_schema: None,
+            metadata_schema: metadata_schema.clone(),
         };
         let col = db.create_collection(schema)?;
         (DbDir::Temp(tmp), col, false)
@@ -276,7 +285,11 @@ fn run_recall_mode(
         for (qi, &query_idx) in indices.iter().enumerate() {
             let query = &all_queries[query_idx];
             let gt = &all_groundtruth[query_idx];
-            let exact_r = recall_at_k(gt, &hits_to_ids(&col.search_exact(query, cli.k)?), cli.k);
+            let exact_r = recall_at_k(
+                gt,
+                &hits_to_ids(&col.search_exact(query, cli.k, false)?),
+                cli.k,
+            );
             let ann_r = recall_at_k(
                 gt,
                 &hits_to_ids(&col.search(query, cli.k, false, false)?),
@@ -304,7 +317,7 @@ fn run_recall_mode(
                     let gt = &all_groundtruth[query_idx];
                     let exact_r = recall_at_k(
                         gt,
-                        &hits_to_ids(&col.search_exact(query, cli.k).unwrap()),
+                        &hits_to_ids(&col.search_exact(query, cli.k, false).unwrap()),
                         cli.k,
                     );
                     let ann_r = recall_at_k(
@@ -370,19 +383,103 @@ fn run_recall_mode(
 // Mutation mode
 // ---------------------------------------------------------------------------
 
+fn mutation_metadata_schema() -> MetadataSchema {
+    MetadataSchema {
+        fields: vec![
+            FieldSchema {
+                id: 0,
+                name: "idx".into(),
+                ty: FieldType::Int64,
+                filterable: false,
+            },
+            FieldSchema {
+                id: 1,
+                name: "label".into(),
+                ty: FieldType::String,
+                filterable: false,
+            },
+        ],
+    }
+}
+
+fn insert_metadata(i: usize) -> HashMap<String, MetadataValue> {
+    HashMap::from([
+        ("idx".to_string(), MetadataValue::Int64(i as i64)),
+        (
+            "label".to_string(),
+            MetadataValue::String(format!("insert_{}", i)),
+        ),
+    ])
+}
+
+fn update_metadata(base_idx: usize) -> HashMap<String, MetadataValue> {
+    HashMap::from([
+        ("idx".to_string(), MetadataValue::Int64(base_idx as i64)),
+        (
+            "label".to_string(),
+            MetadataValue::String(format!("update_{}", base_idx)),
+        ),
+    ])
+}
+
 enum MutationOp {
     Insert {
         doc_id: String,
         vector: Vec<f32>,
+        metadata: HashMap<String, MetadataValue>,
     },
     Update {
         doc_id: String,
         new_vector: Vec<f32>,
+        metadata: HashMap<String, MetadataValue>,
     },
     Delete {
         doc_id: String,
         original_vector: Vec<f32>,
     },
+}
+
+/// Check that a search hit exists for `doc_id` and its metadata matches `expected`.
+/// Returns `(passed, detail_string)`.
+fn check_hit(
+    doc_id: &str,
+    k: usize,
+    kind: &str,
+    hit: Option<&nebel::types::SearchHit>,
+    expected: &HashMap<String, MetadataValue>,
+) -> (bool, String) {
+    let Some(h) = hit else {
+        return (
+            false,
+            format!(
+                "expected '{}' in top-{} after {}, not found",
+                doc_id, k, kind
+            ),
+        );
+    };
+    let Some(m) = &h.metadata else {
+        return (
+            false,
+            format!("'{}': metadata missing in search result", doc_id),
+        );
+    };
+    let mut mismatches = Vec::new();
+    for (field, exp_val) in expected {
+        match (exp_val, m.get(field.as_str())) {
+            (MetadataValue::Int64(e), Some(MetadataValue::Int64(g))) if e == g => {}
+            (MetadataValue::String(e), Some(MetadataValue::String(g))) if e == g => {}
+            (_, Some(got)) => mismatches.push(format!(
+                "field '{}': expected {:?}, got {:?}",
+                field, exp_val, got
+            )),
+            (_, None) => mismatches.push(format!("field '{}': missing", field)),
+        }
+    }
+    if mismatches.is_empty() {
+        (true, String::new())
+    } else {
+        (false, mismatches.join("; "))
+    }
 }
 
 fn run_mutation_mode(
@@ -412,6 +509,7 @@ fn run_mutation_mode(
         ops.push(MutationOp::Insert {
             doc_id: format!("new_doc_{}", i),
             vector: base_vectors[base_idx].clone(),
+            metadata: insert_metadata(i),
         });
     }
     for &base_idx in &update_indices {
@@ -419,6 +517,7 @@ fn run_mutation_mode(
         ops.push(MutationOp::Update {
             doc_id: format!("doc_{}", base_idx),
             new_vector: base_vectors[replacement_idx].clone(),
+            metadata: update_metadata(base_idx),
         });
     }
     for &base_idx in &delete_indices {
@@ -451,7 +550,9 @@ fn run_mutation_mode(
             MutationOp::Insert { vector, .. } => {
                 *post_freq.entry(vec_key(vector)).or_insert(0) += 1;
             }
-            MutationOp::Update { doc_id, new_vector } => {
+            MutationOp::Update {
+                doc_id, new_vector, ..
+            } => {
                 let base_idx: usize = doc_id.strip_prefix("doc_").unwrap().parse().unwrap();
                 if let Some(c) = post_freq.get_mut(&vec_key(&base_vectors[base_idx])) {
                     *c = c.saturating_sub(1);
@@ -479,8 +580,16 @@ fn run_mutation_mode(
     let tokens: Vec<WriteToken> = if cli.concurrency <= 1 {
         ops.iter()
             .map(|op| match op {
-                MutationOp::Insert { doc_id, vector } => col.upsert(doc_id, vector, None),
-                MutationOp::Update { doc_id, new_vector } => col.upsert(doc_id, new_vector, None),
+                MutationOp::Insert {
+                    doc_id,
+                    vector,
+                    metadata,
+                } => col.upsert(doc_id, vector, Some(metadata.clone())),
+                MutationOp::Update {
+                    doc_id,
+                    new_vector,
+                    metadata,
+                } => col.upsert(doc_id, new_vector, Some(metadata.clone())),
                 MutationOp::Delete { doc_id, .. } => col.delete(doc_id),
             })
             .collect::<Result<_>>()?
@@ -491,12 +600,18 @@ fn run_mutation_mode(
         pool.install(|| {
             ops.par_iter()
                 .map(|op| match op {
-                    MutationOp::Insert { doc_id, vector } => {
-                        col.upsert(doc_id, vector, None).unwrap()
-                    }
-                    MutationOp::Update { doc_id, new_vector } => {
-                        col.upsert(doc_id, new_vector, None).unwrap()
-                    }
+                    MutationOp::Insert {
+                        doc_id,
+                        vector,
+                        metadata,
+                    } => col.upsert(doc_id, vector, Some(metadata.clone())).unwrap(),
+                    MutationOp::Update {
+                        doc_id,
+                        new_vector,
+                        metadata,
+                    } => col
+                        .upsert(doc_id, new_vector, Some(metadata.clone()))
+                        .unwrap(),
                     MutationOp::Delete { doc_id, .. } => col.delete(doc_id).unwrap(),
                 })
                 .collect()
@@ -520,48 +635,38 @@ fn run_mutation_mode(
 
     for op in &ops {
         match op {
-            MutationOp::Insert { doc_id, vector } => {
+            MutationOp::Insert {
+                doc_id,
+                vector,
+                metadata: expected_meta,
+            } => {
                 // k = post-mutation count for this vector: covers the new doc
                 // plus any other docs (original or from other mutation ops)
                 // that share the same vector and would tie at distance 0.
                 let k = post_freq_of(vector);
-                let hits = col.search_exact(vector, k)?;
-                let found = hits.iter().any(|h| h.doc_id == *doc_id);
-                let detail = if found {
-                    String::new()
-                } else {
-                    format!(
-                        "expected '{}' in top-{}, got {:?}",
-                        doc_id,
-                        k,
-                        hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>()
-                    )
-                };
+                let hits = col.search_exact(vector, k, true)?;
+                let hit = hits.iter().find(|h| h.doc_id == *doc_id);
+                let (passed, detail) = check_hit(doc_id, k, "insert", hit, expected_meta);
                 results.push(MutationResult {
                     kind: "insert",
                     doc_id: doc_id.clone(),
-                    passed: found,
+                    passed,
                     detail,
                 });
             }
-            MutationOp::Update { doc_id, new_vector } => {
+            MutationOp::Update {
+                doc_id,
+                new_vector,
+                metadata: expected_meta,
+            } => {
                 let k = post_freq_of(new_vector);
-                let hits = col.search_exact(new_vector, k)?;
-                let found = hits.iter().any(|h| h.doc_id == *doc_id);
-                let detail = if found {
-                    String::new()
-                } else {
-                    format!(
-                        "expected '{}' in top-{} after update, got {:?}",
-                        doc_id,
-                        k,
-                        hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>()
-                    )
-                };
+                let hits = col.search_exact(new_vector, k, true)?;
+                let hit = hits.iter().find(|h| h.doc_id == *doc_id);
+                let (passed, detail) = check_hit(doc_id, k, "update", hit, expected_meta);
                 results.push(MutationResult {
                     kind: "update",
                     doc_id: doc_id.clone(),
-                    passed: found,
+                    passed,
                     detail,
                 });
             }
@@ -569,7 +674,7 @@ fn run_mutation_mode(
                 doc_id,
                 original_vector,
             } => {
-                let hits = col.search_exact(original_vector, k_delete)?;
+                let hits = col.search_exact(original_vector, k_delete, false)?;
                 let absent = hits.iter().all(|h| h.doc_id != *doc_id);
                 let detail = if absent {
                     String::new()
