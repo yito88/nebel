@@ -426,7 +426,7 @@ fn main() -> Result<()> {
                     let exact_start = Instant::now();
                     let mut query_results = Vec::with_capacity(bench_queries.len());
                     for (i, q) in bench_queries.iter().enumerate() {
-                        let hits = col.search_exact(q, cli.k)?;
+                        let hits = col.search_exact(q, cli.k, false)?;
                         query_results.push(hits_to_ids(&hits));
                         if (i + 1) % 10 == 0 || i + 1 == bench_queries.len() {
                             print!("\r  {}/{}", i + 1, bench_queries.len());
