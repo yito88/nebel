@@ -434,7 +434,6 @@ fn load_index(dir: &Path, metric: &Metric) -> Result<(HnswIndex, Box<HnswIo>)> {
 
 /// Compute the raw distance between two vectors for the given metric.
 /// The result is consistent with hnsw_rs conventions (lower = closer).
-#[cfg(feature = "testing")]
 pub fn compute_distance(metric: &Metric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         Metric::L2 => {
