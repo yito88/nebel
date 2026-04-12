@@ -292,7 +292,7 @@ fn run_recall_mode(
             );
             let ann_r = recall_at_k(
                 gt,
-                &hits_to_ids(&col.search(query, cli.k, false, false)?),
+                &hits_to_ids(&col.search(query, cli.k, None, false, false)?),
                 cli.k,
             );
             out.push(QueryResult {
@@ -322,7 +322,7 @@ fn run_recall_mode(
                     );
                     let ann_r = recall_at_k(
                         gt,
-                        &hits_to_ids(&col.search(query, cli.k, false, false).unwrap()),
+                        &hits_to_ids(&col.search(query, cli.k, None, false, false).unwrap()),
                         cli.k,
                     );
                     QueryResult {

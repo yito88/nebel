@@ -392,7 +392,7 @@ fn main() -> Result<()> {
             // Warmup
             println!("Running {} warmup queries...", warmup_queries.len());
             for q in warmup_queries {
-                let _ = col.search(q, cli.k, false, false)?;
+                let _ = col.search(q, cli.k, None, false, false)?;
             }
 
             // Exact results: load or compute (skipped when --no-recall)
@@ -467,7 +467,7 @@ fn main() -> Result<()> {
                 let mut recs = Vec::with_capacity(bench_queries.len());
                 for (i, q) in bench_queries.iter().enumerate() {
                     let start = Instant::now();
-                    let hits = col.search(q, cli.k, false, false)?;
+                    let hits = col.search(q, cli.k, None, false, false)?;
                     lats.push(start.elapsed().as_secs_f64() * 1000.0);
                     if let Some(ref er) = exact_results {
                         recs.push(recall_at_k(
@@ -488,7 +488,9 @@ fn main() -> Result<()> {
                         .into_par_iter()
                         .map(|i| {
                             let start = Instant::now();
-                            let hits = col.search(bench_queries[i], cli.k, false, false).unwrap();
+                            let hits = col
+                                .search(bench_queries[i], cli.k, None, false, false)
+                                .unwrap();
                             let latency = start.elapsed().as_secs_f64() * 1000.0;
                             let recall = exact_results.as_ref().map(|er| {
                                 recall_at_k(&er.query_results[i], &hits_to_ids(&hits), cli.k)
@@ -777,7 +779,7 @@ fn main() -> Result<()> {
             for (i, &is_read) in op_is_read[..cli.warmup_ops].iter().enumerate() {
                 if is_read {
                     let q = &all_queries[i % query_len];
-                    let _ = col.search(q, cli.k, false, false)?;
+                    let _ = col.search(q, cli.k, None, false, false)?;
                 } else {
                     let vec_idx = i % base_len;
                     let doc_id = match cli.write_pattern {
@@ -805,7 +807,7 @@ fn main() -> Result<()> {
                     if is_read {
                         let q = &all_queries[i % query_len];
                         let start = Instant::now();
-                        let _ = col.search(q, cli.k, false, false)?;
+                        let _ = col.search(q, cli.k, None, false, false)?;
                         res.push((true, start.elapsed().as_secs_f64() * 1000.0));
                     } else {
                         let vec_idx = i % base_len;
@@ -841,7 +843,7 @@ fn main() -> Result<()> {
                             if is_read {
                                 let q = &all_queries[i % query_len];
                                 let start = Instant::now();
-                                let _ = col.search(q, cli.k, false, false).unwrap();
+                                let _ = col.search(q, cli.k, None, false, false).unwrap();
                                 (true, start.elapsed().as_secs_f64() * 1000.0)
                             } else {
                                 let vec_idx = i % base_len;

@@ -89,7 +89,7 @@ impl MetadataSchema {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataValue {
     String(String),
     Int64(i64),

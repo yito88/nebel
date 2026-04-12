@@ -347,6 +347,7 @@ impl CollectionHandle {
         &self,
         query: &[f32],
         k: usize,
+        filter: Option<&crate::filter::FilterExpr>,
         include_metadata: bool,
         include_vector: bool,
     ) -> Result<Vec<SearchHit>> {
@@ -356,6 +357,7 @@ impl CollectionHandle {
             &snap,
             query,
             k,
+            filter,
             include_metadata,
             include_vector,
         )
