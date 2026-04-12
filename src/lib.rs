@@ -5,6 +5,7 @@ pub mod dataset;
 pub mod db;
 #[cfg(feature = "testing")]
 pub mod eval;
+pub mod filter;
 pub mod handle;
 pub mod metadata;
 mod search;

@@ -4,8 +4,9 @@ use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::{
+    filter::{FilterExpr, FilterResult, eval_expr},
     metadata::{
-        FieldId, MetadataSchema, MetadataValue, decode_value, doc_ord_key, encode_value,
+        DocOrd, FieldId, MetadataSchema, MetadataValue, decode_value, doc_ord_key, encode_value,
         meta_value_key, meta_value_prefix,
     },
     types::{
@@ -230,13 +231,15 @@ impl Storage {
         id: &CollectionId,
         candidates: &[(SegId, InternalId)],
         include_metadata: bool,
+        need_doc_ord: bool,
         metadata_schema: Option<&MetadataSchema>,
     ) -> Result<Vec<Option<ResolvedCandidate>>> {
         let col = id.as_str();
         let rtxn = self.db.begin_read()?;
         let tomb_table = rtxn.open_table(TOMBSTONES)?;
         let rev_table = rtxn.open_table(REVERSE_DOC)?;
-        let doc_ord_table = if include_metadata && metadata_schema.is_some() {
+        let open_ord = (include_metadata && metadata_schema.is_some()) || need_doc_ord;
+        let doc_ord_table = if open_ord {
             Some(rtxn.open_table(DOC_ID_TO_ORD)?)
         } else {
             None
@@ -266,32 +269,36 @@ impl Storage {
                 }
             };
 
-            let metadata = if let (Some(ord_table), Some(mv_table), Some(schema)) =
-                (doc_ord_table.as_ref(), meta_table.as_ref(), metadata_schema)
-            {
+            let mut resolved_ord: Option<DocOrd> = None;
+            let metadata = if let Some(ord_table) = doc_ord_table.as_ref() {
                 let dk = doc_id_to_ord_key(col, &doc_id);
                 if let Some(ord_v) = ord_table.get(dk.as_str())? {
                     let doc_ord = ord_v.value();
-                    let prefix = meta_value_prefix(col, doc_ord);
-                    let end = meta_value_key(col, doc_ord, u32::MAX);
-                    let mut map = HashMap::new();
-                    for entry in mv_table.range(prefix.as_slice()..=end.as_slice())? {
-                        let (k, v) = entry?;
-                        let key_bytes = k.value();
-                        // Last 4 bytes of the key are the field_id.
-                        if key_bytes.len() < 4 {
-                            continue;
+                    resolved_ord = Some(doc_ord);
+
+                    if let (Some(mv_table), Some(schema)) = (meta_table.as_ref(), metadata_schema) {
+                        let prefix = meta_value_prefix(col, doc_ord);
+                        let end = meta_value_key(col, doc_ord, u32::MAX);
+                        let mut map = HashMap::new();
+                        for entry in mv_table.range(prefix.as_slice()..=end.as_slice())? {
+                            let (k, v) = entry?;
+                            let key_bytes = k.value();
+                            if key_bytes.len() < 4 {
+                                continue;
+                            }
+                            let field_id = u32::from_be_bytes(
+                                key_bytes[key_bytes.len() - 4..].try_into().unwrap(),
+                            );
+                            if let (Some(field), Ok(val)) =
+                                (schema.field_by_id(field_id), decode_value(v.value()))
+                            {
+                                map.insert(field.name.clone(), val);
+                            }
                         }
-                        let field_id = u32::from_be_bytes(
-                            key_bytes[key_bytes.len() - 4..].try_into().unwrap(),
-                        );
-                        if let (Some(field), Ok(val)) =
-                            (schema.field_by_id(field_id), decode_value(v.value()))
-                        {
-                            map.insert(field.name.clone(), val);
-                        }
+                        if map.is_empty() { None } else { Some(map) }
+                    } else {
+                        None
                     }
-                    if map.is_empty() { None } else { Some(map) }
                 } else {
                     None
                 }
@@ -299,7 +306,11 @@ impl Storage {
                 None
             };
 
-            results.push(Some(ResolvedCandidate { doc_id, metadata }));
+            results.push(Some(ResolvedCandidate {
+                doc_id,
+                doc_ord: resolved_ord,
+                metadata,
+            }));
         }
         Ok(results)
     }
@@ -682,6 +693,101 @@ impl Storage {
         Ok(())
     }
 
+    /// Scan all live documents for a collection, evaluate `filter` against their
+    /// typed metadata, and return the matching [`FilterResult`].
+    ///
+    /// "Live" means the document has an entry in `DOC_ID_TO_ORD` (i.e. it has
+    /// been upserted at least once and not yet deleted).
+    pub fn evaluate_filter(
+        &self,
+        id: &CollectionId,
+        filter: &FilterExpr,
+        schema: &MetadataSchema,
+    ) -> Result<FilterResult> {
+        let col = id.as_str();
+        let prefix = format!("{}\0", col);
+
+        let rtxn = self.db.begin_read()?;
+        let ord_table = rtxn.open_table(DOC_ID_TO_ORD)?;
+        let mv_table = rtxn.open_table(METADATA_VALUES)?;
+
+        let mut matching = Vec::new();
+
+        for entry in ord_table.iter()? {
+            let (k, v) = entry?;
+            let key = k.value();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let doc_ord: DocOrd = v.value();
+
+            // Load all metadata fields for this doc_ord.
+            let meta_prefix = meta_value_prefix(col, doc_ord);
+            let meta_end = meta_value_key(col, doc_ord, u32::MAX);
+            let mut fields: HashMap<FieldId, MetadataValue> = HashMap::new();
+            for meta_entry in mv_table.range(meta_prefix.as_slice()..=meta_end.as_slice())? {
+                let (mk, mv) = meta_entry?;
+                let key_bytes = mk.value();
+                if key_bytes.len() < 4 {
+                    continue;
+                }
+                let field_id =
+                    u32::from_be_bytes(key_bytes[key_bytes.len() - 4..].try_into().unwrap());
+                if schema.field_by_id(field_id).is_some()
+                    && let Ok(val) = decode_value(mv.value())
+                {
+                    fields.insert(field_id, val);
+                }
+            }
+
+            if eval_expr(filter, &fields) {
+                matching.push(doc_ord);
+            }
+        }
+
+        let matched_count = matching.len();
+        Ok(FilterResult {
+            doc_ords: matching,
+            matched_count,
+        })
+    }
+
+    /// Resolve doc_id and current [`DocLocation`] for each `doc_ord`.
+    ///
+    /// Returns `None` for a given doc_ord if it was deleted between filter
+    /// evaluation and this call (defensive).
+    pub fn get_doc_locations(
+        &self,
+        id: &CollectionId,
+        doc_ords: &[DocOrd],
+    ) -> Result<Vec<Option<(String, DocLocation)>>> {
+        let col = id.as_str();
+        let rtxn = self.db.begin_read()?;
+        let ord_rev_table = rtxn.open_table(DOC_ORD_TO_ID)?;
+        let doc_table = rtxn.open_table(DOC_MAP)?;
+
+        let mut out = Vec::with_capacity(doc_ords.len());
+        for &doc_ord in doc_ords {
+            let ok = doc_ord_key(col, doc_ord);
+            let doc_id = match ord_rev_table.get(ok.as_slice())? {
+                Some(v) => v.value().to_string(),
+                None => {
+                    out.push(None);
+                    continue;
+                }
+            };
+            let dk = doc_key(col, &doc_id);
+            match doc_table.get(dk.as_str())? {
+                Some(v) => {
+                    let loc: DocLocation = serde_json::from_str(v.value())?;
+                    out.push(Some((doc_id, loc)));
+                }
+                None => out.push(None),
+            }
+        }
+        Ok(out)
+    }
+
     /// Get the last applied WAL sequence number for a collection.
     pub fn get_applied_seq(&self, id: &CollectionId) -> Result<Option<u64>> {
         let rtxn = self.db.begin_read()?;
@@ -837,6 +943,8 @@ impl Storage {
 /// Result of resolving a single candidate in [`Storage::resolve_candidates`].
 pub struct ResolvedCandidate {
     pub doc_id: String,
+    /// Present when `need_doc_ord` or `include_metadata` was true.
+    pub doc_ord: Option<DocOrd>,
     pub metadata: Option<HashMap<String, MetadataValue>>,
 }
 

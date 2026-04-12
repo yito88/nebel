@@ -29,7 +29,9 @@ fn create_and_search() {
     col.upsert("c", &[0.0, 0.0, 1.0], None).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.01, 0.0], 1, false, false).unwrap();
+    let hits = col
+        .search(&[1.0, 0.01, 0.0], 1, None, false, false)
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].doc_id, "a");
 }
@@ -46,7 +48,7 @@ fn tombstone_after_delete() {
     let t = col.delete("x").unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 2, false, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 2, None, false, false).unwrap();
     assert!(
         !hits.iter().any(|h| h.doc_id == "x"),
         "deleted doc should not appear"
@@ -64,7 +66,7 @@ fn upsert_replaces_vector() {
     let t = col.upsert("a", &[0.0, 1.0], None).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[0.0, 1.0], 1, false, false).unwrap();
+    let hits = col.search(&[0.0, 1.0], 1, None, false, false).unwrap();
     assert_eq!(hits[0].doc_id, "a");
     assert!(hits[0].score < 0.01, "updated vector should be very close");
 }
@@ -98,7 +100,7 @@ fn metadata_roundtrip() {
     let t = col.upsert("doc", &[1.0, 0.0], Some(meta)).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 1, None, true, false).unwrap();
     let meta = hits[0].metadata.as_ref().unwrap();
     assert!(matches!(meta["label"], MetadataValue::String(ref s) if s == "test"));
 }
@@ -126,7 +128,7 @@ fn update_metadata_only() {
         .unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 1, None, true, false).unwrap();
     let meta = hits[0].metadata.as_ref().unwrap();
     assert!(matches!(meta["v"], MetadataValue::Int64(99)));
 }
@@ -141,7 +143,7 @@ fn include_vector_in_search() {
     let t = col.upsert("v", &[1.0, 2.0, 3.0], None).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 2.0, 3.0], 1, false, true).unwrap();
+    let hits = col.search(&[1.0, 2.0, 3.0], 1, None, false, true).unwrap();
     let vec = hits[0].vector.as_ref().unwrap();
     assert!((vec[0] - 1.0).abs() < 1e-6);
     assert!((vec[1] - 2.0).abs() < 1e-6);
@@ -172,7 +174,9 @@ fn ingest_binary_file() {
     let count = col.ingest_file(&path).unwrap();
     assert_eq!(count, 3);
 
-    let hits = col.search(&[1.0, 0.0, 0.0, 0.0], 1, false, false).unwrap();
+    let hits = col
+        .search(&[1.0, 0.0, 0.0, 0.0], 1, None, false, false)
+        .unwrap();
     assert_eq!(hits[0].doc_id, "doc_0");
 }
 
@@ -205,7 +209,7 @@ fn load_collection_restores_data() {
     let db = Db::open(dir.path()).unwrap();
     let col = db.collection(id.as_str()).unwrap();
 
-    let hits = col.search(&[1.0, 0.01, 0.0], 3, true, true).unwrap();
+    let hits = col.search(&[1.0, 0.01, 0.0], 3, None, true, true).unwrap();
 
     assert_eq!(hits[0].doc_id, "a");
     assert!(
@@ -234,7 +238,7 @@ fn multi_segment_search() {
     let t = col.upsert("d", &[0.9, 0.1, 0.0], None).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0, 0.0], 2, false, false).unwrap();
+    let hits = col.search(&[1.0, 0.0, 0.0], 2, None, false, false).unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].doc_id, "a");
     assert_eq!(hits[1].doc_id, "d");
@@ -253,7 +257,7 @@ fn multi_segment_tombstone() {
     let t = col.delete("x").unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 2, false, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 2, None, false, false).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].doc_id, "y");
 }
@@ -273,7 +277,7 @@ fn search_exact_matches_brute_force() {
 
     let query = [1.0, 0.05, 0.0];
     let exact = col.search_exact(&query, 3, false).unwrap();
-    let approx = col.search(&query, 3, false, false).unwrap();
+    let approx = col.search(&query, 3, None, false, false).unwrap();
 
     assert_eq!(exact.len(), 3);
     assert_eq!(approx.len(), 3);
@@ -344,7 +348,7 @@ fn load_collection_multi_segment() {
     let db = Db::open(dir.path()).unwrap();
     let col = db.collection(id.as_str()).unwrap();
 
-    let hits = col.search(&[1.0, 0.0, 0.0], 2, false, false).unwrap();
+    let hits = col.search(&[1.0, 0.0, 0.0], 2, None, false, false).unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].doc_id, "a");
     assert_eq!(hits[1].doc_id, "b");
@@ -558,7 +562,9 @@ fn compaction_preserves_metadata() {
     wait_for_compaction();
 
     for i in 0..10u32 {
-        let hits = col.search(&[i as f32, 0.0, 0.0], 1, true, false).unwrap();
+        let hits = col
+            .search(&[i as f32, 0.0, 0.0], 1, None, true, false)
+            .unwrap();
         assert_eq!(hits[0].doc_id, format!("d{i}"));
         assert!(
             matches!(hits[0].metadata.as_ref().unwrap()["n"], MetadataValue::Int64(v) if v == i as i64),
@@ -587,11 +593,17 @@ fn upsert_batch_basic() {
         .unwrap();
     col.wait_visible(token).unwrap();
 
-    let hits = col.search(&[1.0, 0.01, 0.0], 1, false, false).unwrap();
+    let hits = col
+        .search(&[1.0, 0.01, 0.0], 1, None, false, false)
+        .unwrap();
     assert_eq!(hits[0].doc_id, "a");
-    let hits = col.search(&[0.0, 1.0, 0.01], 1, false, false).unwrap();
+    let hits = col
+        .search(&[0.0, 1.0, 0.01], 1, None, false, false)
+        .unwrap();
     assert_eq!(hits[0].doc_id, "b");
-    let hits = col.search(&[0.0, 0.01, 1.0], 1, false, false).unwrap();
+    let hits = col
+        .search(&[0.0, 0.01, 1.0], 1, None, false, false)
+        .unwrap();
     assert_eq!(hits[0].doc_id, "c");
 }
 
@@ -645,7 +657,7 @@ fn upsert_batch_with_metadata() {
         .unwrap();
     col.wait_visible(token).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 1, None, true, false).unwrap();
     assert_eq!(hits[0].doc_id, "x");
     assert!(
         matches!(hits[0].metadata.as_ref().unwrap()["label"], MetadataValue::String(ref s) if s == "x")
@@ -714,7 +726,7 @@ fn metadata_correct_types_accepted() {
     let t = col.upsert("doc", &[1.0, 0.0], Some(meta)).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 1, None, true, false).unwrap();
     let m = hits[0].metadata.as_ref().unwrap();
     assert!(matches!(m["s"], MetadataValue::String(ref v) if v == "hello"));
     assert!(matches!(m["i"], MetadataValue::Int64(-42)));
@@ -807,7 +819,7 @@ fn metadata_persists_across_reopen() {
     // Reopen and verify both fields survive.
     let db = Db::open(dir.path()).unwrap();
     let col = db.collection(id.as_str()).unwrap();
-    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 1, None, true, false).unwrap();
     let m = hits[0].metadata.as_ref().unwrap();
     assert!(matches!(m["tag"],   MetadataValue::String(ref s) if s == "persist"));
     assert!(matches!(m["count"], MetadataValue::Int64(7)));
@@ -850,7 +862,7 @@ fn metadata_overwrite_replaces_value() {
         .unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 1, None, true, false).unwrap();
     // Only the latest value is visible.
     assert!(matches!(
         hits[0].metadata.as_ref().unwrap()["v"],
@@ -881,7 +893,7 @@ fn metadata_deleted_doc_not_returned() {
     let t = col.delete("doc").unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 1, None, true, false).unwrap();
     assert!(hits.is_empty(), "deleted doc must not appear in results");
 }
 
@@ -900,7 +912,7 @@ fn metadata_partial_fields_allowed() {
     let t = col.upsert("doc", &[1.0, 0.0], Some(meta)).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 1, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 1, None, true, false).unwrap();
     let m = hits[0].metadata.as_ref().unwrap();
     assert!(matches!(m["s"], MetadataValue::String(ref v) if v == "only-s"));
     // Absent fields must not appear.
@@ -929,7 +941,7 @@ fn metadata_bool_boundaries() {
     let t = col.upsert("z", &[0.0, 1.0], None).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 2, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 2, None, true, false).unwrap();
     for hit in &hits {
         if hit.doc_id == "t" {
             assert!(matches!(
@@ -966,7 +978,7 @@ fn metadata_int64_boundaries() {
     let t = col.upsert("z", &[0.0, 1.0], None).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 3, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 3, None, true, false).unwrap();
     for hit in &hits {
         let expected = match hit.doc_id.as_str() {
             "min" => Some(i64::MIN),
@@ -1009,7 +1021,7 @@ fn metadata_string_boundaries() {
     let t = col.upsert("z", &[0.0, 1.0], None).unwrap();
     col.wait_visible(t).unwrap();
 
-    let hits = col.search(&[1.0, 0.0], 5, true, false).unwrap();
+    let hits = col.search(&[1.0, 0.0], 5, None, true, false).unwrap();
     for hit in &hits {
         if let Some((_, expected)) = cases.iter().find(|(id, _)| *id == hit.doc_id) {
             assert!(
@@ -1043,4 +1055,285 @@ fn metadata_float_inf_rejected() {
             "expected 'finite' in error: {err}"
         );
     }
+}
+
+// ===========================================================================
+// Filtering tests
+// ===========================================================================
+
+use nebel::filter::FilterExpr;
+
+fn filter_schema(name: &str) -> CollectionSchema {
+    let mut s = CollectionSchema::new(CollectionId::new(name), 2, Metric::L2);
+    s.metadata_schema = Some(MetadataSchema {
+        fields: vec![
+            FieldSchema {
+                id: 0,
+                name: "cat".into(),
+                ty: FieldType::String,
+                filterable: true,
+            },
+            FieldSchema {
+                id: 1,
+                name: "score".into(),
+                ty: FieldType::Int64,
+                filterable: true,
+            },
+            FieldSchema {
+                id: 2,
+                name: "active".into(),
+                ty: FieldType::Bool,
+                filterable: true,
+            },
+        ],
+    });
+    s
+}
+
+fn meta(cat: &str, score: i64, active: bool) -> HashMap<String, MetadataValue> {
+    HashMap::from([
+        ("cat".into(), MetadataValue::String(cat.into())),
+        ("score".into(), MetadataValue::Int64(score)),
+        ("active".into(), MetadataValue::Bool(active)),
+    ])
+}
+
+fn upsert_wait(
+    col: &nebel::CollectionHandle,
+    doc_id: &str,
+    v: &[f32],
+    m: HashMap<String, MetadataValue>,
+) {
+    let t = col.upsert(doc_id, v, Some(m)).unwrap();
+    col.wait_visible(t).unwrap();
+}
+
+#[test]
+fn filter_eq() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    upsert_wait(&col, "a", &[1.0, 0.0], meta("x", 10, true));
+    upsert_wait(&col, "b", &[0.0, 1.0], meta("y", 20, false));
+    upsert_wait(&col, "c", &[1.0, 1.0], meta("x", 30, true));
+
+    let f = FilterExpr::Eq {
+        field_id: 0,
+        value: MetadataValue::String("x".into()),
+    };
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+    let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(ids.contains(&"a"), "{ids:?}");
+    assert!(ids.contains(&"c"), "{ids:?}");
+    assert!(!ids.contains(&"b"), "{ids:?}");
+}
+
+#[test]
+fn filter_in() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    upsert_wait(&col, "a", &[1.0, 0.0], meta("x", 10, true));
+    upsert_wait(&col, "b", &[0.0, 1.0], meta("y", 20, false));
+    upsert_wait(&col, "c", &[1.0, 1.0], meta("z", 30, true));
+
+    let f = FilterExpr::In {
+        field_id: 0,
+        values: vec![
+            MetadataValue::String("x".into()),
+            MetadataValue::String("z".into()),
+        ],
+    };
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+    let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(ids.contains(&"a"), "{ids:?}");
+    assert!(ids.contains(&"c"), "{ids:?}");
+    assert!(!ids.contains(&"b"), "{ids:?}");
+}
+
+#[test]
+fn filter_exists() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    // "a" has all fields; "b" omits "active".
+    let t = col
+        .upsert("a", &[1.0, 0.0], Some(meta("x", 10, true)))
+        .unwrap();
+    col.wait_visible(t).unwrap();
+    let t = col
+        .upsert(
+            "b",
+            &[0.0, 1.0],
+            Some(HashMap::from([
+                ("cat".into(), MetadataValue::String("y".into())),
+                ("score".into(), MetadataValue::Int64(20)),
+            ])),
+        )
+        .unwrap();
+    col.wait_visible(t).unwrap();
+
+    let f = FilterExpr::Exists { field_id: 2 }; // "active"
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+    let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(ids.contains(&"a"), "{ids:?}");
+    assert!(!ids.contains(&"b"), "{ids:?}");
+}
+
+#[test]
+fn filter_range() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    upsert_wait(&col, "a", &[1.0, 0.0], meta("x", 5, true));
+    upsert_wait(&col, "b", &[0.0, 1.0], meta("y", 15, false));
+    upsert_wait(&col, "c", &[1.0, 1.0], meta("z", 25, true));
+
+    // 10 <= score <= 20
+    let f = FilterExpr::Range {
+        field_id: 1,
+        gte: Some(MetadataValue::Int64(10)),
+        lte: Some(MetadataValue::Int64(20)),
+    };
+    let hits = col.search(&[0.0, 1.0], 10, Some(&f), false, false).unwrap();
+    let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(!ids.contains(&"a"), "{ids:?}");
+    assert!(ids.contains(&"b"), "{ids:?}");
+    assert!(!ids.contains(&"c"), "{ids:?}");
+}
+
+#[test]
+fn filter_and() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    upsert_wait(&col, "a", &[1.0, 0.0], meta("x", 10, true));
+    upsert_wait(&col, "b", &[0.0, 1.0], meta("x", 20, false));
+    upsert_wait(&col, "c", &[1.0, 1.0], meta("y", 10, true));
+
+    // cat == "x" AND active == true
+    let f = FilterExpr::And(vec![
+        FilterExpr::Eq {
+            field_id: 0,
+            value: MetadataValue::String("x".into()),
+        },
+        FilterExpr::Eq {
+            field_id: 2,
+            value: MetadataValue::Bool(true),
+        },
+    ]);
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+    let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(ids.contains(&"a"), "{ids:?}");
+    assert!(!ids.contains(&"b"), "{ids:?}");
+    assert!(!ids.contains(&"c"), "{ids:?}");
+}
+
+#[test]
+fn filter_overwrite_changes_result() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    upsert_wait(&col, "doc", &[1.0, 0.0], meta("x", 10, true));
+
+    let f = FilterExpr::Eq {
+        field_id: 0,
+        value: MetadataValue::String("x".into()),
+    };
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+    assert_eq!(hits.len(), 1);
+
+    // Re-upsert with different category.
+    upsert_wait(&col, "doc", &[1.0, 0.0], meta("z", 10, true));
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+    assert_eq!(hits.len(), 0, "should not match after overwrite");
+}
+
+#[test]
+fn filter_delete_removes_doc() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    upsert_wait(&col, "doc", &[1.0, 0.0], meta("x", 10, true));
+
+    let f = FilterExpr::Eq {
+        field_id: 0,
+        value: MetadataValue::String("x".into()),
+    };
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+    assert_eq!(hits.len(), 1);
+
+    let t = col.delete("doc").unwrap();
+    col.wait_visible(t).unwrap();
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+    assert_eq!(
+        hits.len(),
+        0,
+        "deleted doc should not appear in filter results"
+    );
+}
+
+#[test]
+fn filter_persists_across_reopen() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Db::open(dir.path()).unwrap();
+        let col = db.create_collection(filter_schema("col")).unwrap();
+        upsert_wait(&col, "a", &[1.0, 0.0], meta("x", 10, true));
+        upsert_wait(&col, "b", &[0.0, 1.0], meta("y", 20, false));
+    }
+    {
+        let db = Db::open(dir.path()).unwrap();
+        let col = db.collection("col").unwrap();
+        let f = FilterExpr::Eq {
+            field_id: 0,
+            value: MetadataValue::String("x".into()),
+        };
+        let hits = col.search(&[1.0, 0.0], 10, Some(&f), false, false).unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, vec!["a"], "{ids:?}");
+    }
+}
+
+#[test]
+fn filter_small_set_uses_exact_path() {
+    // With <= EXACT_THRESHOLD matches the filtered-exact path is taken.
+    // Verify correctness: results must be ordered by distance and only include matching docs.
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    // Insert 10 docs: half with cat="target", half with cat="other".
+    for i in 0..10 {
+        let cat = if i % 2 == 0 { "target" } else { "other" };
+        let t = col
+            .upsert(
+                &format!("doc_{}", i),
+                &[i as f32, 0.0],
+                Some(meta(cat, i, true)),
+            )
+            .unwrap();
+        col.wait_visible(t).unwrap();
+    }
+
+    let f = FilterExpr::Eq {
+        field_id: 0,
+        value: MetadataValue::String("target".into()),
+    };
+    let hits = col.search(&[0.0, 0.0], 10, Some(&f), false, false).unwrap();
+    // Only even-indexed docs should appear.
+    for h in &hits {
+        let idx: i64 = h.doc_id.strip_prefix("doc_").unwrap().parse().unwrap();
+        assert_eq!(idx % 2, 0, "odd doc leaked through filter: {}", h.doc_id);
+    }
+    assert!(!hits.is_empty());
+}
+
+#[test]
+fn filter_with_metadata_in_result() {
+    let (db, _dir) = make_db();
+    let col = db.create_collection(filter_schema("col")).unwrap();
+    upsert_wait(&col, "a", &[1.0, 0.0], meta("x", 42, true));
+    upsert_wait(&col, "b", &[0.0, 1.0], meta("y", 7, false));
+
+    let f = FilterExpr::Eq {
+        field_id: 0,
+        value: MetadataValue::String("x".into()),
+    };
+    let hits = col.search(&[1.0, 0.0], 10, Some(&f), true, false).unwrap();
+    assert_eq!(hits.len(), 1);
+    let m = hits[0].metadata.as_ref().unwrap();
+    assert!(matches!(m["cat"], MetadataValue::String(ref s) if s == "x"));
+    assert!(matches!(m["score"], MetadataValue::Int64(42)));
 }
