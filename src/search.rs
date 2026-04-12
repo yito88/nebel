@@ -70,41 +70,7 @@ pub(crate) fn search_snapshot(
         _ => None,
     });
 
-    let (sealed_cands, ws_cands) = std::thread::scope(|scope| {
-        let sealed_handle = scope.spawn(|| {
-            sealed
-                .par_iter()
-                .filter(|s| s.num_vectors() > 0)
-                .flat_map(|seg| {
-                    let sid = seg.seg_id();
-                    seg.search(query, k)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(move |(id, dist)| (sid, id, dist))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        });
-        let ws_cands: Vec<(SegId, InternalId, f32)> = writable
-            .map(|w| {
-                let ws = w.read().unwrap();
-                let sid = ws.seg_id();
-                let hits = if ws.num_vectors() > 0 {
-                    ws.search(query, k).unwrap_or_default()
-                } else {
-                    vec![]
-                };
-                drop(ws);
-                hits.into_iter()
-                    .map(|(id, dist)| (sid, id, dist))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        (sealed_handle.join().unwrap(), ws_cands)
-    });
-    let mut candidates: Vec<(SegId, InternalId, f32)> = sealed_cands;
-    candidates.extend(ws_cands);
-    candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(CmpOrdering::Equal));
+    let candidates = gather_ann_candidates(&sealed, writable.map(|v| &**v), query, k);
 
     // Resolve tombstones, doc_ids, and metadata in a single read transaction.
     let keys: Vec<(SegId, InternalId)> = candidates.iter().map(|&(s, i, _)| (s, i)).collect();
@@ -151,6 +117,55 @@ pub(crate) fn search_snapshot(
         });
     }
     Ok(hits)
+}
+
+// ---------------------------------------------------------------------------
+// Shared ANN candidate gathering
+// ---------------------------------------------------------------------------
+
+/// Run HNSW search across all segments and return candidates sorted by distance.
+fn gather_ann_candidates(
+    sealed: &[&Arc<SealedSegment>],
+    writable: Option<&std::sync::RwLock<crate::segment::WritableSegment>>,
+    query: &[f32],
+    k: usize,
+) -> Vec<(SegId, InternalId, f32)> {
+    let (sealed_cands, ws_cands) = std::thread::scope(|scope| {
+        let sealed_handle = scope.spawn(|| {
+            sealed
+                .par_iter()
+                .filter(|s| s.num_vectors() > 0)
+                .flat_map(|seg| {
+                    let sid = seg.seg_id();
+                    seg.search(query, k)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |(id, dist)| (sid, id, dist))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        let ws_cands: Vec<(SegId, InternalId, f32)> = writable
+            .map(|w| {
+                let ws = w.read().unwrap();
+                let sid = ws.seg_id();
+                let hits = if ws.num_vectors() > 0 {
+                    ws.search(query, k).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                drop(ws);
+                hits.into_iter()
+                    .map(|(id, dist)| (sid, id, dist))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (sealed_handle.join().unwrap(), ws_cands)
+    });
+    let mut candidates: Vec<(SegId, InternalId, f32)> = sealed_cands;
+    candidates.extend(ws_cands);
+    candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(CmpOrdering::Equal));
+    candidates
 }
 
 #[cfg(feature = "testing")]
@@ -286,7 +301,7 @@ pub(crate) fn search_exact_snapshot(
 ///
 /// Used when the filter selects few enough documents that loading every matched
 /// vector is cheaper than a full ANN + post-filter pass.
-pub(crate) fn filtered_exact_snapshot(
+fn filtered_exact_snapshot(
     inner: &CollectionInner,
     snap: &CollectionSnapshot,
     query: &[f32],
@@ -295,13 +310,6 @@ pub(crate) fn filtered_exact_snapshot(
     include_metadata: bool,
 ) -> Result<Vec<SearchHit>> {
     let dimension = snap.schema.dimension;
-    if query.len() != dimension {
-        bail!(
-            "dimension mismatch: expected {}, got {}",
-            dimension,
-            query.len()
-        );
-    }
     let metric = &snap.schema.metric;
 
     // Resolve doc_ords → (doc_id, DocLocation).
@@ -391,7 +399,7 @@ pub(crate) fn filtered_exact_snapshot(
 
 /// ANN search with a larger candidate pool, then retain only documents whose
 /// `doc_ord` is in `filter_result`.
-pub(crate) fn ann_post_filter_snapshot(
+fn ann_post_filter_snapshot(
     inner: &CollectionInner,
     snap: &CollectionSnapshot,
     query: &[f32],
@@ -401,14 +409,6 @@ pub(crate) fn ann_post_filter_snapshot(
     include_vector: bool,
 ) -> Result<Vec<SearchHit>> {
     let dimension = snap.schema.dimension;
-    if query.len() != dimension {
-        bail!(
-            "dimension mismatch: expected {}, got {}",
-            dimension,
-            query.len()
-        );
-    }
-
     let filter_set: HashSet<u64> = filter_result.doc_ords.iter().copied().collect();
     let candidate_k = (k * 10).max(100);
 
@@ -428,41 +428,7 @@ pub(crate) fn ann_post_filter_snapshot(
         _ => None,
     });
 
-    let (sealed_cands, ws_cands) = std::thread::scope(|scope| {
-        let sealed_handle = scope.spawn(|| {
-            sealed
-                .par_iter()
-                .filter(|s| s.num_vectors() > 0)
-                .flat_map(|seg| {
-                    let sid = seg.seg_id();
-                    seg.search(query, candidate_k)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(move |(id, dist)| (sid, id, dist))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        });
-        let ws_cands: Vec<(SegId, InternalId, f32)> = writable
-            .map(|w| {
-                let ws = w.read().unwrap();
-                let sid = ws.seg_id();
-                let hits = if ws.num_vectors() > 0 {
-                    ws.search(query, candidate_k).unwrap_or_default()
-                } else {
-                    vec![]
-                };
-                drop(ws);
-                hits.into_iter()
-                    .map(|(id, dist)| (sid, id, dist))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        (sealed_handle.join().unwrap(), ws_cands)
-    });
-    let mut candidates: Vec<(SegId, InternalId, f32)> = sealed_cands;
-    candidates.extend(ws_cands);
-    candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(CmpOrdering::Equal));
+    let candidates = gather_ann_candidates(&sealed, writable.map(|v| &**v), query, candidate_k);
 
     // Resolve candidates with doc_ord so we can apply the filter set.
     let keys: Vec<(SegId, InternalId)> = candidates.iter().map(|&(s, i, _)| (s, i)).collect();
