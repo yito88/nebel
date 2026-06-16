@@ -3050,5 +3050,45 @@
         "total_write_ops": 980
       }
     }
+  },
+  {
+    "date": "2026-06-16T07:34:46Z",
+    "commit": "9a93532",
+    "run_number": 80,
+    "run_url": "https://github.com/yito88/nebel/actions/runs/27600732086",
+    "workloads": {
+      "search_only": {
+        "concurrency": 4,
+        "throughput_qps": 2069.3063145806755,
+        "avg_latency_ms": 1.9143129718000034,
+        "p50_latency_ms": 1.872617,
+        "p95_latency_ms": 3.2047600000000003,
+        "p99_latency_ms": 4.088274999999999
+      },
+      "write_durable": {
+        "concurrency": 1,
+        "throughput_ops": 2991.9736375718776,
+        "avg_latency_ms": 0.3334221764000006,
+        "p50_latency_ms": 0.29802700000000004,
+        "p95_latency_ms": 0.447146,
+        "p99_latency_ms": 0.5817990000000001
+      },
+      "write_visible": {
+        "concurrency": 1,
+        "throughput_ops": 545.7557469399244,
+        "avg_latency_ms": 1.8316234811999974,
+        "p50_latency_ms": 1.456095,
+        "p95_latency_ms": 1.8461249999999998,
+        "p99_latency_ms": 4.446521
+      },
+      "mix_80_20": {
+        "concurrency": 4,
+        "throughput_ops": 1441.0436390340233,
+        "read_avg_latency_ms": 2.0988537567164194,
+        "write_avg_latency_ms": 5.539950319387755,
+        "total_read_ops": 4020,
+        "total_write_ops": 980
+      }
+    }
   }
 ]
