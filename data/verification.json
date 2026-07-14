@@ -1,13 +1,5 @@
 [
   {
-    "date": "2026-04-06T05:43:39Z",
-    "commit": "49edd3e",
-    "run_number": 7,
-    "run_url": "https://github.com/yito88/nebel/actions/runs/24020083074",
-    "ann_recall": 0.968,
-    "passed": true
-  },
-  {
     "date": "2026-04-07T05:27:55Z",
     "commit": "8139e6a",
     "run_number": 8,
@@ -893,6 +885,15 @@
     "run_number": 106,
     "run_url": "https://github.com/yito88/nebel/actions/runs/29228878279",
     "ann_recall": 0.969,
+    "passed": true,
+    "mutation_passed": true
+  },
+  {
+    "date": "2026-07-14T05:48:36Z",
+    "commit": "9a93532",
+    "run_number": 107,
+    "run_url": "https://github.com/yito88/nebel/actions/runs/29308934473",
+    "ann_recall": 0.966,
     "passed": true,
     "mutation_passed": true
   }
