@@ -1,45 +1,5 @@
 [
   {
-    "date": "2026-07-05T06:17:10Z",
-    "commit": "9a93532",
-    "run_number": 99,
-    "run_url": "https://github.com/yito88/nebel/actions/runs/28731249021",
-    "workloads": {
-      "search_only": {
-        "concurrency": 4,
-        "throughput_qps": 2010.8185795790462,
-        "avg_latency_ms": 1.980697219599992,
-        "p50_latency_ms": 1.9200059999999999,
-        "p95_latency_ms": 3.3399189999999996,
-        "p99_latency_ms": 4.1526369999999995
-      },
-      "write_durable": {
-        "concurrency": 1,
-        "throughput_ops": 2032.0241990608165,
-        "avg_latency_ms": 0.4914912060000016,
-        "p50_latency_ms": 0.432267,
-        "p95_latency_ms": 0.766752,
-        "p99_latency_ms": 1.614115
-      },
-      "write_visible": {
-        "concurrency": 1,
-        "throughput_ops": 476.0449253185472,
-        "avg_latency_ms": 2.0999001522000067,
-        "p50_latency_ms": 1.849245,
-        "p95_latency_ms": 2.469583,
-        "p99_latency_ms": 4.378109
-      },
-      "mix_80_20": {
-        "concurrency": 4,
-        "throughput_ops": 1900.8002062839623,
-        "read_avg_latency_ms": 2.2648190798507417,
-        "write_avg_latency_ms": 1.3633860346938769,
-        "total_read_ops": 4020,
-        "total_write_ops": 980
-      }
-    }
-  },
-  {
     "date": "2026-07-06T06:36:36Z",
     "commit": "9a93532",
     "run_number": 100,
@@ -3994,6 +3954,46 @@
         "throughput_ops": 1750.024167833758,
         "read_avg_latency_ms": 2.652908463432836,
         "write_avg_latency_ms": 0.6870305030612239,
+        "total_read_ops": 4020,
+        "total_write_ops": 980
+      }
+    }
+  },
+  {
+    "date": "2026-10-14T07:15:13Z",
+    "commit": "9a93532",
+    "run_number": 200,
+    "run_url": "https://github.com/yito88/nebel/actions/runs/38524798790",
+    "workloads": {
+      "search_only": {
+        "concurrency": 4,
+        "throughput_qps": 1991.4283221563676,
+        "avg_latency_ms": 1.9976668505999948,
+        "p50_latency_ms": 1.942719,
+        "p95_latency_ms": 3.3895079999999997,
+        "p99_latency_ms": 4.099285999999999
+      },
+      "write_durable": {
+        "concurrency": 1,
+        "throughput_ops": 3781.692852281561,
+        "avg_latency_ms": 0.2636801896000002,
+        "p50_latency_ms": 0.231752,
+        "p95_latency_ms": 0.379127,
+        "p99_latency_ms": 0.5461389999999999
+      },
+      "write_visible": {
+        "concurrency": 1,
+        "throughput_ops": 559.3959239958124,
+        "avg_latency_ms": 1.7868745109999942,
+        "p50_latency_ms": 1.565112,
+        "p95_latency_ms": 1.967412,
+        "p99_latency_ms": 2.617546
+      },
+      "mix_80_20": {
+        "concurrency": 4,
+        "throughput_ops": 1824.1966069951866,
+        "read_avg_latency_ms": 2.5475086619402973,
+        "write_avg_latency_ms": 0.7071270336734693,
         "total_read_ops": 4020,
         "total_write_ops": 980
       }
